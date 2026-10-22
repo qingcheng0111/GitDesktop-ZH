@@ -73,7 +73,7 @@ Image rendering, before and after:
 
 ## Download and install
 
-Grab `GitDesktop_0.13.6_aarch64.dmg` from [Releases](https://github.com/923106608-lang/GitDesktop-ZH/releases).
+Grab `GitDesktop_0.13.6_aarch64.dmg` from [Releases](https://github.com/qingcheng0111/GitDesktop-ZH/releases).
 
 1. Open the DMG and drag GitDesktop into Applications
 2. If macOS says the developer cannot be verified, right-click → Open, or allow it under System Settings → Privacy & Security

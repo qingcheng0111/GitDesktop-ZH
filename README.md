@@ -73,7 +73,7 @@
 
 ## 下载与安装
 
-从 [Releases](https://github.com/923106608-lang/GitDesktop-ZH/releases) 下载 `GitDesktop_0.13.6_aarch64.dmg`。
+从 [Releases](https://github.com/qingcheng0111/GitDesktop-ZH/releases) 下载 `GitDesktop_0.13.6_aarch64.dmg`。
 
 1. 打开 DMG，把 GitDesktop 拖进「应用程序」
 2. 首次启动若提示「无法验证开发者」，右键 → 打开，或在「系统设置 → 隐私与安全性」里放行
