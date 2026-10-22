@@ -1,0 +1,281 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  externalReviewerNames,
+  fetchExternalFindings,
+} from "@/lib/ai/external-context";
+import { resolveReviewerNotesContext } from "@/lib/ai/notes-context";
+import { useForgeStatus } from "@/lib/git/queries";
+import type { RemoteLens } from "@/lib/git/types";
+import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import { useMutation } from "@/lib/started-mutation";
+import {
+  createLocalPr,
+  deleteLocalPr,
+  type LocalPr,
+  listLocalPrs,
+  updateLocalPr,
+} from "./local";
+import {
+  clearReviewsFor,
+  deleteReview,
+  listPartialReviews,
+  listReviews,
+  reviewHistoryKey,
+  reviewPartialKey,
+  reviewPartialsKey,
+  updateReviewText,
+} from "./reviews-history";
+
+/** The local PR records for one repo. Exported because the MCP is a second
+ *  writer, so a surface offering a manual refresh has to reach this family. */
+export const localPrKey = (repo: string) => ["local-prs", repo] as const;
+
+export function localPrsOptions(repo: string) {
+  return {
+    queryKey: localPrKey(repo),
+    queryFn: () => listLocalPrs(repo),
+    // Local app-data reads must not park on the default "online" mode; applies
+    // to every networkMode in this file (the forge-backed queries carry none).
+    networkMode: "always" as const,
+    gcTime: REPO_SHELL_GC_TIME,
+  };
+}
+
+export function useLocalPrs(repo: string) {
+  return useQuery(localPrsOptions(repo));
+}
+
+/** Filter prefix for every local-PR RECORD write (`[family, op, repo]`), the
+ *  family a view reads its pending writes back from. Distinct from the git-side
+ *  local-PR writes' `LOCAL_PR_WRITES_KEY` ("local-pr-write"). */
+export const LOCAL_PR_RECORD_WRITES_FAMILY = "local-pr";
+
+/** Pinned to `op` + repo, so a repo switch mid-flight detaches the write and the
+ *  newly-live repo's controls don't read it as busy (gd-conventions). The detached
+ *  observer goes idle, so callers never rely on `isPending` alone for re-entry
+ *  protection. */
+function useLocalPrMutation<TArgs, TData>(
+  repo: string,
+  op: "create" | "update" | "delete",
+  fn: (args: TArgs) => Promise<TData>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: [LOCAL_PR_RECORD_WRITES_FAMILY, op, repo],
+    mutationFn: fn,
+    // Local PR write — never park it offline.
+    networkMode: "always",
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: localPrKey(repo) }),
+  });
+}
+
+export function useCreateLocalPr(repo: string) {
+  return useLocalPrMutation(
+    repo,
+    "create",
+    (input: { title: string; body: string; base: string; head: string }) =>
+      createLocalPr(repo, input),
+  );
+}
+
+export function useUpdateLocalPr(repo: string) {
+  return useLocalPrMutation(
+    repo,
+    "update",
+    ({ id, mutate }: { id: string; mutate: (pr: LocalPr) => LocalPr }) =>
+      updateLocalPr(repo, id, mutate),
+  );
+}
+
+export function useDeleteLocalPr(repo: string) {
+  return useLocalPrMutation(repo, "delete", (id: string) =>
+    deleteLocalPr(repo, id),
+  );
+}
+
+type PrKind = "remote" | "local";
+
+/** Persisted AI reviews for a PR (both modes), newest first. Read-only — never
+ *  creates a record, so a never-reviewed PR's first run stays unchanged. */
+export function useReviewHistory(
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+) {
+  return useQuery({
+    queryKey: reviewHistoryKey(repo, lens, kind, ref),
+    queryFn: () => listReviews(repo, lens, kind, ref),
+    networkMode: "always",
+  });
+}
+
+/** Kept PARTIAL runs for a PR (both modes), newest first — the timed-out output the
+ *  history list shows beside completed reviews. Its own hook, never a widening of
+ *  {@link useReviewHistory}: callers that mean "the previous review" (the panel's
+ *  context banner, the automation gates) must not be able to read a partial by accident. */
+export function useReviewPartials(
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+) {
+  return useQuery({
+    queryKey: reviewPartialsKey(repo, lens, kind, ref),
+    queryFn: () => listPartialReviews(repo, lens, kind, ref),
+    networkMode: "always",
+  });
+}
+
+/** Filter prefix for the review-history writes a view reads back from the cache. */
+export const REVIEW_HISTORY_WRITES_FAMILY = "review-history-write";
+
+/** A review-history write's key: the review scope (lens, PR kind, PR ref) trails
+ *  the repo, so a reader passing its scope holds only its own PR's writes. */
+const reviewHistoryWriteKey = (
+  op: "update" | "delete" | "clear",
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+) => [REVIEW_HISTORY_WRITES_FAMILY, op, repo, lens, kind, ref] as const;
+
+function useReviewHistoryMutation<TArgs>(
+  op: "update" | "delete" | "clear",
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+  fn: (args: TArgs) => Promise<void>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: reviewHistoryWriteKey(op, repo, lens, kind, ref),
+    mutationFn: fn,
+    // Local review-history write — never park it offline.
+    networkMode: "always",
+    // Both keys: every mutation here writes the whole record set, and clear/delete
+    // remove kept PARTIAL runs too (they carry no phase filter). Refreshing only the
+    // completed-review key would leave a deleted partial's cached text on screen.
+    // The partial key is invalidated as a PREFIX, which covers the list read keyed
+    // under it as well as the single latest-partial read.
+    onSettled: () =>
+      Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: reviewHistoryKey(repo, lens, kind, ref),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: reviewPartialKey(repo, lens, kind, ref),
+        }),
+      ]),
+  });
+}
+
+/** Edits a stored review's text — backs "trim before re-running". */
+export function useUpdateReviewText(
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+) {
+  return useReviewHistoryMutation(
+    "update",
+    repo,
+    lens,
+    kind,
+    ref,
+    ({ id, text }: { id: string; text: string }) =>
+      updateReviewText(repo, id, text),
+  );
+}
+
+export function useDeleteReview(
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+) {
+  return useReviewHistoryMutation(
+    "delete",
+    repo,
+    lens,
+    kind,
+    ref,
+    (id: string) => deleteReview(repo, id),
+  );
+}
+
+export function useClearReviews(
+  repo: string,
+  lens: RemoteLens,
+  kind: PrKind,
+  ref: string,
+) {
+  return useReviewHistoryMutation("clear", repo, lens, kind, ref, () =>
+    clearReviewsFor(repo, lens, kind, ref),
+  );
+}
+
+/** Third-party AI-reviewer findings on a remote PR (Copilot/CodeRabbit/…), for
+ *  the Review panel's "build on external reviews" banner. Remote PRs only;
+ *  best-effort (errors degrade to no banner). Returns the kept findings, the
+ *  distinct reviewer display names, and whether the read may be partial. */
+export function useExternalReviews(repo: string, kind: PrKind, ref: string) {
+  // Harvested behind the forge abstraction for GitHub + GitLab; Bitbucket has no
+  // bot-review ecosystem, so the query is disabled there (no banner, no round trip).
+  // Gate on the forge status being RESOLVED before enabling: while it's pending the
+  // provider is unknown, so we must not run under a default-"github" assumption
+  // (wrong trust semantics on GitLab, a wasted IPC harvest on Bitbucket).
+  const forge = useForgeStatus(repo);
+  const provider = forge.data?.provider;
+  const enabled =
+    forge.isSuccess &&
+    provider != null &&
+    provider !== "bitbucket" &&
+    kind === "remote" &&
+    repo !== "" &&
+    /^\d+$/.test(ref);
+  return useQuery({
+    queryKey: ["external-reviews", repo, ref, provider ?? "pending"],
+    queryFn: async () => {
+      // Only runs when enabled, so provider is guaranteed a resolved non-Bitbucket value.
+      const { items, incomplete } = await fetchExternalFindings(
+        repo,
+        Number(ref),
+        provider ?? undefined,
+      );
+      return { items, reviewers: externalReviewerNames(items), incomplete };
+    },
+    enabled,
+    staleTime: 60_000,
+    retry: false,
+  });
+}
+
+/** The author's "Notes for reviewers" on a remote PR — lifted from the marker
+ *  conversation comment (author-gated inside the resolver). Drives the Review
+ *  panel's per-run "Ignore author notes" row; the run re-resolves them itself.
+ *  Remote PRs only; best-effort (a failure just hides the row). */
+export function useReviewerNotes(repo: string, kind: PrKind, ref: string) {
+  // Same gating as `useExternalReviews`, for the same reasons: wait for the forge
+  // status to RESOLVE (an unknown provider must not run under a default-"github"
+  // assumption), and skip Bitbucket — the notes harvest reads the same conversation
+  // comments the external path does, so a Bitbucket round trip buys nothing.
+  const forge = useForgeStatus(repo);
+  const provider = forge.data?.provider;
+  const enabled =
+    forge.isSuccess &&
+    provider != null &&
+    provider !== "bitbucket" &&
+    kind === "remote" &&
+    repo !== "" &&
+    /^\d+$/.test(ref);
+  return useQuery({
+    queryKey: ["reviewer-notes", repo, ref, provider ?? "pending"],
+    queryFn: () => resolveReviewerNotesContext(repo, Number(ref)),
+    enabled,
+    staleTime: 60_000,
+    retry: false,
+  });
+}

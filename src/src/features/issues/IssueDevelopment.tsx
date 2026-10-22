@@ -1,0 +1,296 @@
+import {
+  ArrowSquareOutIcon,
+  GitBranchIcon,
+  PlusIcon,
+} from "@phosphor-icons/react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useState } from "react";
+import { toast } from "sonner";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { MENU_HELD_ROW_CLASS } from "@/components/menu-held-row";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
+import { useRetryFocusRescue } from "@/features/conversations/ConversationListPanel";
+import { useCreateLinkedBranch, useIssueDevelopment } from "@/lib/git/queries";
+import type { IssueDetails, RemoteLens } from "@/lib/git/types";
+import {
+  pendingWriteReason,
+  refuseWhileOffline,
+  useOfflineHold,
+} from "@/lib/offline-writes";
+import { prPill } from "@/lib/pulls/pr-state";
+import { repoNameFromPath } from "@/lib/stores/notifications";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { SectionReadLine, sectionReadFailed } from "./IssueRelations";
+
+/** GitHub's default linked-branch name: `<number>-<slugified title>`. */
+function defaultBranchName(number: number, title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-+|-+$)/g, "")
+    .slice(0, 60);
+  return slug ? `${number}-${slug}` : `${number}-branch`;
+}
+
+/**
+ * GitHub's issue "Development" section: the PRs that close/reference the issue
+ * and the branches linked to it. Clicking a PR opens it in the Pulls tab.
+ * "Create a branch" makes a new remote branch linked to the issue; linking an
+ * existing PR/branch has no public mutation, so it links out to GitHub. A
+ * meta-sidebar section (shows an empty state rather than hiding).
+ */
+export function IssueDevelopment({
+  repoPath,
+  number,
+  issue,
+  lens,
+  disabledReason,
+  linkOutReason,
+  reserve = false,
+}: {
+  repoPath: string;
+  /** Whose development the section lists. */
+  number: number;
+  /** The issue on screen: a created branch is named from it AND linked to it,
+   *  so the name and the link can never come from two issues. */
+  issue: Pick<IssueDetails, "id" | "number" | "title" | "url">;
+  /** The origin|upstream lens the parent issue view resolved. */
+  lens: RemoteLens;
+  /** Set when creating a linked branch can't be used right now (the viewer may
+   *  not push, or the issue is still loading): that item disables and appends
+   *  this text to its label (a disabled menu item drops pointer events, so a
+   *  tooltip never shows). */
+  disabledReason?: string;
+  /** Set while `issue` isn't the selected issue yet: the link-out to it
+   *  disables the same way. */
+  linkOutReason?: string;
+  /** The provider is known to carry this section: the empty state's line is
+   *  held while the read is out, and says so when it can't load. */
+  reserve?: boolean;
+}) {
+  const dev = useIssueDevelopment(repoPath, number, lens);
+  const createBranch = useCreateLinkedBranch(repoPath, lens);
+  const openPr = useUiStore((s) => s.openPr);
+  const repoName = useUiStore((s) => s.repoName);
+  const [branchOpen, setBranchOpen] = useState(false);
+  // The issue the dialog was opened for, captured with the name it seeded.
+  const [branchFor, setBranchFor] = useState<{
+    id: string;
+    number: number;
+  } | null>(null);
+  const [branchName, setBranchName] = useState("");
+  const { hostRef, retryRef } = useRetryFocusRescue(
+    reserve && sectionReadFailed(dev),
+  );
+
+  const prs = dev.data?.prs ?? [];
+  const branches = dev.data?.branches ?? [];
+  const loaded = dev.data !== undefined;
+
+  function openLinkedPr(n: number) {
+    // Through the store's navigator: the PRs listed here are usually the ones
+    // that CLOSED the issue, so the Pulls list has to align its open/closed tab
+    // with the PR's real state rather than land on whichever tab was showing.
+    // The numbers come from `dev`, read under this view's live `lens`, so they
+    // resolve under the lens that produced them without a lens write.
+    openPr({
+      kind: "remote",
+      repoPath,
+      repoName: repoName ?? repoNameFromPath(repoPath),
+      ref: String(n),
+      section: null,
+    });
+  }
+
+  // The create holds rather than parks: a parked one would push a branch to
+  // GitHub whenever the connection returns. Ranked: the running write, then
+  // offline, then the form's own precondition.
+  const offlineHold = useOfflineHold();
+  const submitReason = (() => {
+    switch (true) {
+      case createBranch.isPending:
+        return pendingWriteReason(
+          createBranch.isPaused,
+          "Creating the branch…",
+        );
+      case !!offlineHold:
+        return offlineHold;
+      case !branchName.trim():
+        return "Enter a branch name";
+      default:
+        return undefined;
+    }
+  })();
+
+  async function submitBranch() {
+    const name = branchName.trim();
+    // The input's Enter submits past the held button, which stays focusable.
+    if (!branchFor || !name || createBranch.isPending || refuseWhileOffline())
+      return;
+    try {
+      await createBranch.mutateAsync({ issueId: branchFor.id, name });
+    } catch (e) {
+      toastError(e);
+      return;
+    }
+    toast.success(`Created branch ${name}`, {
+      description: "Fetch to check it out locally.",
+    });
+    setBranchOpen(false);
+  }
+
+  return (
+    <div ref={hostRef} tabIndex={-1} className="space-y-1.5 outline-none">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-muted-foreground">Development</p>
+        <span className="flex-1" />
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-label="Development actions"
+              />
+            }
+          >
+            <PlusIcon />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-56">
+            {/* Both rows flip with the issue's load while the menu can be open. */}
+            <DropdownMenuItem
+              className={MENU_HELD_ROW_CLASS}
+              disabled={!!disabledReason}
+              onClick={() => {
+                setBranchName(defaultBranchName(issue.number, issue.title));
+                setBranchFor({ id: issue.id, number: issue.number });
+                setBranchOpen(true);
+              }}
+            >
+              Create a branch…
+              {disabledReason ? ` — ${disabledReason}` : ""}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className={MENU_HELD_ROW_CLASS}
+              disabled={!!linkOutReason}
+              onClick={() => openUrl(issue.url)}
+            >
+              <ArrowSquareOutIcon />
+              Link a pull request or branch on GitHub…
+              {linkOutReason ? ` — ${linkOutReason}` : ""}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {prs.map((pr) => {
+        // The linked-PR payload carries no draft flag.
+        const { Icon, tone, word } = prPill(pr.state, false);
+        return (
+          <button
+            key={pr.number}
+            type="button"
+            onClick={() => openLinkedPr(pr.number)}
+            className="flex w-full cursor-pointer items-center gap-1.5 text-left text-xs hover:underline"
+            title={`#${pr.number} ${pr.title}`}
+          >
+            <Icon className={cn("size-3.5 shrink-0", tone)} />
+            {/* The glyph's state in words for a reader; the trailing space keeps
+                it from running into the number in the accessible name. */}
+            <span className="sr-only">{`${word} `}</span>
+            <span className="text-muted-foreground">#{pr.number}</span>
+            <span className="min-w-0 flex-1 truncate">{pr.title}</span>
+          </button>
+        );
+      })}
+      {branches.map((b) => (
+        <div
+          key={b}
+          className="flex items-center gap-1.5 text-xs text-muted-foreground"
+          title={b}
+        >
+          <GitBranchIcon className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 truncate font-mono">{b}</span>
+        </div>
+      ))}
+      {!loaded
+        ? reserve && (
+            <SectionReadLine
+              query={dev}
+              noun="linked pull requests and branches"
+              retryRef={retryRef}
+            />
+          )
+        : prs.length === 0 &&
+          branches.length === 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              No linked pull requests or branches.
+            </p>
+          )}
+
+      <Dialog open={branchOpen} onOpenChange={setBranchOpen}>
+        <DialogContent>
+          <form
+            className="space-y-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitBranch();
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>Create a branch</DialogTitle>
+              <DialogDescription>
+                Creates a branch off the default branch on GitHub, linked to #
+                {branchFor?.number}. Fetch afterwards to check it out locally.
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              autoFocus
+              value={branchName}
+              onChange={(e) => setBranchName(e.target.value)}
+              placeholder="branch-name"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setBranchOpen(false)}
+              >
+                Cancel
+              </Button>
+              <DisabledReasonButton
+                type="submit"
+                disabled={submitReason !== undefined}
+                reason={submitReason}
+              >
+                {createBranch.isPending && <Spinner data-icon="inline-start" />}
+                Create branch
+              </DisabledReasonButton>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

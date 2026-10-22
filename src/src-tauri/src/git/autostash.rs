@@ -1,0 +1,2699 @@
+//! App-level stash → op → reapply compounds for pull, merge, rebase and switch, plus
+//! the SHA-verified drop of the backup stash a conflicted reapply keeps.
+//!
+//! Each command acquires the repo's WORKING-TREE lock ONCE and uses only the
+//! lock-free runners while holding it — `run_git_mutating` re-acquires the same
+//! non-reentrant mutex and deadlocks (precedent: `git_stash_paths_core`). The inner
+//! steps therefore lose `run_git_mutating`'s one-shot index.lock retry, the same
+//! trade-off that compound accepts. The pull compound runs its transfer FIRST, under
+//! the network domain alone (`git::pull_guard`), and takes the working tree only for
+//! the local half — so staging stays available across a transfer. Its bare
+//! fall-through keeps the older shape, taking the NETWORK lock inside the
+//! working-tree hold; that nesting direction is the only one allowed (see
+//! `run_git_mutating`).
+
+use tauri::State;
+
+use crate::error::{AppError, AppResult};
+use crate::git::branches::{finish_tracking_setup, validate_ref_name, TrackedBy};
+use crate::git::ignored_guard::{self, ignored_files_in_the_way};
+use crate::git::remote::run_git_with_creds_once;
+use crate::git::runner::{
+    acquire_repo_lock, run_git, run_git_raw, with_config_write_lock, GitOutput, DEFAULT_TIMEOUT,
+    LOCK_WAIT_TIMEOUT, NETWORK_LOCK_WAIT_TIMEOUT, NETWORK_TIMEOUT, WORKTREE_OP_TIMEOUT,
+};
+use crate::state::AppState;
+
+/// How a stash → op → reapply compound ended. Every failure mode is reportable —
+/// a variant, refined by its discriminant field — because git's own `--autostash`
+/// reports none of them: it exits 0 even when the reapply conflicts.
+#[derive(Debug, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AutostashOutcome {
+    /// Tree was clean at stash time; the op ran plainly (op failure returns Err, not this).
+    NothingStashed,
+    /// Stash pushed, reapply not requested (switch with reapply=false).
+    StashedOnly,
+    /// stash → op → pop, all clean.
+    Reapplied,
+    /// Op succeeded; pop failed. Git retains the stash entry on a conflicted pop.
+    /// `conflicted` distinguishes a merge conflict (unmerged paths in the changes
+    /// list) from a pop git refused outright, which leaves nothing to resolve.
+    ReapplyConflicted {
+        stderr: String,
+        conflicted: bool,
+        /// Full hex object id (40, or 64 in SHA-256 repos) of the kept backup stash
+        /// entry. None unless the pop left conflicts and `refs/stash` read the same id
+        /// before and after it; the UI then keeps its marker-less behavior.
+        stash_sha: Option<String>,
+    },
+    /// Op failed with no in-progress state; the stash was popped back cleanly.
+    OpFailedRestored { stderr: String },
+    /// Op failed leaving in-progress state (e.g. rebase conflict), OR the restore-pop
+    /// itself failed — stash kept either way. `in_progress` says which: only the
+    /// first has a merge/rebase for the user to continue or abort.
+    OpFailedStashKept { stderr: String, in_progress: bool },
+}
+
+/// `git stash push --include-untracked` (parity with `git_stash_all_core`,
+/// reserved-name exclusions included). `false` when git found nothing to stash.
+///
+/// Excluding the Windows-reserved untracked names is what keeps the parity: git
+/// would otherwise write the entry and then fail removing the unreachable file,
+/// aborting the compound around an orphan stash. When they are the ONLY changes
+/// the exclusion leaves nothing to save, and `false` is the right answer here —
+/// the compound runs its op unstashed, exactly as it would on a clean tree.
+/// Stash-ALL refuses on that same answer instead; only it is a user-chosen "put
+/// my work away" whose silence would be a lie.
+///
+/// `pub(crate)` for `git::pull_guard`, whose decided-pull compound is this
+/// module's shape run from another entry point.
+pub(crate) async fn autostash_push(repo: &str) -> AppResult<bool> {
+    let excludes = crate::git::ops::reserved_stash_excludes(repo).await?;
+    let mut args: Vec<&str> = vec!["stash", "push", "--include-untracked"];
+    if !excludes.is_empty() {
+        args.push("--");
+        args.extend(excludes.iter().map(String::as_str));
+    }
+    let out = run_git(Some(repo), &args, DEFAULT_TIMEOUT).await?;
+    Ok(!crate::git::ops::stash_saved_nothing(&out.stdout_lossy()))
+}
+
+/// Raw so a conflicted pop (exit 1) can be classified rather than propagated.
+async fn autostash_pop(repo: &str) -> AppResult<GitOutput> {
+    run_git_raw(Some(repo), &["stash", "pop"], DEFAULT_TIMEOUT).await
+}
+
+/// Turns the inner op's result into an outcome, unwinding the autostash when it can
+/// be unwound safely. Never errors on a failed pop — the retained stash is the
+/// user's safety net, and reporting it is the whole point of the outcome enum.
+///
+/// `op_name` is the paused operation the no-stash arm reports — `classify_failure`'s
+/// closed set, spelled as the matching plain core spells it.
+///
+/// `pub(crate)` for `git::pull_guard`, whose decided-pull compound settles the
+/// same way this module's do.
+pub(crate) async fn settle(
+    repo: &str,
+    op_name: &str,
+    stashed: bool,
+    reapply: bool,
+    op: AppResult<GitOutput>,
+) -> AppResult<AutostashOutcome> {
+    // Nothing was stashed, so there is nothing to unwind: behave like the plain
+    // command, structured error included — the same failure must not report as a
+    // conflict through one entry point and as prose through the other.
+    if !stashed {
+        let out = op?;
+        if out.code != 0 {
+            // The baseline is empty because every compound refuses mid-op BEFORE
+            // stashing, so nothing was unmerged when the op started (`op_continue`
+            // passes an empty one for its own reason). `full_failure_text` because
+            // merge and pull both carry half their report on stdout, which the
+            // parity tests below pin; switch is the exception in the other direction
+            // — a FAILING `git switch` emits no stdout at all (measured across its
+            // refusal modes), so the combined text is identical to stderr alone.
+            return Err(crate::git::ops::classify_failure(
+                repo,
+                op_name,
+                &[],
+                out.code,
+                out.full_failure_text(),
+            )
+            .await);
+        }
+        return Ok(AutostashOutcome::NothingStashed);
+    }
+
+    let failure = match &op {
+        Ok(out) if out.code == 0 => None,
+        // Combined, matching the no-stash arm and the plain cores:
+        // a substitution reports a conflicted pull's fetch summary alone and says
+        // nothing about the conflict, so the stashed and unstashed paths would
+        // disagree on the same failure.
+        Ok(out) => Some(out.full_failure_text()),
+        Err(err) => Some(err.to_string()),
+    };
+
+    if let Some(stderr) = failure {
+        // Popping onto an in-progress merge/rebase would tangle the stash with
+        // conflicts the user still has to resolve — keep it instead.
+        if crate::git::ops::op_in_progress(repo).await {
+            return Ok(AutostashOutcome::OpFailedStashKept {
+                stderr,
+                in_progress: true,
+            });
+        }
+        let restored = matches!(autostash_pop(repo).await, Ok(out) if out.code == 0);
+        return Ok(if restored {
+            AutostashOutcome::OpFailedRestored { stderr }
+        } else {
+            AutostashOutcome::OpFailedStashKept {
+                stderr,
+                in_progress: false,
+            }
+        });
+    }
+
+    if !reapply {
+        return Ok(AutostashOutcome::StashedOnly);
+    }
+    // Read just before the pop, which keeps the entry on a conflict. The working-tree
+    // lock stops only this process's writers on this checkout from pushing in between;
+    // an MCP server, a sibling worktree (refs/stash is shared) or external git could.
+    let pre_pop = stash_tip(repo).await;
+    // Substitution here, unlike the op-failure arms' combined text: a conflicted pop
+    // reports on stdout alone, and a refused pop leads with stderr NAMING the blocking
+    // file while its stdout is generic `status` noise (measured, git 2.51.1.windows.1).
+    let stderr = match autostash_pop(repo).await {
+        Ok(out) if out.code == 0 => return Ok(AutostashOutcome::Reapplied),
+        Ok(out) => out.failure_text(),
+        Err(err) => err.to_string(),
+    };
+    // git aborts some pops without merging at all (an untracked file already in the
+    // way), leaving nothing for the user to resolve; an unreadable index answers the
+    // same way.
+    let conflicted = crate::git::ops::has_unmerged(repo).await.unwrap_or(false);
+    // git can't pop by object id, so a push landing before the pop would make it
+    // reapply (and keep) THAT entry: the sha stands only if the tip didn't move. A
+    // second external write between the pop and this re-read could still fool it.
+    let stash_sha = if conflicted {
+        kept_backup_sha(pre_pop, stash_tip(repo).await)
+    } else {
+        None
+    };
+    Ok(AutostashOutcome::ReapplyConflicted {
+        stderr,
+        conflicted,
+        stash_sha,
+    })
+}
+
+/// The backup a conflicted pop kept: the pre-pop tip, only when the post-pop tip
+/// still names it. Any failed or missing read answers None (no drop offer).
+fn kept_backup_sha(
+    pre_pop: AppResult<Option<String>>,
+    post_pop: AppResult<Option<String>>,
+) -> Option<String> {
+    match (pre_pop, post_pop) {
+        (Ok(Some(pre)), Ok(Some(post))) if pre == post => Some(pre),
+        _ => None,
+    }
+}
+
+/// `refs/stash`'s object id: `Ok(None)` only when git confirms the ref is absent,
+/// an error when the read itself failed. Lock-free runner: every caller holds the
+/// working-tree lock.
+async fn stash_tip(repo: &str) -> AppResult<Option<String>> {
+    let out = run_git_raw(
+        Some(repo),
+        &["rev-parse", "--verify", "--quiet", "refs/stash"],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    classify_stash_tip(out.code, &out.stdout_lossy(), &out.stderr)
+}
+
+/// `rev-parse --verify --quiet`: exit 0 with an id is present, exit 1 with no output
+/// is a confirmed absence, and anything else is a failed read, never "absent".
+fn classify_stash_tip(code: i32, stdout: &str, stderr: &str) -> AppResult<Option<String>> {
+    let sha = stdout.trim();
+    match (code, sha.is_empty()) {
+        (0, false) => Ok(Some(sha.to_string())),
+        (1, true) => Ok(None),
+        _ => Err(AppError::Git {
+            code,
+            stderr: if stderr.trim().is_empty() {
+                "couldn't read refs/stash".to_string()
+            } else {
+                stderr.to_string()
+            },
+        }),
+    }
+}
+
+/// Pull with the uncommitted changes stashed across the operation and reapplied
+/// afterwards, reporting every failure mode the plain pull would collapse into a
+/// bare error.
+#[tauri::command]
+pub async fn git_pull_autostash(
+    state: State<'_, AppState>,
+    repo_path: String,
+    mode: String,
+) -> AppResult<AutostashOutcome> {
+    git_pull_autostash_core(&state, repo_path, mode).await
+}
+
+pub(crate) async fn git_pull_autostash_core(
+    state: &AppState,
+    repo_path: String,
+    mode: String,
+) -> AppResult<AutostashOutcome> {
+    // Same mode→flag map as `git_pull_core`; the frontend retries the refused pull
+    // with the mode it originally attempted.
+    let flag = match mode.as_str() {
+        "rebase" => "--rebase",
+        "merge" => "--no-rebase",
+        _ => "--ff-only",
+    };
+    // Same label as `git_pull_core`: the operation a conflicted pull pauses is the
+    // mode it RAN. A refused `--ff-only` leaves nothing unmerged, so its label
+    // never surfaces.
+    let paused = if mode == "rebase" { "rebase" } else { "merge" };
+    // Every mode splits into a network phase and a local one (git::pull_guard), so the
+    // transfer runs before anything is stashed and holds the network domain alone.
+    // Rebase mode additionally runs the fork-point guard there — bare
+    // `git pull --rebase` can silently drop a pushed commit a force-push rewrote away.
+    if mode == "rebase" {
+        if let Some(outcome) = crate::git::pull_guard::guarded_pull_autostash(state, &repo_path).await? {
+            return Ok(outcome);
+        }
+    } else if let Some(plain) =
+        crate::git::pull_guard::pin_plain_pull(state, &repo_path, mode != "merge").await?
+    {
+        return crate::git::pull_guard::merge_pinned_autostash(state, &repo_path, &plain).await;
+    }
+    // A read that shells out to git itself — resolve it BEFORE taking the lock.
+    let cred = crate::forge::credential_config_for_remote(&repo_path, "origin").await?;
+
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a pull").await?;
+    crate::git::ops::refuse_mid_op(&repo_path).await?;
+
+    // The fall-through's transfer serializes with the network domain (the auto-fetch
+    // runs there), and the hold is taken BEFORE the stash so it spans
+    // stash → pull → settle: a refusal to wait must precede the first tree mutation,
+    // or the user's work is stashed and popped back purely to report that something
+    // else was running.
+    let network = state.network_lock(&repo_path).await;
+    let _net_guard = acquire_repo_lock(&network, NETWORK_LOCK_WAIT_TIMEOUT, "a pull").await?;
+
+    // Commits the pull's own transfer brings are not checked.
+    if mode != "rebase" {
+        if let Some(target) = ignored_guard::upstream_commit(&repo_path).await? {
+            if ignored_guard::pull_can_merge(&repo_path, &target, mode != "merge").await? {
+                let paths = ignored_files_in_the_way(&repo_path, &target, WORKTREE_OP_TIMEOUT)
+                    .await
+                    .map_err(|e| ignored_guard::check_failed("Pull", e))?;
+                if !paths.is_empty() {
+                    return Err(ignored_guard::pull_refusal(&paths));
+                }
+            }
+        }
+    }
+    let stashed = autostash_push(&repo_path).await?;
+    let op = run_git_with_creds_once(&repo_path, &cred, &["pull", flag], NETWORK_TIMEOUT).await;
+    settle(&repo_path, paused, stashed, true, op).await
+}
+
+/// Merge `branch` into the current one with the uncommitted changes stashed across
+/// the merge and reapplied afterwards. Plain `--no-edit` merges only.
+#[tauri::command]
+pub async fn git_merge_autostash(
+    state: State<'_, AppState>,
+    repo_path: String,
+    branch: String,
+) -> AppResult<AutostashOutcome> {
+    git_merge_autostash_core(&state, repo_path, branch).await
+}
+
+pub(crate) async fn git_merge_autostash_core(
+    state: &AppState,
+    repo_path: String,
+    branch: String,
+) -> AppResult<AutostashOutcome> {
+    validate_ref_name(&branch)?;
+
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a merge").await?;
+    crate::git::ops::refuse_mid_op(&repo_path).await?;
+    let network = state.network_lock(&repo_path).await;
+    let _net_guard = acquire_repo_lock(&network, NETWORK_LOCK_WAIT_TIMEOUT, "a merge").await?;
+    let rev = crate::git::branches::branch_first_rev(&repo_path, &branch).await;
+    if let Some(incoming_sha) =
+        ignored_guard::target_commit(&repo_path, &rev, DEFAULT_TIMEOUT, "Merge").await?
+    {
+        let paths = ignored_files_in_the_way(&repo_path, &incoming_sha, DEFAULT_TIMEOUT)
+            .await
+            .map_err(|e| ignored_guard::check_failed("Merge", e))?;
+        if !paths.is_empty() {
+            return Err(ignored_guard::merge_refusal(&branch, &paths));
+        }
+    }
+
+    let stashed = autostash_push(&repo_path).await?;
+    // Read AFTER the push: it can mint `refs/stash`, which a bare `stash` resolves
+    // to before refs/heads, so only the post-push read sees that ambiguity.
+    let rev = crate::git::branches::branch_first_rev(&repo_path, &branch).await;
+    let op = run_git_raw(
+        Some(&repo_path),
+        &["merge", "--no-edit", "--no-overwrite-ignore", &rev],
+        DEFAULT_TIMEOUT,
+    )
+    .await;
+    settle(&repo_path, "merge", stashed, true, op).await
+}
+
+/// Rebase the current branch onto `branch` with the uncommitted changes stashed
+/// across the rebase and reapplied afterwards. Rebase refuses on ANY dirty
+/// tracked file, not just one the replay would touch, so this is the arm that
+/// fires most often.
+#[tauri::command]
+pub async fn git_rebase_autostash(
+    state: State<'_, AppState>,
+    repo_path: String,
+    branch: String,
+) -> AppResult<AutostashOutcome> {
+    git_rebase_autostash_core(&state, repo_path, branch).await
+}
+
+pub(crate) async fn git_rebase_autostash_core(
+    state: &AppState,
+    repo_path: String,
+    branch: String,
+) -> AppResult<AutostashOutcome> {
+    validate_ref_name(&branch)?;
+
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a rebase").await?;
+    crate::git::ops::refuse_mid_op(&repo_path).await?;
+
+    let stashed = autostash_push(&repo_path).await?;
+    // Read after the push, as in `git_merge_autostash_core`.
+    let rev = crate::git::branches::branch_first_rev(&repo_path, &branch).await;
+    // Inlined rather than delegating to `git_rebase_core`: that one runs through
+    // `run_git_mutating_raw`, which re-acquires the lock held here (module doc).
+    // `core.editor=true` mirrors it so git never blocks on an editor.
+    let op = run_git_raw(
+        Some(&repo_path),
+        &["-c", "core.editor=true", "rebase", &rev],
+        DEFAULT_TIMEOUT,
+    )
+    .await;
+    settle(&repo_path, "rebase", stashed, true, op).await
+}
+
+/// `git rebase --onto <new_base> <old_base>` — replaying only `old_base..HEAD`
+/// — with the uncommitted changes stashed across it and reapplied afterwards.
+#[tauri::command]
+pub async fn git_rebase_onto_autostash(
+    state: State<'_, AppState>,
+    repo_path: String,
+    new_base: String,
+    old_base: String,
+) -> AppResult<AutostashOutcome> {
+    git_rebase_onto_autostash_core(&state, repo_path, new_base, old_base).await
+}
+
+pub(crate) async fn git_rebase_onto_autostash_core(
+    state: &AppState,
+    repo_path: String,
+    new_base: String,
+    old_base: String,
+) -> AppResult<AutostashOutcome> {
+    validate_ref_name(&new_base)?;
+    validate_ref_name(&old_base)?;
+
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a rebase").await?;
+    crate::git::ops::refuse_mid_op(&repo_path).await?;
+
+    let stashed = autostash_push(&repo_path).await?;
+    // Read after the push, as in `git_merge_autostash_core`.
+    let new_base = crate::git::branches::branch_first_rev(&repo_path, &new_base).await;
+    let old_base = crate::git::branches::branch_first_rev(&repo_path, &old_base).await;
+    // Inlined for the same reason as `git_rebase_autostash_core` above.
+    let op = run_git_raw(
+        Some(&repo_path),
+        &[
+            "-c",
+            "core.editor=true",
+            "rebase",
+            "--onto",
+            &new_base,
+            &old_base,
+        ],
+        DEFAULT_TIMEOUT,
+    )
+    .await;
+    settle(&repo_path, "rebase", stashed, true, op).await
+}
+
+/// Switch branches with the uncommitted changes stashed across the switch, and
+/// reapplied on the far side when `reapply` is set. `remote` checks out a
+/// remote-only branch as a tracking branch, mirroring `git_checkout_remote_branch`.
+#[tauri::command]
+pub async fn git_switch_autostash(
+    state: State<'_, AppState>,
+    repo_path: String,
+    name: String,
+    remote: Option<String>,
+    reapply: bool,
+) -> AppResult<AutostashOutcome> {
+    git_switch_autostash_core(&state, repo_path, name, remote, reapply).await
+}
+
+pub(crate) async fn git_switch_autostash_core(
+    state: &AppState,
+    repo_path: String,
+    name: String,
+    remote: Option<String>,
+    reapply: bool,
+) -> AppResult<AutostashOutcome> {
+    validate_ref_name(&name)?;
+    if let Some(remote) = &remote {
+        validate_ref_name(remote)?;
+    }
+    // The full ref, as `git_checkout_remote_branch_core` passes it: a tag or local
+    // branch named `<remote>/<name>` makes the bare form ambiguous, and git refuses it.
+    let tracking = remote.map(|remote| format!("refs/remotes/{remote}/{name}"));
+
+    let domain = state.working_tree_lock(&repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a checkout").await?;
+    crate::git::ops::refuse_mid_op(&repo_path).await?;
+    // Ahead of the stash: the switch would fail on the update's hold anyway, after
+    // pushing and popping the user's changes for nothing.
+    crate::git::update_marker::refuse_if_branch_updating(state, &repo_path, &name).await?;
+
+    let stashed = autostash_push(&repo_path).await?;
+    let op = match &tracking {
+        // A tracking switch writes the config, so it holds the config-write mutex and
+        // finishes a lost tracking setup BEFORE `settle` pops onto the half-switched tree.
+        Some(tracking) => {
+            let (repo, name) = (repo_path.as_str(), name.as_str());
+            with_config_write_lock(repo, |held| async move {
+                let args = ["switch", "--track", tracking.as_str()];
+                let out = run_git_raw(Some(repo), &args, DEFAULT_TIMEOUT).await?;
+                let by = TrackedBy::ExplicitTrack;
+                let finished =
+                    finish_tracking_setup(&held, repo, out, name, tracking, by, true).await?;
+                // `settle` reads a failure as "HEAD never moved" and pops onto whatever
+                // is checked out, so a landed switch whose upstream lost again reports
+                // as the switch it is; the miss is logged, not surfaced.
+                if finished.switched && finished.out.code != 0 {
+                    eprintln!(
+                        "gitdesktop: switched to {name}, but its upstream was not written: {}",
+                        finished.out.stderr.trim()
+                    );
+                    return Ok(GitOutput {
+                        code: 0,
+                        ..finished.out
+                    });
+                }
+                Ok(finished.out)
+            })
+            .await
+        }
+        None => run_git_raw(Some(&repo_path), &["switch", &name], DEFAULT_TIMEOUT).await,
+    };
+    // Unreachable as a label: a refused `git switch` leaves nothing unmerged, so
+    // `classify_failure` always answers with a plain git error here. "merge" is the
+    // closed set's spelling for the only way a checkout could ever pause one.
+    settle(&repo_path, "merge", stashed, reapply, op).await
+}
+
+/// Verdict of a SHA-verified backup-stash drop.
+#[derive(Debug, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum StashDropOutcome {
+    /// `refs/stash` matched the recorded sha and the entry was dropped.
+    Dropped,
+    /// `refs/stash` resolves but points elsewhere; nothing was dropped.
+    Moved,
+    /// `refs/stash` does not resolve, so there is nothing to drop.
+    Gone,
+    /// The drop removed a DIFFERENT entry (an external push raced the window) and
+    /// restoring it failed. `dropped_sha` is the removed entry, recoverable via
+    /// `git stash store <sha>` or the app's Recoverable view (fsck finds it dangling).
+    RestoreFailed { dropped_sha: String },
+}
+
+/// Drop the autostash backup the UI recorded, but only while it is still
+/// `stash@{0}`: a backup that moved deeper or vanished is refused, never re-resolved.
+///
+/// The pre-check under the working-tree lock covers this process's writers on this
+/// checkout; the post-drop verify plus a `git stash store` restore covers the rest
+/// (an MCP server, sibling worktrees sharing refs/stash, external git).
+#[tauri::command]
+pub async fn git_drop_stash_by_sha(
+    state: State<'_, AppState>,
+    repo_path: String,
+    sha: String,
+) -> AppResult<StashDropOutcome> {
+    git_drop_stash_by_sha_core(&state, repo_path, sha).await
+}
+
+pub(crate) async fn git_drop_stash_by_sha_core(
+    state: &AppState,
+    repo_path: String,
+    sha: String,
+) -> AppResult<StashDropOutcome> {
+    // The sha's fixed grammar is its argv chokepoint: nothing else reaches git.
+    if !is_full_object_id(&sha) {
+        return Err(AppError::InvalidArgument(
+            "Expected a full lowercase stash object id".into(),
+        ));
+    }
+    let repo = repo_path.as_str();
+    let domain = state.working_tree_lock(repo).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a stash drop").await?;
+
+    // A failed read propagates: only a confirmed absence may report Gone.
+    let Some(tip) = stash_tip(repo).await? else {
+        return Ok(StashDropOutcome::Gone);
+    };
+    if tip != sha {
+        return Ok(StashDropOutcome::Moved);
+    }
+    // Read before the drop: the compensation arm needs the entry's message.
+    let listing = run_git(
+        Some(repo),
+        &["stash", "list", "--format=%H%x09%gs"],
+        DEFAULT_TIMEOUT,
+    )
+    .await?
+    .stdout_lossy();
+    let out = run_git(Some(repo), &["stash", "drop", "stash@{0}"], DEFAULT_TIMEOUT).await?;
+    let printed = dropped_sha(&out.stdout_lossy()).or_else(|| dropped_sha(&out.stderr));
+    match printed {
+        Some(printed) if printed != sha => Ok(restore_dropped(repo, &listing, printed).await),
+        // A missing confirmation is fail-open; the real-repo test pins its format.
+        _ => Ok(StashDropOutcome::Dropped),
+    }
+}
+
+/// Stores back an entry a racing drop removed, under the message `listing` (a
+/// pre-drop `stash list --format=%H%x09%gs`) gave it. Moved when it is back on top,
+/// RestoreFailed naming it when git refused (e.g. "is not a stash-like commit").
+async fn restore_dropped(repo: &str, listing: &str, printed: String) -> StashDropOutcome {
+    let message = listing
+        .lines()
+        .find_map(|line| {
+            line.split_once('\t')
+                .filter(|(id, _)| *id == printed)
+                .map(|(_, msg)| msg.to_string())
+        })
+        .unwrap_or_else(|| "Restored by GitDesktop".to_string());
+    let restore = run_git(
+        Some(repo),
+        &["stash", "store", "-m", &message, &printed],
+        DEFAULT_TIMEOUT,
+    )
+    .await;
+    match restore {
+        Ok(_) => StashDropOutcome::Moved,
+        Err(_) => StashDropOutcome::RestoreFailed {
+            dropped_sha: printed,
+        },
+    }
+}
+
+/// 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
+fn is_full_object_id(sha: &str) -> bool {
+    (sha.len() == 40 || sha.len() == 64)
+        && sha
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+/// The object id in `git stash drop`'s `Dropped <rev> (<sha>)` line, keyed on the
+/// TRAILING parenthesized hex only, so either rev spelling git prints parses.
+fn dropped_sha(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let line = line.trim_end();
+        let rest = line.strip_prefix("Dropped ")?;
+        let inner = rest.strip_suffix(')')?;
+        let (_, sha) = inner.rsplit_once(" (")?;
+        let sha = sha.to_ascii_lowercase();
+        is_full_object_id(&sha).then_some(sha)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn git(repo: &str, args: &[&str]) -> String {
+        run_git(Some(repo), args, DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout_lossy()
+    }
+
+    /// `core.autocrlf=false` keeps every checkout/stash-pop byte-exact regardless of
+    /// the machine's global git config — content assertions below depend on it.
+    async fn configure(repo: &str) {
+        git(repo, &["config", "core.autocrlf", "false"]).await;
+        git(repo, &["config", "user.email", "t@t"]).await;
+        git(repo, &["config", "user.name", "t"]).await;
+    }
+
+    async fn commit_all(repo: &str, msg: &str) {
+        git(repo, &["add", "-A"]).await;
+        git(repo, &["commit", "-m", msg]).await;
+    }
+
+    fn write(dir: &std::path::Path, file: &str, content: &str) {
+        std::fs::write(dir.join(file), content).unwrap();
+    }
+
+    fn read(dir: &std::path::Path, file: &str) -> String {
+        std::fs::read_to_string(dir.join(file)).unwrap()
+    }
+
+    fn temp(marker: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("gd-autostash-{marker}-"))
+            .tempdir()
+            .expect("create temp dir")
+    }
+
+    /// A repo with `a.txt`/`b.txt` committed on `main` — enough for one overlapping
+    /// and one non-overlapping dirty file.
+    async fn setup_repo(marker: &str) -> (tempfile::TempDir, String) {
+        let dir = temp(marker);
+        let repo = dir.path().to_string_lossy().into_owned();
+        git(&repo, &["init", "-b", "main"]).await;
+        configure(&repo).await;
+        write(dir.path(), "a.txt", "v0\n");
+        write(dir.path(), "b.txt", "b0\n");
+        commit_all(&repo, "base").await;
+        (dir, repo)
+    }
+
+    /// Bare origin + an upstream work clone + the clone under test. Returns
+    /// `(tempdir, upstream, clone)`; both work trees sit next to the bare repo.
+    async fn setup_clone(marker: &str) -> (tempfile::TempDir, String, String) {
+        let dir = temp(marker);
+        let root = dir.path().to_string_lossy().into_owned();
+        git(&root, &["init", "--bare", "-b", "main", "origin.git"]).await;
+        let url = format!(
+            "file://{}",
+            dir.path()
+                .join("origin.git")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+
+        git(&root, &["init", "-b", "main", "work"]).await;
+        let work_dir = dir.path().join("work");
+        let work = work_dir.to_string_lossy().into_owned();
+        configure(&work).await;
+        write(&work_dir, "a.txt", "v0\n");
+        write(&work_dir, "b.txt", "b0\n");
+        commit_all(&work, "base").await;
+        git(&work, &["remote", "add", "origin", &url]).await;
+        git(&work, &["push", "-u", "origin", "main"]).await;
+
+        // The clone's own checkout must be LF too, before its config exists.
+        git(
+            &root,
+            &["-c", "core.autocrlf=false", "clone", &url, "clone"],
+        )
+        .await;
+        let clone = dir.path().join("clone").to_string_lossy().into_owned();
+        configure(&clone).await;
+        (dir, work, clone)
+    }
+
+    async fn stash_list(repo: &str) -> String {
+        git(repo, &["stash", "list"]).await.trim().to_string()
+    }
+
+    async fn unmerged(repo: &str) -> String {
+        git(repo, &["ls-files", "--unmerged"])
+            .await
+            .trim()
+            .to_string()
+    }
+
+    async fn head_branch(repo: &str) -> String {
+        git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .trim()
+            .to_string()
+    }
+
+    fn stderr_of(outcome: &AutostashOutcome) -> &str {
+        match outcome {
+            AutostashOutcome::ReapplyConflicted { stderr, .. }
+            | AutostashOutcome::OpFailedRestored { stderr }
+            | AutostashOutcome::OpFailedStashKept { stderr, .. } => stderr,
+            other => panic!("expected a failure-carrying outcome, got {other:?}"),
+        }
+    }
+
+    // ---- pull -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pull_autostash_reapplies_non_overlapping_changes() {
+        let (dir, work, clone) = setup_clone("pull-reapply").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        let clone_dir = dir.path().join("clone");
+        write(&clone_dir, "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_pull_autostash_core(&state, clone.clone(), "ffOnly".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(read(&clone_dir, "a.txt"), "upstream\n");
+        assert_eq!(read(&clone_dir, "b.txt"), "mine\n");
+        assert!(stash_list(&clone).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_autostash_reports_a_conflicted_reapply() {
+        let (dir, work, clone) = setup_clone("pull-conflict").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        write(&dir.path().join("clone"), "a.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_pull_autostash_core(&state, clone.clone(), "ffOnly".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::ReapplyConflicted {
+                    conflicted: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!stderr_of(&outcome).is_empty());
+        // git keeps the entry on a conflicted pop, and the tree is left unmerged.
+        assert!(!stash_list(&clone).await.is_empty());
+        assert!(unmerged(&clone).await.contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn pull_autostash_on_a_clean_tree_stashes_nothing() {
+        let (dir, work, clone) = setup_clone("pull-clean").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        let state = AppState::default();
+        let outcome = git_pull_autostash_core(&state, clone.clone(), "ffOnly".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::NothingStashed),
+            "{outcome:?}"
+        );
+        assert_eq!(read(&dir.path().join("clone"), "a.txt"), "upstream\n");
+        assert!(stash_list(&clone).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_autostash_restores_changes_when_ff_only_refuses() {
+        let (dir, work, clone) = setup_clone("pull-restore").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        // Diverge locally so --ff-only aborts, leaving no in-progress state.
+        let clone_dir = dir.path().join("clone");
+        write(&clone_dir, "b.txt", "local commit\n");
+        commit_all(&clone, "local").await;
+        write(&clone_dir, "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        let outcome = git_pull_autostash_core(&state, clone.clone(), "ffOnly".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::OpFailedRestored { .. }),
+            "{outcome:?}"
+        );
+        assert!(!stderr_of(&outcome).is_empty());
+        assert_eq!(read(&clone_dir, "b.txt"), "dirty\n");
+        assert!(stash_list(&clone).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_autostash_keeps_the_stash_when_a_rebase_conflicts() {
+        let (dir, work, clone) = setup_clone("pull-rebase").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        let clone_dir = dir.path().join("clone");
+        write(&clone_dir, "a.txt", "mine\n");
+        commit_all(&clone, "local").await;
+        write(&clone_dir, "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        let outcome = git_pull_autostash_core(&state, clone.clone(), "rebase".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::OpFailedStashKept {
+                    in_progress: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(crate::git::ops::op_state(&clone).await.unwrap().rebasing);
+        assert!(!stash_list(&clone).await.is_empty());
+    }
+
+    /// The clone has PUSHED `V`, and the upstream has since force-pushed over it
+    /// — the state a bare `git pull --rebase` replays out of existence. Returns
+    /// the fixture guard, the clone's path, and V's sha.
+    async fn setup_vaporize(marker: &str) -> (tempfile::TempDir, String, String) {
+        let (dir, work, clone) = setup_clone(marker).await;
+        let work_dir = dir.path().join("work");
+        let clone_dir = dir.path().join("clone");
+
+        write(&clone_dir, "v.txt", "v\n");
+        commit_all(&clone, "V the victim").await;
+        git(&clone, &["push"]).await;
+        let victim = git(&clone, &["rev-parse", "HEAD"]).await.trim().to_string();
+
+        git(&work, &["fetch"]).await;
+        git(&work, &["reset", "--hard", "origin/main~1"]).await;
+        write(&work_dir, "r.txt", "r\n");
+        commit_all(&work, "teammate rewrite").await;
+        git(&work, &["push", "--force"]).await;
+        (dir, clone, victim)
+    }
+
+    /// Phase A runs BEFORE the stash, so a refused pull leaves the dirty tree
+    /// exactly as it was — nothing stashed, nothing to settle.
+    #[tokio::test]
+    async fn pull_autostash_refuses_a_would_drop_before_stashing() {
+        let (dir, clone, victim) = setup_vaporize("would-drop").await;
+        let clone_dir = dir.path().join("clone");
+        write(&clone_dir, "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        let err = git_pull_autostash_core(&state, clone.clone(), "rebase".into())
+            .await
+            .expect_err("a pull that would drop a pushed commit must refuse");
+        assert!(
+            matches!(&err, AppError::PullRebaseWouldDrop(d) if d.commits.len() == 1),
+            "{err:?}"
+        );
+        assert!(
+            stash_list(&clone).await.is_empty(),
+            "the refusal comes before the stash"
+        );
+        assert_eq!(read(&clone_dir, "b.txt"), "dirty\n");
+        assert_eq!(git(&clone, &["rev-parse", "HEAD"]).await.trim(), victim);
+    }
+
+    /// And with nothing being rewritten away, the compound behaves exactly as it
+    /// did: stash, rebase, reapply.
+    #[tokio::test]
+    async fn pull_autostash_rebases_and_reapplies_when_nothing_would_drop() {
+        let (dir, work, clone) = setup_clone("rebase-reapply").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        let clone_dir = dir.path().join("clone");
+        write(&clone_dir, "b.txt", "local commit\n");
+        commit_all(&clone, "local").await;
+        write(&clone_dir, "c.txt", "dirty\n");
+
+        let state = AppState::default();
+        let outcome = git_pull_autostash_core(&state, clone.clone(), "rebase".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(read(&clone_dir, "a.txt"), "upstream\n");
+        assert_eq!(read(&clone_dir, "b.txt"), "local commit\n");
+        assert_eq!(read(&clone_dir, "c.txt"), "dirty\n");
+        assert!(stash_list(&clone).await.is_empty());
+        // The local commit was replayed on top of the upstream one.
+        assert_eq!(
+            git(&clone, &["log", "--format=%s"])
+                .await
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec!["local", "upstream"]
+        );
+    }
+
+    // ---- merge ------------------------------------------------------------
+
+    /// `main` with a `feat` branch that rewrote `a.txt`, checked out on `main`.
+    async fn setup_with_feat(marker: &str) -> (tempfile::TempDir, String) {
+        let (dir, repo) = setup_repo(marker).await;
+        git(&repo, &["switch", "-c", "feat"]).await;
+        write(dir.path(), "a.txt", "feat\n");
+        commit_all(&repo, "feat").await;
+        git(&repo, &["switch", "main"]).await;
+        (dir, repo)
+    }
+
+    /// The stash-and-retry flows read a branch picked by name as the BRANCH, never a
+    /// same-named tag. Each flow runs before any assertion, so one run shows all three.
+    #[tokio::test]
+    async fn autostash_flows_take_a_branch_shadowed_by_a_tag() {
+        let state = AppState::default();
+
+        // Merge: the tag sits on `main` itself, so merging it would be a no-op.
+        let (dir, repo) = setup_with_feat("merge-tag-shadow").await;
+        git(&repo, &["tag", "feat", "main"]).await;
+        write(dir.path(), "b.txt", "mine\n");
+        git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        let merged = read(dir.path(), "a.txt");
+
+        // Rebase: a `topic` off `main` replays onto the branch, not onto the tag.
+        let (dir2, repo2) = setup_with_feat("rebase-tag-shadow").await;
+        git(&repo2, &["tag", "feat", "main"]).await;
+        let feat_tip = git(&repo2, &["rev-parse", "refs/heads/feat"]).await;
+        git(&repo2, &["switch", "-c", "topic"]).await;
+        write(dir2.path(), "c.txt", "topic\n");
+        commit_all(&repo2, "topic").await;
+        write(dir2.path(), "b.txt", "mine\n");
+        git_rebase_autostash_core(&state, repo2.clone(), "feat".into())
+            .await
+            .unwrap();
+        let rebased = git(&repo2, &["rev-parse", "HEAD~1"]).await;
+
+        // Onto: same resolution for the new base.
+        let (dir3, repo3) = setup_with_feat("onto-tag-shadow").await;
+        git(&repo3, &["tag", "feat", "main"]).await;
+        let feat_tip3 = git(&repo3, &["rev-parse", "refs/heads/feat"]).await;
+        git(&repo3, &["switch", "-c", "wrong"]).await;
+        write(dir3.path(), "w.txt", "wrong\n");
+        commit_all(&repo3, "wrong base").await;
+        git(&repo3, &["switch", "-c", "topic"]).await;
+        write(dir3.path(), "c.txt", "topic\n");
+        commit_all(&repo3, "topic").await;
+        write(dir3.path(), "b.txt", "mine\n");
+        git_rebase_onto_autostash_core(&state, repo3.clone(), "feat".into(), "wrong".into())
+            .await
+            .unwrap();
+        let onto = git(&repo3, &["rev-parse", "HEAD~1"]).await;
+
+        assert_eq!(
+            (merged, rebased, onto),
+            ("feat\n".to_string(), feat_tip, feat_tip3)
+        );
+    }
+
+    /// A branch literally named `stash` stays the branch: the autostash's own push
+    /// mints `refs/stash`, which a bare `stash` resolves to first (refs/<name> is
+    /// checked before refs/heads), so the name is read only after that push.
+    #[tokio::test]
+    async fn merge_autostash_takes_a_branch_named_stash() {
+        let (dir, repo) = setup_repo("merge-branch-named-stash").await;
+        git(&repo, &["switch", "-c", "stash"]).await;
+        write(dir.path(), "s.txt", "branch\n");
+        commit_all(&repo, "stash branch work").await;
+        let branch_tip = git(&repo, &["rev-parse", "refs/heads/stash"]).await;
+        git(&repo, &["switch", "main"]).await;
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "stash".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]).await, branch_tip);
+        assert_eq!(read(dir.path(), "b.txt"), "mine\n");
+    }
+
+    #[tokio::test]
+    async fn merge_autostash_reapplies_non_overlapping_changes() {
+        let (dir, repo) = setup_with_feat("merge-reapply").await;
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(read(dir.path(), "a.txt"), "feat\n");
+        assert_eq!(read(dir.path(), "b.txt"), "mine\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_autostash_reports_a_conflicted_reapply() {
+        let (dir, repo) = setup_with_feat("merge-conflict").await;
+        write(dir.path(), "a.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::ReapplyConflicted {
+                    conflicted: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!stash_list(&repo).await.is_empty());
+        assert!(unmerged(&repo).await.contains("a.txt"));
+        // The sha names the entry git kept: the backup the banner offers to drop.
+        let AutostashOutcome::ReapplyConflicted { stash_sha, .. } = &outcome else {
+            unreachable!();
+        };
+        let kept = git(&repo, &["rev-parse", "refs/stash"]).await;
+        assert_eq!(stash_sha.as_deref(), Some(kept.trim()));
+    }
+
+    #[tokio::test]
+    async fn merge_autostash_on_a_clean_tree_stashes_nothing() {
+        let (dir, repo) = setup_with_feat("merge-clean").await;
+
+        let state = AppState::default();
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::NothingStashed),
+            "{outcome:?}"
+        );
+        assert_eq!(read(dir.path(), "a.txt"), "feat\n");
+    }
+
+    #[tokio::test]
+    async fn merge_autostash_restores_changes_when_the_merge_is_rejected() {
+        let (dir, repo) = setup_with_feat("merge-restore").await;
+        write(dir.path(), "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        // An unknown ref fails the merge outright — no MERGE_HEAD to protect.
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "nope".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::OpFailedRestored { .. }),
+            "{outcome:?}"
+        );
+        assert!(!stderr_of(&outcome).is_empty());
+        assert_eq!(read(dir.path(), "b.txt"), "dirty\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_autostash_keeps_the_stash_when_the_merge_conflicts() {
+        let (dir, repo) = setup_with_feat("merge-kept").await;
+        write(dir.path(), "a.txt", "main\n");
+        commit_all(&repo, "main side").await;
+        write(dir.path(), "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::OpFailedStashKept {
+                    in_progress: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        // A conflicted merge reports on stdout only, so the payload proves the
+        // stderr-empty fallback works.
+        assert!(stderr_of(&outcome).contains("CONFLICT"));
+        assert!(crate::git::ops::op_state(&repo).await.unwrap().merging);
+        assert!(!stash_list(&repo).await.is_empty());
+    }
+
+    // ---- rebase -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn rebase_autostash_reapplies_non_overlapping_changes() {
+        let (dir, repo) = setup_with_feat("rebase-reapply").await;
+        // Plain `rebase` refuses on a dirty `b.txt` even though the replay never
+        // touches it — the gap this compound closes.
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_rebase_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(read(dir.path(), "a.txt"), "feat\n");
+        assert_eq!(read(dir.path(), "b.txt"), "mine\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebase_autostash_reports_a_conflicted_reapply() {
+        let (dir, repo) = setup_with_feat("rebase-conflict").await;
+        write(dir.path(), "a.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_rebase_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::ReapplyConflicted {
+                    conflicted: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!stash_list(&repo).await.is_empty());
+        assert!(unmerged(&repo).await.contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn rebase_autostash_on_a_clean_tree_stashes_nothing() {
+        let (dir, repo) = setup_with_feat("rebase-clean").await;
+
+        let state = AppState::default();
+        let outcome = git_rebase_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::NothingStashed),
+            "{outcome:?}"
+        );
+        assert_eq!(read(dir.path(), "a.txt"), "feat\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebase_autostash_restores_changes_when_the_rebase_is_rejected() {
+        let (dir, repo) = setup_with_feat("rebase-restore").await;
+        write(dir.path(), "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        // An unknown upstream fails before any replay starts — nothing in progress.
+        let outcome = git_rebase_autostash_core(&state, repo.clone(), "nope".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::OpFailedRestored { .. }),
+            "{outcome:?}"
+        );
+        assert!(!stderr_of(&outcome).is_empty());
+        assert_eq!(read(dir.path(), "b.txt"), "dirty\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebase_autostash_keeps_the_stash_when_the_rebase_conflicts() {
+        let (dir, repo) = setup_with_feat("rebase-kept").await;
+        write(dir.path(), "a.txt", "main\n");
+        commit_all(&repo, "main side").await;
+        write(dir.path(), "b.txt", "dirty\n");
+
+        let state = AppState::default();
+        let outcome = git_rebase_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::OpFailedStashKept {
+                    in_progress: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        // A conflicted rebase splits its report across both streams, so the
+        // combined shaping has to carry the stdout half too.
+        let stderr = stderr_of(&outcome);
+        assert!(stderr.contains("could not apply"), "{stderr}");
+        assert!(stderr.contains("CONFLICT ("), "{stderr}");
+        assert!(crate::git::ops::op_state(&repo).await.unwrap().rebasing);
+        assert!(!stash_list(&repo).await.is_empty());
+    }
+
+    /// `topic` branched off `wrong` when it meant to sit on `main` — the shape
+    /// `rebase --onto main wrong` fixes, replaying `topic`'s own commit only.
+    async fn setup_with_wrong_base(marker: &str) -> (tempfile::TempDir, String) {
+        let (dir, repo) = setup_repo(marker).await;
+        git(&repo, &["switch", "-c", "wrong"]).await;
+        write(dir.path(), "c.txt", "wrong base\n");
+        commit_all(&repo, "wrong base work").await;
+        git(&repo, &["switch", "-c", "topic"]).await;
+        write(dir.path(), "d.txt", "topic\n");
+        commit_all(&repo, "topic work").await;
+        (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn rebase_onto_autostash_reapplies_and_drops_the_old_base() {
+        let (dir, repo) = setup_with_wrong_base("rebase-onto-reapply").await;
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome =
+            git_rebase_onto_autostash_core(&state, repo.clone(), "main".into(), "wrong".into())
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        // `topic`'s own commit moved; the wrong base's did not come along.
+        assert_eq!(read(dir.path(), "d.txt"), "topic\n");
+        assert!(!dir.path().join("c.txt").exists());
+        assert_eq!(read(dir.path(), "b.txt"), "mine\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    // ---- switch -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn switch_autostash_reapplies_on_the_target_branch() {
+        let (dir, repo) = setup_with_feat("switch-reapply").await;
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_switch_autostash_core(&state, repo.clone(), "feat".into(), None, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(head_branch(&repo).await, "feat");
+        assert_eq!(read(dir.path(), "b.txt"), "mine\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    /// The stash-and-switch twin of the remote-branch checkout: it tracks the
+    /// remote-tracking ref itself, since a tag named `<remote>/<name>` makes the bare
+    /// form ambiguous and git refuses to start from it.
+    #[tokio::test]
+    async fn switch_autostash_tracks_a_remote_ref_shadowed_by_a_tag() {
+        let (dir, repo) = setup_repo("switch-remote-tag-shadow").await;
+        git(&repo, &["remote", "add", "origin", &repo]).await;
+        // The tag sits on the seed commit, the remote branch one commit past it.
+        git(&repo, &["tag", "origin/landing"]).await;
+        write(dir.path(), "c.txt", "remote\n");
+        commit_all(&repo, "remote work").await;
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/landing", "HEAD"],
+        )
+        .await;
+        git(&repo, &["reset", "-q", "--hard", "HEAD~1"]).await;
+        let remote_tip = git(&repo, &["rev-parse", "refs/remotes/origin/landing"]).await;
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_switch_autostash_core(
+            &state,
+            repo.clone(),
+            "landing".into(),
+            Some("origin".into()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            git(&repo, &["symbolic-ref", "HEAD"]).await.trim(),
+            "refs/heads/landing"
+        );
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]).await, remote_tip);
+        assert_eq!(
+            git(&repo, &["config", "--get", "branch.landing.merge"])
+                .await
+                .trim(),
+            "refs/heads/landing"
+        );
+        assert_eq!(read(dir.path(), "b.txt"), "mine\n");
+        assert!(stash_list(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_autostash_without_reapply_leaves_the_stash() {
+        let (dir, repo) = setup_with_feat("switch-stashed").await;
+        write(dir.path(), "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_switch_autostash_core(&state, repo.clone(), "feat".into(), None, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::StashedOnly),
+            "{outcome:?}"
+        );
+        assert_eq!(head_branch(&repo).await, "feat");
+        assert!(!stash_list(&repo).await.is_empty());
+        assert!(git(&repo, &["status", "--porcelain"])
+            .await
+            .trim()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_autostash_reports_a_conflicted_reapply() {
+        let (dir, repo) = setup_with_feat("switch-conflict").await;
+        write(dir.path(), "a.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_switch_autostash_core(&state, repo.clone(), "feat".into(), None, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::ReapplyConflicted {
+                    conflicted: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(head_branch(&repo).await, "feat");
+        assert!(!stash_list(&repo).await.is_empty());
+        assert!(unmerged(&repo).await.contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn switch_autostash_tracks_a_remote_only_branch() {
+        let (dir, work, clone) = setup_clone("switch-remote").await;
+        let work_dir = dir.path().join("work");
+        git(&work, &["switch", "-c", "feat"]).await;
+        write(&work_dir, "a.txt", "feat\n");
+        commit_all(&work, "feat").await;
+        git(&work, &["push", "-u", "origin", "feat"]).await;
+        git(&clone, &["fetch"]).await;
+
+        let clone_dir = dir.path().join("clone");
+        write(&clone_dir, "b.txt", "mine\n");
+
+        let state = AppState::default();
+        let outcome = git_switch_autostash_core(
+            &state,
+            clone.clone(),
+            "feat".into(),
+            Some("origin".into()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(head_branch(&clone).await, "feat");
+        assert_eq!(read(&clone_dir, "a.txt"), "feat\n");
+        assert_eq!(read(&clone_dir, "b.txt"), "mine\n");
+    }
+
+    // ---- contract ---------------------------------------------------------
+
+    /// The whole feature triggers off git's English refusal wording, matched in
+    /// `src/lib/error-summary.ts`. These literals are duplicated here ON PURPOSE:
+    /// a git release that rewords one would otherwise kill the recovery flow
+    /// silently, and this is the only thing that would notice.
+    #[tokio::test]
+    async fn refusal_stderr_still_matches_the_frontend_markers() {
+        const MERGE_TRACKED: &str =
+            "your local changes to the following files would be overwritten by merge";
+        const MERGE_UNTRACKED: &str =
+            "the following untracked working tree files would be overwritten by merge";
+        const CHECKOUT_TRACKED: &str =
+            "your local changes to the following files would be overwritten by checkout";
+        const CHECKOUT_UNTRACKED: &str =
+            "the following untracked working tree files would be overwritten by checkout";
+        const PULL_REBASE_UNSTAGED: &str = "cannot pull with rebase: you have unstaged changes";
+        const PULL_REBASE_STAGED: &str =
+            "cannot pull with rebase: your index contains uncommitted changes";
+        const REBASE_UNSTAGED: &str = "cannot rebase: you have unstaged changes";
+        const REBASE_STAGED: &str = "cannot rebase: your index contains uncommitted changes";
+
+        async fn refusal(repo: &str, args: &[&str]) -> String {
+            let out = run_git_raw(Some(repo), args, DEFAULT_TIMEOUT)
+                .await
+                .unwrap();
+            assert_ne!(out.code, 0, "expected git to refuse {args:?}");
+            out.stderr.to_lowercase()
+        }
+        fn assert_marker(stderr: &str, marker: &str) {
+            assert!(
+                stderr.contains(marker),
+                "git no longer emits {marker:?} — the frontend classifier is now blind to this \
+                 refusal. Actual stderr:\n{stderr}"
+            );
+        }
+
+        // Tracked overlap: `feat` rewrote a.txt and so did the working tree.
+        let (dir, repo) = setup_with_feat("markers-tracked").await;
+        write(dir.path(), "a.txt", "dirty\n");
+        assert_marker(
+            &refusal(&repo, &["merge", "--no-edit", "feat"]).await,
+            MERGE_TRACKED,
+        );
+        assert_marker(&refusal(&repo, &["switch", "feat"]).await, CHECKOUT_TRACKED);
+
+        // Untracked overlap: `feat` adds a file the working tree already has.
+        let (dir, repo) = setup_repo("markers-untracked").await;
+        git(&repo, &["switch", "-c", "feat"]).await;
+        write(dir.path(), "u.txt", "theirs\n");
+        commit_all(&repo, "add untracked-to-be").await;
+        git(&repo, &["switch", "main"]).await;
+        write(dir.path(), "u.txt", "mine\n");
+        assert_marker(
+            &refusal(&repo, &["merge", "--no-edit", "feat"]).await,
+            MERGE_UNTRACKED,
+        );
+        assert_marker(
+            &refusal(&repo, &["switch", "feat"]).await,
+            CHECKOUT_UNTRACKED,
+        );
+
+        // `pull --rebase` refuses up front, with a different line per dirty kind.
+        let (dir, work, clone) = setup_clone("markers-rebase").await;
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        write(&dir.path().join("clone"), "b.txt", "dirty\n");
+        assert_marker(
+            &refusal(&clone, &["pull", "--rebase"]).await,
+            PULL_REBASE_UNSTAGED,
+        );
+        git(&clone, &["add", "b.txt"]).await;
+        assert_marker(
+            &refusal(&clone, &["pull", "--rebase"]).await,
+            PULL_REBASE_STAGED,
+        );
+
+        // A plain `rebase` refuses on ANY dirty tracked file, overlapping or not
+        // — `b.txt` is untouched by `feat` on purpose — and says it in its own
+        // wording, which the "cannot pull with rebase" lines above do not cover.
+        let (dir, repo) = setup_with_feat("markers-rebase-plain").await;
+        write(dir.path(), "b.txt", "dirty\n");
+        assert_marker(&refusal(&repo, &["rebase", "feat"]).await, REBASE_UNSTAGED);
+        git(&repo, &["add", "b.txt"]).await;
+        assert_marker(&refusal(&repo, &["rebase", "feat"]).await, REBASE_STAGED);
+
+        // `--onto` refuses with the same two lines, so one marker pair covers both
+        // compounds.
+        let (dir, repo) = setup_with_feat("markers-rebase-onto").await;
+        write(dir.path(), "b.txt", "dirty\n");
+        assert_marker(
+            &refusal(&repo, &["rebase", "--onto", "feat", "main"]).await,
+            REBASE_UNSTAGED,
+        );
+        git(&repo, &["add", "b.txt"]).await;
+        assert_marker(
+            &refusal(&repo, &["rebase", "--onto", "feat", "main"]).await,
+            REBASE_STAGED,
+        );
+    }
+
+    /// The FALLBACK conflict summary in `src/lib/error-summary.ts` keys off the
+    /// ANCHORED shapes of these lines — the arm that classifies any producer not
+    /// carrying `AppError::Conflict`, this compound's own outcomes included — so a
+    /// git release that reworded one would silently change how those present.
+    /// Markers 1-2 guard live toast classification; markers 3-4 ride stdout, which
+    /// only the paths shaping their error through `GitOutput::failure_text` /
+    /// `full_failure_text` carry.
+    ///
+    /// The STREAM SPLIT each family reports on is pinned here too, because the
+    /// shaping choice depends on it: a family that writes to both streams needs
+    /// the combined text, and a substitution would silently drop half its report.
+    #[tokio::test]
+    async fn conflict_output_still_matches_the_anchored_frontend_markers() {
+        // Mirrors of the four CONFLICT_MARKERS regexes, in plain string ops.
+        // Splitting on a bare CR as well as LF mirrors ECMAScript `/m`, which ends
+        // a line at either; git has been observed joining its `Rebasing (n/m)`
+        // progress to the diagnostic that follows with one.
+        fn lines(text: &str) -> std::str::Split<'_, [char; 2]> {
+            text.split(['\n', '\r'])
+        }
+        // Mirrors CONFLICT_MARKERS[0], which covers BOTH verbs — rebase and
+        // cherry-pick echo `could not apply`, revert `could not revert`, and for a
+        // revert that line is the only conflict evidence the error carries. Same
+        // shape as `is_subject_echo` on purpose (see the marker's comment).
+        fn could_not_apply_or_revert(text: &str) -> bool {
+            lines(text).any(is_subject_echo)
+        }
+        fn resolve_all_conflicts(text: &str) -> bool {
+            lines(text).any(|line| {
+                line.strip_prefix("error: ")
+                    .or_else(|| line.strip_prefix("hint: "))
+                    .is_some_and(|rest| rest.starts_with("Resolve all conflicts"))
+            })
+        }
+        fn conflict_paren(text: &str) -> bool {
+            lines(text).any(|line| line.starts_with("CONFLICT ("))
+        }
+        fn needs_merge(text: &str) -> bool {
+            lines(text).any(|line| line.trim_end().ends_with(": needs merge"))
+        }
+        // Mirrors SUBJECT_ECHO_LINE + OP_ADVICE (error-summary.ts): the paused op
+        // is read from `git <op> --continue` advice ONLY — never an `--abort`
+        // remedy, and never the line that echoes the commit subject.
+        fn is_subject_echo(line: &str) -> bool {
+            let rest = line.strip_prefix("error: ").unwrap_or(line);
+            [
+                "could not apply ",
+                "Could not apply ",
+                "could not revert ",
+                "Could not revert ",
+            ]
+            .iter()
+            .any(|prefix| rest.starts_with(prefix))
+        }
+        fn advises_continue(text: &str, op: &str) -> bool {
+            let advice = format!("git {op} --continue");
+            lines(text).any(|line| !is_subject_echo(line) && line.contains(&advice))
+        }
+        fn assert_shape(matched: bool, shape: &str, output: &str) {
+            assert!(
+                matched,
+                "git no longer emits a line shaped {shape:?} — the frontend classifier is now \
+                 blind to this conflict. Actual output:\n{output}"
+            );
+        }
+
+        let (dir, repo) = setup_repo("conflict-markers").await;
+        git(&repo, &["switch", "-c", "feat"]).await;
+        write(dir.path(), "a.txt", "theirs\n");
+        // The subject names a DIFFERENT op on purpose: git echoes it onto the
+        // `could not apply` line, where only the anchor keeps it from classifying.
+        commit_all(&repo, "rebase the parser").await;
+        git(&repo, &["switch", "main"]).await;
+        write(dir.path(), "a.txt", "mine\n");
+        commit_all(&repo, "local change").await;
+
+        let cherry = run_git_raw(Some(&repo), &["cherry-pick", "feat"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert_ne!(cherry.code, 0, "expected the cherry-pick to conflict");
+        assert_shape(
+            could_not_apply_or_revert(&cherry.stderr),
+            "error: could not apply <sha>…",
+            &cherry.stderr,
+        );
+        assert_shape(
+            conflict_paren(&cherry.stdout_lossy()),
+            "CONFLICT (…",
+            &cherry.stdout_lossy(),
+        );
+        // The split itself: both halves non-empty, which is why the sequencer
+        // families shape their error with `full_failure_text` rather than
+        // substituting one stream for the other.
+        assert!(
+            !cherry.stderr.trim().is_empty() && !cherry.stdout_lossy().trim().is_empty(),
+            "a conflicted cherry-pick still splits its report across both streams — \
+             stderr:\n{}\nstdout:\n{}",
+            cherry.stderr,
+            cherry.stdout_lossy()
+        );
+        assert!(
+            advises_continue(&cherry.stderr, "cherry-pick"),
+            "git no longer advises `git cherry-pick --continue` outside the subject-echo line — \
+             the frontend would name every paused cherry-pick \"Operation\". Actual stderr:\n{}",
+            cherry.stderr
+        );
+        git(&repo, &["cherry-pick", "--abort"]).await;
+
+        let rebase = run_git_raw(Some(&repo), &["rebase", "feat"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert_ne!(rebase.code, 0, "expected the rebase to conflict");
+        assert_shape(
+            resolve_all_conflicts(&rebase.stderr),
+            "hint: Resolve all conflicts…",
+            &rebase.stderr,
+        );
+        assert_shape(
+            could_not_apply_or_revert(&rebase.stderr),
+            "Could not apply <sha>…",
+            &rebase.stderr,
+        );
+        assert!(
+            advises_continue(&rebase.stderr, "rebase"),
+            "git no longer advises `git rebase --continue` outside the subject-echo line — \
+             the frontend would name every paused rebase \"Operation\". Actual stderr:\n{}",
+            rebase.stderr
+        );
+
+        assert!(
+            !rebase.stderr.trim().is_empty() && !rebase.stdout_lossy().trim().is_empty(),
+            "a conflicted rebase still splits its report across both streams — \
+             stderr:\n{}\nstdout:\n{}",
+            rebase.stderr,
+            rebase.stdout_lossy()
+        );
+
+        // Continuing without resolving is the one sequencer case that is
+        // stdout-ONLY: `core.editor` is pinned so a future git that got past the
+        // check can't block on an editor. `op_continue` shapes its error through
+        // the combined text, so an empty stderr here must not swallow the report.
+        let cont = run_git_raw(
+            Some(&repo),
+            &["-c", "core.editor=true", "rebase", "--continue"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_ne!(cont.code, 0, "expected --continue to refuse unmerged files");
+        assert_shape(
+            needs_merge(&cont.stdout_lossy()),
+            "<path>: needs merge",
+            &cont.stdout_lossy(),
+        );
+        assert!(
+            cont.stderr.trim().is_empty(),
+            "a refused `rebase --continue` still reports on stdout alone — the reason \
+             op_continue carries stdout into its error. Actual stderr:\n{}",
+            cont.stderr
+        );
+        git(&repo, &["rebase", "--abort"]).await;
+
+        // Revert: its own advice verb, the `could not revert` echo on stderr, and
+        // the `CONFLICT (…` list on stdout — `git_revert_core` carries both, so
+        // both are pinned. Reverting the SECOND-newest commit conflicts; the
+        // newest would apply cleanly.
+        write(dir.path(), "a.txt", "one\n");
+        commit_all(&repo, "one").await;
+        write(dir.path(), "a.txt", "two\n");
+        commit_all(&repo, "two").await;
+        let revert = run_git_raw(
+            Some(&repo),
+            &["revert", "--no-edit", "HEAD~1"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_ne!(revert.code, 0, "expected the revert to conflict");
+        assert_shape(
+            could_not_apply_or_revert(&revert.stderr),
+            "error: could not revert <sha>…",
+            &revert.stderr,
+        );
+        assert_shape(
+            conflict_paren(&revert.stdout_lossy()),
+            "CONFLICT (…",
+            &revert.stdout_lossy(),
+        );
+        assert!(
+            !revert.stderr.trim().is_empty() && !revert.stdout_lossy().trim().is_empty(),
+            "a conflicted revert still splits its report across both streams — \
+             stderr:\n{}\nstdout:\n{}",
+            revert.stderr,
+            revert.stdout_lossy()
+        );
+        assert!(
+            advises_continue(&revert.stderr, "revert"),
+            "git no longer advises `git revert --continue` outside the subject-echo line — \
+             the frontend would name every paused revert \"Operation\". Actual stderr:\n{}",
+            revert.stderr
+        );
+        git(&repo, &["revert", "--abort"]).await;
+
+        // Merge is the one conflict family with NO `--continue` advice: it reports
+        // on stdout and leaves stderr EMPTY, so the frontend reads the verdict line
+        // to name it. Asserting the advice here would fail against correct git —
+        // this pins the reality instead.
+        let merge = run_git_raw(
+            Some(&repo),
+            &["merge", "--no-edit", "feat"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_ne!(merge.code, 0, "expected the merge to conflict");
+        assert_shape(
+            conflict_paren(&merge.stdout_lossy()),
+            "CONFLICT (…",
+            &merge.stdout_lossy(),
+        );
+        // Line-anchored, mirroring MERGE_VERDICT (error-summary.ts) — that is the
+        // only line naming the op for a merge, since there is no advice to read.
+        assert_shape(
+            lines(&merge.stdout_lossy()).any(|l| l.starts_with("Automatic merge failed")),
+            "Automatic merge failed…",
+            &merge.stdout_lossy(),
+        );
+        assert!(
+            merge.stderr.trim().is_empty(),
+            "a conflicted merge still leaves stderr empty — the reason git_merge_core \
+             backfills stdout. Actual stderr:\n{}",
+            merge.stderr
+        );
+
+        // A merge-mode PULL is the same conflict on stdout, but its stderr is NOT
+        // empty: the fetch writes its summary there. That combination is what makes
+        // a stderr-or-stdout substitution a silent no-op for pull, and the reason
+        // `run_git_mutating_with_creds` shapes with `full_failure_text`.
+        let (pull_dir, work, clone) = setup_clone("conflict-markers-pull").await;
+        write(&pull_dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+        write(&pull_dir.path().join("clone"), "a.txt", "mine\n");
+        commit_all(&clone, "local").await;
+
+        let pull = run_git_raw(Some(&clone), &["pull", "--no-rebase"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert_ne!(pull.code, 0, "expected the pull to conflict");
+        assert_shape(
+            conflict_paren(&pull.stdout_lossy()),
+            "CONFLICT (…",
+            &pull.stdout_lossy(),
+        );
+        assert_shape(
+            lines(&pull.stdout_lossy()).any(|l| l.starts_with("Automatic merge failed")),
+            "Automatic merge failed…",
+            &pull.stdout_lossy(),
+        );
+        assert!(
+            !pull.stderr.trim().is_empty(),
+            "a conflicted pull still writes its fetch summary to stderr — the reason \
+             substituting stdout for an empty stderr would drop the merge verdict"
+        );
+    }
+
+    #[test]
+    fn outcome_serializes_to_the_pinned_wire_shape() {
+        // The frontend branches on these exact strings; `rename_all` alone does NOT
+        // cover fields, so the `stderr` casing is pinned here too.
+        let json = |o: &AutostashOutcome| serde_json::to_string(o).unwrap();
+        assert_eq!(
+            json(&AutostashOutcome::NothingStashed),
+            r#"{"kind":"nothingStashed"}"#
+        );
+        assert_eq!(
+            json(&AutostashOutcome::StashedOnly),
+            r#"{"kind":"stashedOnly"}"#
+        );
+        assert_eq!(
+            json(&AutostashOutcome::Reapplied),
+            r#"{"kind":"reapplied"}"#
+        );
+        assert_eq!(
+            json(&AutostashOutcome::ReapplyConflicted {
+                stderr: "boom".into(),
+                conflicted: true,
+                stash_sha: None,
+            }),
+            r#"{"kind":"reapplyConflicted","stderr":"boom","conflicted":true,"stashSha":null}"#
+        );
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let kept = AutostashOutcome::ReapplyConflicted {
+            stderr: "boom".into(),
+            conflicted: false,
+            stash_sha: Some(sha.into()),
+        };
+        assert_eq!(
+            json(&kept),
+            format!(
+                r#"{{"kind":"reapplyConflicted","stderr":"boom","conflicted":false,"stashSha":"{sha}"}}"#
+            )
+        );
+        let wire = serde_json::to_value(&kept).unwrap();
+        assert_eq!(wire["stashSha"], sha);
+        assert!(!wire.as_object().unwrap().contains_key("stash_sha"));
+        assert_eq!(
+            json(&AutostashOutcome::OpFailedRestored {
+                stderr: "boom".into()
+            }),
+            r#"{"kind":"opFailedRestored","stderr":"boom"}"#
+        );
+        assert_eq!(
+            json(&AutostashOutcome::OpFailedStashKept {
+                stderr: "boom".into(),
+                in_progress: true
+            }),
+            r#"{"kind":"opFailedStashKept","stderr":"boom","inProgress":true}"#
+        );
+        assert_eq!(
+            json(&AutostashOutcome::OpFailedStashKept {
+                stderr: "boom".into(),
+                in_progress: false
+            }),
+            r#"{"kind":"opFailedStashKept","stderr":"boom","inProgress":false}"#
+        );
+
+        let drop = |o: &StashDropOutcome| serde_json::to_string(o).unwrap();
+        assert_eq!(drop(&StashDropOutcome::Dropped), r#"{"kind":"dropped"}"#);
+        assert_eq!(drop(&StashDropOutcome::Moved), r#"{"kind":"moved"}"#);
+        assert_eq!(drop(&StashDropOutcome::Gone), r#"{"kind":"gone"}"#);
+        let failed = StashDropOutcome::RestoreFailed {
+            dropped_sha: sha.into(),
+        };
+        assert_eq!(
+            drop(&failed),
+            format!(r#"{{"kind":"restoreFailed","droppedSha":"{sha}"}}"#)
+        );
+        let wire = serde_json::to_value(&failed).unwrap();
+        assert!(!wire.as_object().unwrap().contains_key("dropped_sha"));
+    }
+
+    // ---- SHA-verified backup drop ------------------------------------------
+
+    async fn stash_shas(repo: &str) -> Vec<String> {
+        git(repo, &["stash", "list", "--format=%H"])
+            .await
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Stashes a fresh edit of `b.txt` and returns the new entry's sha.
+    async fn push_stash(dir: &std::path::Path, repo: &str, content: &str) -> String {
+        write(dir, "b.txt", content);
+        git(repo, &["stash", "push"]).await;
+        git(repo, &["rev-parse", "refs/stash"])
+            .await
+            .trim()
+            .to_string()
+    }
+
+    /// Only the matched entry goes: an OLDER stash beneath the backup survives, so a
+    /// drop that cleared the whole list (or took the wrong slot) fails here.
+    #[tokio::test]
+    async fn drop_by_sha_drops_only_the_matching_backup() {
+        let (dir, repo) = setup_with_feat("drop-exact").await;
+        let older = push_stash(dir.path(), &repo, "older\n").await;
+        write(dir.path(), "a.txt", "mine\n");
+        let state = AppState::default();
+        let outcome = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap();
+        let AutostashOutcome::ReapplyConflicted {
+            conflicted: true,
+            stash_sha: Some(backup),
+            ..
+        } = outcome
+        else {
+            panic!("expected a conflicted reapply with its sha, got {outcome:?}");
+        };
+        assert_eq!(stash_shas(&repo).await, vec![backup.clone(), older.clone()]);
+
+        let verdict = git_drop_stash_by_sha_core(&state, repo.clone(), backup)
+            .await
+            .unwrap();
+        assert!(matches!(verdict, StashDropOutcome::Dropped), "{verdict:?}");
+        assert_eq!(stash_shas(&repo).await, vec![older]);
+    }
+
+    /// The compensation arm, driven directly since the race it repairs can't be
+    /// staged: an entry dropped from the top goes back on top under its own
+    /// message.
+    #[tokio::test]
+    async fn restore_dropped_stores_the_raced_entry_back() {
+        let (dir, repo) = setup_repo("drop-restore").await;
+        let older = push_stash(dir.path(), &repo, "older\n").await;
+        write(dir.path(), "b.txt", "raced\n");
+        git(&repo, &["stash", "push", "-m", "raced push"]).await;
+        let raced = git(&repo, &["rev-parse", "refs/stash"])
+            .await
+            .trim()
+            .to_string();
+        let listing = git(&repo, &["stash", "list", "--format=%H%x09%gs"]).await;
+        async fn top_subject(repo: &str) -> String {
+            git(repo, &["stash", "list", "-1", "--format=%gs"])
+                .await
+                .trim()
+                .to_string()
+        }
+        let before = top_subject(&repo).await;
+        assert_eq!(before, "On main: raced push");
+        git(&repo, &["stash", "drop", "stash@{0}"]).await;
+        assert_eq!(stash_shas(&repo).await, vec![older.clone()]);
+
+        let verdict = restore_dropped(&repo, &listing, raced.clone()).await;
+        assert!(matches!(verdict, StashDropOutcome::Moved), "{verdict:?}");
+        assert_eq!(stash_shas(&repo).await, vec![raced, older]);
+        assert_eq!(top_subject(&repo).await, before);
+    }
+
+    /// git refuses to store an id with no object behind it ("is not a stash-like
+    /// commit", exit 128), so the lost entry is named rather than reported moved.
+    #[tokio::test]
+    async fn restore_dropped_names_an_entry_it_could_not_store() {
+        let (dir, repo) = setup_repo("drop-restore-fails").await;
+        let older = push_stash(dir.path(), &repo, "older\n").await;
+        let missing = "f".repeat(40);
+
+        let verdict = restore_dropped(&repo, "", missing.clone()).await;
+        assert!(
+            matches!(&verdict, StashDropOutcome::RestoreFailed { dropped_sha } if *dropped_sha == missing),
+            "{verdict:?}"
+        );
+        assert_eq!(
+            stash_shas(&repo).await,
+            vec![older],
+            "the list is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_by_sha_refuses_a_backup_that_moved() {
+        let (dir, repo) = setup_repo("drop-moved").await;
+        let backup = push_stash(dir.path(), &repo, "backup\n").await;
+        let newer = push_stash(dir.path(), &repo, "newer\n").await;
+
+        let state = AppState::default();
+        let verdict = git_drop_stash_by_sha_core(&state, repo.clone(), backup.clone())
+            .await
+            .unwrap();
+        assert!(matches!(verdict, StashDropOutcome::Moved), "{verdict:?}");
+        assert_eq!(
+            stash_shas(&repo).await,
+            vec![newer, backup],
+            "nothing dropped"
+        );
+    }
+
+    /// Also the format pin for `dropped_sha`: under the runner's pinned locale git
+    /// confirms an explicit-slot drop on STDOUT, and the parser must read it there.
+    #[tokio::test]
+    async fn drop_by_sha_refuses_a_backup_that_is_gone() {
+        let (dir, repo) = setup_repo("drop-gone").await;
+        let backup = push_stash(dir.path(), &repo, "backup\n").await;
+        let external = run_git(
+            Some(&repo),
+            &["stash", "drop", "stash@{0}"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dropped_sha(&external.stdout_lossy()).as_deref(),
+            Some(backup.as_str()),
+            "stdout: {:?} stderr: {:?}",
+            external.stdout_lossy(),
+            external.stderr
+        );
+        assert!(stash_shas(&repo).await.is_empty());
+
+        let state = AppState::default();
+        let verdict = git_drop_stash_by_sha_core(&state, repo.clone(), backup)
+            .await
+            .unwrap();
+        assert!(matches!(verdict, StashDropOutcome::Gone), "{verdict:?}");
+    }
+
+    /// The sha is the command's only argv input, so its grammar is checked before any
+    /// git runs: the repo path here does not exist, and a spawned git would fail
+    /// differently.
+    #[tokio::test]
+    async fn drop_by_sha_rejects_a_malformed_sha_before_running_git() {
+        let missing = std::env::temp_dir()
+            .join("gd-autostash-no-such-repo")
+            .to_string_lossy()
+            .into_owned();
+        let state = AppState::default();
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcdef0123456",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456g",
+            "--output=0123456789abcdef0123456789abcdef01",
+            "0123456789abcdef0123456789abcdef01234567 ",
+        ] {
+            let err = git_drop_stash_by_sha_core(&state, missing.clone(), bad.into())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AppError::InvalidArgument(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stash_tip_tells_a_failed_read_from_a_missing_ref() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            classify_stash_tip(0, &format!("{sha}\n"), "").unwrap(),
+            Some(sha.to_string())
+        );
+        assert_eq!(classify_stash_tip(1, "", "").unwrap(), None);
+        for (code, stdout, stderr) in [
+            (128, "", "fatal: not a git repository"),
+            (128, "", ""),
+            (0, "", ""),
+            (1, sha, ""),
+            (2, "", ""),
+            (-1, "", ""),
+        ] {
+            let err = classify_stash_tip(code, stdout, stderr).unwrap_err();
+            assert!(matches!(err, AppError::Git { .. }), "{code}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_kept_backup_sha_needs_the_tip_unmoved_across_the_pop() {
+        let a = || Ok(Some("a".repeat(40)));
+        let b = || Ok(Some("b".repeat(40)));
+        let failed = || Err(AppError::Command("rev-parse failed".into()));
+        assert_eq!(kept_backup_sha(a(), a()), Some("a".repeat(40)));
+        assert_eq!(
+            kept_backup_sha(a(), b()),
+            None,
+            "the pop took another entry"
+        );
+        assert_eq!(kept_backup_sha(Ok(None), a()), None);
+        assert_eq!(kept_backup_sha(a(), Ok(None)), None);
+        assert_eq!(kept_backup_sha(failed(), a()), None);
+        assert_eq!(kept_backup_sha(a(), failed()), None);
+    }
+
+    #[test]
+    fn dropped_sha_reads_the_trailing_object_id() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for sha in [sha1, sha256] {
+            for rev in ["stash@{0}", "refs/stash@{0}"] {
+                assert_eq!(
+                    dropped_sha(&format!("Dropped {rev} ({sha})\n")).as_deref(),
+                    Some(sha),
+                    "{rev}"
+                );
+            }
+        }
+        assert_eq!(
+            dropped_sha(&format!("noise\r\nDropped stash@{{0}} ({sha1})\r\n")).as_deref(),
+            Some(sha1)
+        );
+        for junk in [
+            "",
+            "Dropped stash@{0}",
+            "Dropped stash@{0} ()",
+            "Dropped stash@{0} (not-a-sha)",
+            "Dropped stash@{0} (0123456789abcdef)",
+            "error: stash@{0} is not a valid reference",
+        ] {
+            assert_eq!(dropped_sha(junk), None, "{junk:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn autostash_refuses_mid_merge() {
+        let (dir, repo) = setup_with_feat("guard").await;
+        write(dir.path(), "a.txt", "main\n");
+        commit_all(&repo, "main side").await;
+        // A real conflicted merge: unmerged index entries, mid-resolve.
+        run_git_raw(
+            Some(&repo),
+            &["merge", "--no-edit", "feat"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(!unmerged(&repo).await.is_empty());
+
+        let state = AppState::default();
+        let err = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::InvalidArgument(m) if m.contains("conflict is in progress")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autostash_refuses_a_staged_but_uncommitted_merge() {
+        let (dir, repo) = setup_with_feat("guard-staged").await;
+        write(dir.path(), "a.txt", "main\n");
+        commit_all(&repo, "main side").await;
+        run_git_raw(
+            Some(&repo),
+            &["merge", "--no-edit", "feat"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        // Conflicts resolved and staged, merge not committed: no unmerged entries
+        // left, so only the op-state half of the guard can catch this.
+        write(dir.path(), "a.txt", "resolved\n");
+        git(&repo, &["add", "a.txt"]).await;
+        assert!(unmerged(&repo).await.is_empty());
+        assert!(crate::git::ops::op_state(&repo).await.unwrap().merging);
+
+        let state = AppState::default();
+        let err = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::InvalidArgument(m) if m.contains("merge, rebase, cherry-pick or revert is in progress")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_keeps_the_stash_when_the_restore_pop_fails() {
+        let (dir, repo) = setup_repo("restore-pop-fails").await;
+        write(dir.path(), "b.txt", "stashed\n");
+        git(&repo, &["stash", "push", "--include-untracked"]).await;
+        // A conflicting local edit makes the restore-pop refuse outright, with no
+        // op state to explain it.
+        write(dir.path(), "b.txt", "blocking\n");
+        let op = run_git_raw(
+            Some(&repo),
+            &["merge", "--no-edit", "nope"],
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+
+        let outcome = settle(&repo, "merge", true, true, op).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::OpFailedStashKept {
+                    in_progress: false,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!stderr_of(&outcome).is_empty());
+        assert!(!stash_list(&repo).await.is_empty());
+        assert_eq!(read(dir.path(), "b.txt"), "blocking\n");
+    }
+
+    #[tokio::test]
+    async fn settle_reports_an_aborted_pop_as_not_conflicted() {
+        let (dir, repo) = setup_repo("pop-aborted").await;
+        write(dir.path(), "u.txt", "mine\n");
+        git(&repo, &["stash", "push", "--include-untracked"]).await;
+        // An untracked file back in the way makes git abort the pop before merging
+        // anything: the stash is kept but there is nothing conflicted to resolve.
+        write(dir.path(), "u.txt", "other\n");
+        let op = run_git_raw(Some(&repo), &["rev-parse", "HEAD"], DEFAULT_TIMEOUT).await;
+
+        let outcome = settle(&repo, "merge", true, true, op).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AutostashOutcome::ReapplyConflicted {
+                    conflicted: false,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!stderr_of(&outcome).is_empty());
+        assert!(!stash_list(&repo).await.is_empty());
+        assert!(unmerged(&repo).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_nothing_stashed_matches_the_plain_command_error() {
+        let (_dir, repo) = setup_repo("plain-parity").await;
+        let state = AppState::default();
+
+        let compound = git_merge_autostash_core(&state, repo.clone(), "nope".into())
+            .await
+            .unwrap_err();
+        let plain = crate::git::ops::git_merge_core(
+            &state,
+            repo.clone(),
+            "nope".into(),
+            false,
+            false,
+            "none".into(),
+        )
+        .await
+        .unwrap_err();
+
+        match (&compound, &plain) {
+            (
+                AppError::Git {
+                    code: a,
+                    stderr: a_err,
+                },
+                AppError::Git {
+                    code: b,
+                    stderr: b_err,
+                },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(a_err, b_err);
+            }
+            other => panic!("expected two git errors, got {other:?}"),
+        }
+    }
+
+    /// The same parity in the shape that actually loses information: a conflicted
+    /// merge reports on STDOUT and leaves stderr empty, and this arm is reached
+    /// exactly when nothing was stashed — the clean tree a dirty-tree recovery
+    /// leaves behind once the user commits or the changes are already away.
+    /// Pull has its own arm below (a different stream split); switch never will,
+    /// since a failing `git switch` writes no stdout to lose.
+    ///
+    /// The parity covers the VARIANT as well as git's text: both sides name the
+    /// paused operation structurally, so the frontend cannot tell which entry
+    /// point produced the error.
+    #[tokio::test]
+    async fn a_conflict_with_nothing_stashed_carries_the_stdout_report() {
+        let (dir, repo) = setup_with_feat("plain-parity-conflict").await;
+        // Diverge `main` so the merge conflicts instead of fast-forwarding, and
+        // leave the tree CLEAN so `settle` takes its no-stash arm.
+        write(dir.path(), "a.txt", "mine\n");
+        commit_all(&repo, "local change").await;
+        let state = AppState::default();
+
+        let compound = git_merge_autostash_core(&state, repo.clone(), "feat".into())
+            .await
+            .unwrap_err();
+        assert!(stash_list(&repo).await.is_empty(), "nothing was stashed");
+        git(&repo, &["merge", "--abort"]).await;
+        let plain = crate::git::ops::git_merge_core(
+            &state,
+            repo.clone(),
+            "feat".into(),
+            false,
+            false,
+            "none".into(),
+        )
+        .await
+        .unwrap_err();
+        git(&repo, &["merge", "--abort"]).await;
+
+        match (&compound, &plain) {
+            (
+                AppError::Conflict {
+                    op: a_op,
+                    paths: a_paths,
+                    report: a_err,
+                },
+                AppError::Conflict {
+                    op: b_op,
+                    paths: b_paths,
+                    report: b_err,
+                },
+            ) => {
+                assert_eq!(a_err, b_err);
+                assert_eq!(a_op, b_op);
+                assert_eq!(a_op, "merge");
+                assert_eq!(a_paths, b_paths);
+                assert_eq!(a_paths, &vec!["a.txt".to_string()]);
+                // Mirrors the frontend's anchored CONFLICT_MARKERS: without the
+                // stdout backfill both sides carry an empty report instead, which
+                // renders as "git exited with code 1".
+                assert!(
+                    a_err.lines().any(|l| l.starts_with("CONFLICT (")),
+                    "the conflict line must reach the frontend: {a_err}"
+                );
+                assert!(
+                    a_err.contains("Automatic merge failed"),
+                    "and the verdict line that names it a merge: {a_err}"
+                );
+            }
+            other => panic!("expected two conflicts, got {other:?}"),
+        }
+    }
+
+    /// Pull's version of the same parity, on the split that hides the loss: a
+    /// conflicted merge reports on STDOUT and leaves stderr empty, so an error
+    /// shaped from stderr alone looks like a bare exit code and says nothing about
+    /// the conflict. Both sides must carry the whole report, identically, and both
+    /// must name the operation they paused.
+    #[tokio::test]
+    async fn a_conflicted_pull_with_nothing_stashed_carries_the_stdout_report() {
+        let (dir, work, clone) = setup_clone("pull-parity-conflict").await;
+        // TWO clones, one per side: the first pull leaves the tree mid-merge, so a
+        // second one in the SAME clone could only be measured against a refusal.
+        // Cloned before the upstream push so each is behind by the same commit.
+        let url = format!(
+            "file://{}",
+            dir.path()
+                .join("origin.git")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+        let root = dir.path().to_string_lossy().into_owned();
+        git(&root, &["-c", "core.autocrlf=false", "clone", &url, "clone2"]).await;
+        let clone2 = dir.path().join("clone2").to_string_lossy().into_owned();
+        configure(&clone2).await;
+
+        write(&dir.path().join("work"), "a.txt", "upstream\n");
+        commit_all(&work, "upstream").await;
+        git(&work, &["push"]).await;
+
+        // A local commit on the same file diverges each branch, so `--no-rebase`
+        // merges and conflicts; both trees stay CLEAN so `settle` takes its
+        // no-stash arm.
+        for (path, repo) in [("clone", &clone), ("clone2", &clone2)] {
+            write(&dir.path().join(path), "a.txt", "mine\n");
+            commit_all(repo, "local").await;
+        }
+        let state = AppState::default();
+
+        let compound = git_pull_autostash_core(&state, clone.clone(), "merge".into())
+            .await
+            .unwrap_err();
+        assert!(stash_list(&clone).await.is_empty(), "nothing was stashed");
+        let plain = crate::git::remote::git_pull_core(&state, clone2.clone(), "merge".into())
+            .await
+            .unwrap_err();
+
+        match (&compound, &plain) {
+            (
+                AppError::Conflict {
+                    op: a_op,
+                    paths: a_paths,
+                    report: a_err,
+                },
+                AppError::Conflict {
+                    op: b_op,
+                    paths: b_paths,
+                    report: b_err,
+                },
+            ) => {
+                assert_eq!(a_err, b_err);
+                assert_eq!(a_op, b_op);
+                assert_eq!(a_op, "merge", "a merge-mode pull pauses a merge");
+                assert_eq!(a_paths, b_paths);
+                assert_eq!(a_paths, &vec!["a.txt".to_string()]);
+                assert!(
+                    a_err.lines().any(|l| l.starts_with("CONFLICT (")),
+                    "the conflict line must reach the frontend: {a_err}"
+                );
+                assert!(
+                    a_err.contains("Automatic merge failed"),
+                    "and the verdict line that names it a merge: {a_err}"
+                );
+            }
+            other => panic!("expected two conflicts, got {other:?}"),
+        }
+    }
+
+    /// The guard runs BEFORE `autostash_push`, which is the whole point of its
+    /// placement: a refused switch must not have pushed and popped the user's changes
+    /// on the way to reporting the refusal. An empty stash list after the refusal is
+    /// what proves the ordering — a guard placed after the push would leave a stash
+    /// entry behind on any pop failure, and would churn the working tree regardless.
+    // The serializing guard MUST span the awaits — it keeps the process-wide root
+    // override installed for the whole body.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_refused_switch_never_stashes() {
+        use crate::git::update_marker as marker;
+        let (dir, repo) = setup_repo("update-guard-order").await;
+        git(&repo, &["branch", "switch-refusal-holder"]).await;
+        // Uncommitted work: without the guard this is exactly what would be stashed.
+        write(dir.path(), "a.txt", "dirty\n");
+
+        let root = dir.path().join("gd-worktrees");
+        std::fs::create_dir_all(&root).unwrap();
+        let _serialized = marker::test_root_lock();
+        let _override = marker::TestRootOverride::set(&root);
+        let _live =
+            marker::UpdateMarker::create_for(&root.join("gd-update-live"), "switch-refusal-holder")
+                .expect("the marker mints");
+
+        let state = AppState::default();
+        let err = git_switch_autostash_core(
+            &state,
+            repo.clone(),
+            "switch-refusal-holder".into(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("switching to a branch an update holds is refused");
+        assert_eq!(
+            err.to_string(),
+            marker::branch_update_refusal("switch-refusal-holder").to_string()
+        );
+        assert!(
+            git(&repo, &["stash", "list"]).await.trim().is_empty(),
+            "a refused switch must not have touched the stash"
+        );
+        assert_eq!(read(dir.path(), "a.txt"), "dirty\n", "nor the working tree");
+    }
+
+    /// An untracked Windows-reserved name would make `stash push` write the entry
+    /// and then fail removing the unreachable file (exit 1), aborting the whole
+    /// compound around an orphan stash. Excluded, the compound stashes and reapplies
+    /// the real work and leaves the reserved file where it is.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn autostash_push_works_around_a_reserved_device_named_file() {
+        let (dir, repo) = setup_repo("reserved-name").await;
+        // Only the verbatim path reaches such a name; the plain one is the device.
+        let nul = std::path::PathBuf::from(format!(
+            r"\\?\{}",
+            dir.path().join("nul").to_string_lossy().replace('/', "\\")
+        ));
+        std::fs::write(&nul, b"x\n").expect("verbatim write");
+        write(dir.path(), "a.txt", "dirty\n");
+
+        let stashed = autostash_push(&repo)
+            .await
+            .expect("the reserved name is excluded instead of failing the push");
+        assert!(stashed, "the tracked change was stashed");
+        assert_eq!(read(dir.path(), "a.txt"), "v0\n", "the tree came back clean");
+        assert!(!stash_list(&repo).await.is_empty());
+        assert!(
+            std::fs::metadata(&nul).is_ok(),
+            "the reserved-name file stays put"
+        );
+
+        let pop = autostash_pop(&repo).await.expect("pop runs");
+        assert_eq!(pop.code, 0, "{}", pop.full_failure_text());
+        assert_eq!(read(dir.path(), "a.txt"), "dirty\n", "the work came back");
+
+        // The temp dir's cleanup walks plain paths and cannot reach this one.
+        std::fs::remove_file(&nul).expect("verbatim unlink");
+    }
+
+    /// The compound must not refuse when the reserved name is the ONLY change:
+    /// excluding it leaves nothing to save, which is the clean-tree answer.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn autostash_push_reports_nothing_stashed_when_only_a_reserved_name_changed() {
+        let (dir, repo) = setup_repo("reserved-name-only").await;
+        let nul = std::path::PathBuf::from(format!(
+            r"\\?\{}",
+            dir.path().join("nul").to_string_lossy().replace('/', "\\")
+        ));
+        std::fs::write(&nul, b"x\n").expect("verbatim write");
+
+        let stashed = autostash_push(&repo).await.expect("no refusal here");
+        assert!(!stashed, "nothing to stash, so the compound runs unstashed");
+        assert!(stash_list(&repo).await.is_empty());
+
+        std::fs::remove_file(&nul).expect("verbatim unlink");
+    }
+
+    /// A tracking switch that loses the config lock is finished BEFORE the stash pops:
+    /// the user's change lands on the new branch, which is checked out and tracking,
+    /// never on a moved tree under the old HEAD.
+    #[tokio::test]
+    async fn a_tracking_switch_that_loses_the_config_lock_reapplies_onto_the_new_branch() {
+        use crate::git::runner::{release_config_lock_before_attempt, CONFIG_WRITE_ATTEMPT_HOOK};
+        let (dir, repo) = setup_repo("switch-config-lock").await;
+        git(&repo, &["switch", "-q", "-c", "remote-side"]).await;
+        write(dir.path(), "b.txt", "remote\n");
+        commit_all(&repo, "remote side").await;
+        git(&repo, &["update-ref", "refs/remotes/origin/feat", "HEAD"]).await;
+        git(&repo, &["switch", "-q", "main"]).await;
+        git(&repo, &["branch", "-q", "-D", "remote-side"]).await;
+        let nowhere = dir
+            .path()
+            .join("nowhere.git")
+            .to_string_lossy()
+            .into_owned();
+        git(&repo, &["remote", "add", "origin", &nowhere]).await;
+        write(dir.path(), "a.txt", "dirty\n");
+        let lock = dir.path().join(".git").join("config.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let (hook, attempts) = release_config_lock_before_attempt(lock, 2);
+
+        let state = AppState::default();
+        let outcome = CONFIG_WRITE_ATTEMPT_HOOK
+            .scope(
+                hook,
+                git_switch_autostash_core(
+                    &state,
+                    repo.clone(),
+                    "feat".into(),
+                    Some("origin".into()),
+                    true,
+                ),
+            )
+            .await
+            .expect("the switch succeeds");
+        assert!(
+            matches!(outcome, AutostashOutcome::Reapplied),
+            "{outcome:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            git(&repo, &["symbolic-ref", "--short", "HEAD"])
+                .await
+                .trim(),
+            "feat"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "--abbrev-ref", "feat@{upstream}"])
+                .await
+                .trim(),
+            "origin/feat"
+        );
+        assert_eq!(read(dir.path(), "b.txt"), "remote\n");
+        assert_eq!(read(dir.path(), "a.txt"), "dirty\n");
+        assert_eq!(git(&repo, &["status", "--porcelain"]).await, " M a.txt\n");
+    }
+
+    /// The upstream repair losing again must not read as a failed switch: the switch
+    /// leg landed, so `settle` keeps its reapply semantics on the NEW branch. With
+    /// reapply off the stash stays put, never popped onto a branch the user left.
+    #[tokio::test]
+    async fn a_landed_switch_whose_upstream_loses_again_keeps_reapply_semantics() {
+        let (dir, repo) = setup_repo("switch-config-lock-held").await;
+        git(&repo, &["switch", "-q", "-c", "remote-side"]).await;
+        write(dir.path(), "b.txt", "remote\n");
+        commit_all(&repo, "remote side").await;
+        git(&repo, &["update-ref", "refs/remotes/origin/feat", "HEAD"]).await;
+        git(&repo, &["switch", "-q", "main"]).await;
+        git(&repo, &["branch", "-q", "-D", "remote-side"]).await;
+        let nowhere = dir
+            .path()
+            .join("nowhere.git")
+            .to_string_lossy()
+            .into_owned();
+        git(&repo, &["remote", "add", "origin", &nowhere]).await;
+        write(dir.path(), "a.txt", "dirty\n");
+        let lock = dir.path().join(".git").join("config.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        let state = AppState::default();
+        let outcome = git_switch_autostash_core(
+            &state,
+            repo.clone(),
+            "feat".into(),
+            Some("origin".into()),
+            false,
+        )
+        .await
+        .expect("the landed switch is reported as one");
+        std::fs::remove_file(&lock).unwrap();
+        assert!(
+            matches!(outcome, AutostashOutcome::StashedOnly),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            git(&repo, &["symbolic-ref", "--short", "HEAD"])
+                .await
+                .trim(),
+            "feat"
+        );
+        assert_eq!(git(&repo, &["status", "--porcelain"]).await, "");
+        assert_eq!(read(dir.path(), "a.txt"), "v0\n", "nothing popped");
+        assert_eq!(git(&repo, &["stash", "list"]).await.lines().count(), 1);
+        let upstream = run_git_raw(
+            Some(&repo),
+            &["rev-parse", "--abbrev-ref", "feat@{upstream}"],
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_ne!(upstream.code, 0, "the upstream miss stays a miss");
+    }
+    #[tokio::test]
+    async fn merge_autostash_ignored_guard_sensitivity() {
+        use crate::git::ignored_guard::tests::{Fixture, Shape};
+        for diverged in [false, true] {
+            let mut f = Fixture::new(Shape::IgnoredFile, diverged).await;
+            let tracked = std::path::Path::new(&f.repo).join("tracked.txt");
+            std::fs::write(&tracked, "dirty tracked edit\n").unwrap();
+            f.snapshot().await;
+            let state = AppState::default();
+            let err = super::git_merge_autostash_core(&state, f.repo.clone(), "incoming".into())
+                .await
+                .unwrap_err();
+            f.assert_unchanged(&err).await;
+            assert_eq!(
+                std::fs::read_to_string(&tracked).unwrap(),
+                "dirty tracked edit\n"
+            );
+            f.remove_ignored();
+            assert!(matches!(
+                super::git_merge_autostash_core(&state, f.repo.clone(), "incoming".into())
+                    .await
+                    .unwrap(),
+                AutostashOutcome::Reapplied
+            ));
+            f.assert_landed().await;
+            assert_eq!(
+                std::fs::read_to_string(&tracked).unwrap(),
+                "dirty tracked edit\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_autostash_mid_operation_does_not_wait_for_fetch() {
+        use crate::git::ignored_guard::tests::{Fixture, MergeState, Shape};
+        let f = Fixture::new(Shape::IgnoredFile, true).await;
+        MergeState::MergeHead.install(&f).await;
+        let expected = crate::git::ops::refuse_mid_op(&f.repo).await.unwrap_err();
+        let state = AppState::default();
+        let network = state.network_lock(&f.repo).await;
+        let _held = acquire_repo_lock(&network, NETWORK_LOCK_WAIT_TIMEOUT, "a fetch")
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            git_merge_autostash_core(&state, f.repo.clone(), "incoming".into()),
+        )
+        .await
+        .expect("mid-operation refusal must precede the network wait")
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidArgument(_)), "{err:?}");
+        assert_eq!(err.to_string(), expected.to_string());
+        assert!(!err.to_string().contains("ignored files"), "{err}");
+        f.assert_snapshot().await;
+    }
+}

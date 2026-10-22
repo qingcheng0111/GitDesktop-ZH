@@ -1,0 +1,311 @@
+import { useSelector } from "@tanstack/react-store";
+import { useEffect, useEffectEvent, useRef } from "react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { required, useAppForm } from "@/lib/form";
+import { useRenameBranch } from "@/lib/git/queries";
+import {
+  isSessionBranchName,
+  refNameWarning,
+  sanitizeRefName,
+} from "@/lib/git/ref-name";
+import type { FileEntry } from "@/lib/git/types";
+import { useGenerateChord } from "@/lib/hotkeys/useGenerateChord";
+import { promotionBlocksCheckout } from "@/lib/stores/worktree-removal";
+import { toastError } from "@/lib/toast";
+import { useRetained } from "@/lib/use-retained";
+import { PROMOTION_BLOCKS_CHECKOUT } from "./checkout-copy";
+import {
+  GenerateBranchNameButton,
+  useBranchNameGenerateAction,
+} from "./GenerateBranchNameButton";
+import {
+  type BranchNameGenerator,
+  type CommittedNameSource,
+  useGenerateBranchName,
+} from "./useGenerateBranchName";
+
+/** Why Generate holds while the rename runs: the name it would revise has
+ *  already been sent. */
+const RENAME_PENDING_GENERATE_REASON = "Wait for the rename to finish";
+
+/** The field's warning for a name in the agent-session namespace. A warning, not
+ *  a validator: validator messages never render, and the backend refuses it. */
+function sessionNameWarning(name: string): string | null {
+  return isSessionBranchName(name)
+    ? "gd/session/ is reserved for agent sessions — choose another name"
+    : null;
+}
+
+/**
+ * Rename-branch dialog. Open when `target` is the branch being renamed (null =
+ * closed). Owns its own form + the rename mutation; seeds the field with the
+ * current name on open so the user edits from there. The target need not be the
+ * checked-out branch — every branch row's context menu opens this — so AI name
+ * generation reads the working tree only when it is.
+ */
+export function RenameBranchDialog({
+  repoPath,
+  target,
+  targetUpstream,
+  currentName,
+  onClose,
+  aiEnabled,
+  aiConfigured,
+  hasChanges,
+  headExists,
+  entries,
+  allBranchNames,
+  committedFallback,
+  committedStatus,
+  onOpenSettings,
+}: {
+  repoPath: string;
+  target: string | null;
+  /** `target`'s live upstream branch, by its remote and its name there; null when
+   *  unpublished, gone, a local upstream, or not a branch. */
+  targetUpstream: { remote: string; branch: string } | null;
+  /** The checked-out branch — decides whether `target`'s working tree is its
+   *  own (null when HEAD is detached, which is never the rename target). */
+  currentName: string | null;
+  onClose: () => void;
+  aiEnabled: boolean;
+  aiConfigured: boolean;
+  hasChanges: boolean;
+  headExists: boolean;
+  entries: FileEntry[];
+  allBranchNames: string[];
+  /** The committed work of the branch being renamed, vs the default branch —
+   *  compared against `target` itself, not HEAD. */
+  committedFallback: CommittedNameSource | null;
+  /** How the committed-work lookup stands (pending/error are surfaced rather
+   *  than read as "there is none"). */
+  committedStatus: "ready" | "pending" | "error";
+  onOpenSettings: (section: "ai") => void;
+}) {
+  const renameBranch = useRenameBranch(repoPath);
+  const branchNameGen = useGenerateBranchName(repoPath);
+  // The Generate affordance's copy — and so its enabled state — is retained
+  // through the close fade below, so the dispatch carries the liveness: a click
+  // after close would start an uncancellable generation whose name lands in the
+  // next open's field.
+  const guardedGen: BranchNameGenerator = {
+    ...branchNameGen,
+    generate: async (opts) => {
+      if (target === null) return;
+      await branchNameGen.generate(opts);
+    },
+  };
+  // The open session a rename settles against: minted by the [target] seed (each
+  // open and hotkey retarget), dropped by every close this dialog makes (a
+  // host-side close is re-minted over by the next seed). A name compare can't tell
+  // a same-named branch reopened in the next repo (this dialog outlives repo
+  // switches), and a repo compare would leave a dialog open across the switch.
+  const sessionRef = useRef<object | null>(null);
+  // Every close path routes through here: the dialog stays mounted, so an
+  // in-flight suggestion would otherwise land in the field on the NEXT open,
+  // which may be naming a different branch.
+  const closeDialog = () => {
+    sessionRef.current = null;
+    branchNameGen.cancel();
+    onClose();
+  };
+  const shownTarget = useRetained(target);
+  // The parent's committed-work lookup collapses when the dialog closes, so
+  // these two retain on the dialog's own discriminant rather than their values:
+  // null / "ready" are legitimate while it's open (a branch with no commits).
+  const shownCommittedFallback = useRetained(
+    committedFallback,
+    target !== null,
+  );
+  const shownCommittedStatus = useRetained(committedStatus, target !== null);
+  const shownUpstream = useRetained(targetUpstream, target !== null);
+  // Only the checked-out branch's own working tree describes it.
+  const targetIsCurrent = shownTarget !== null && shownTarget === currentName;
+
+  const renameForm = useAppForm({
+    defaultValues: { name: "" },
+    onSubmit: async ({ value }) => {
+      if (!target) return;
+      if (promotionBlocksCheckout(repoPath)) {
+        toast.info(PROMOTION_BLOCKS_CHECKOUT);
+        return;
+      }
+      const newName = sanitizeRefName(value.name);
+      const session = sessionRef.current;
+      try {
+        const outcome = await renameBranch.mutateAsync({
+          oldName: target,
+          newName,
+        });
+        toast.success(`Renamed to ${newName}`, {
+          description: outcome.warning ?? undefined,
+        });
+        if (sessionRef.current === session) {
+          sessionRef.current = null;
+          onClose();
+        }
+      } catch (e) {
+        toastError(e);
+      }
+    },
+  });
+
+  // NOTE: seeding resets must pass keepDefaultValues — otherwise reset()
+  // rewrites the form's defaultValues, and react-form's per-render options
+  // sync sees "different defaults + untouched form" and clobbers the seeded
+  // values right back on the next render.
+  const seedOnOpen = useEffectEvent((name: string) => {
+    sessionRef.current = {};
+    renameForm.reset({ name }, { keepDefaultValues: true });
+  });
+  useEffect(() => {
+    if (target !== null) seedOnOpen(target);
+  }, [target]);
+
+  // Generations are bound to the target they were started for: the rename
+  // hotkey stays live over the open dialog, so `target` can swap mid-stream and
+  // a suggestion for the old branch would otherwise land in a form that is now
+  // renaming a different one. `cancel` is stable (a no-dep `useCallback` in
+  // `useAiStream`), so this re-runs only on a target change. Closing cancels
+  // here as well as in `closeDialog` — aborting twice is a no-op.
+  const cancelGenerate = branchNameGen.cancel;
+  useEffect(() => {
+    if (target === null) return;
+    return () => cancelGenerate();
+  }, [target, cancelGenerate]);
+
+  // One generate pair for the button and the chord — see
+  // `useBranchNameGenerateAction`. It rides `guardedGen`, so a chord pressed
+  // during the close fade can't start an uncancellable generation either.
+  const generateAction = useBranchNameGenerateAction({
+    gen: guardedGen,
+    aiEnabled,
+    aiConfigured,
+    hasChanges,
+    headExists,
+    entries,
+    recentBranches: allBranchNames,
+    nameTarget: targetIsCurrent ? "checked-out-branch" : "other-branch",
+    committedFallback: shownCommittedFallback,
+    onName: (name) => renameForm.setFieldValue("name", name),
+  });
+  // This dialog opens from any branch row over any tab, including Changes where
+  // the global generate-commit-message action is live. The chord is swallowed
+  // here whenever it may fire, generate-capable or not (the hook mirrors the
+  // global listener's own guards). A running rename holds it like the button:
+  // the name it would revise has already been sent.
+  const isSubmitting = useSelector(renameForm.store, (s) => s.isSubmitting);
+  const generateChord = useGenerateChord({
+    enabled: generateAction.enabled && !isSubmitting,
+    run: generateAction.run,
+  });
+
+  return (
+    <Dialog
+      open={target !== null}
+      onOpenChange={(o) => {
+        if (!o) closeDialog();
+      }}
+    >
+      <DialogContent onKeyDown={generateChord.onKeyDown}>
+        <form
+          // min-w-0: DialogContent is display:grid, so this grid item must be
+          // allowed to shrink below its content — otherwise a long branch name
+          // pushes the form past the dialog's max-width and the text overflows.
+          className="min-w-0 space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            // Enter submits even while the submit button is disabled, so an
+            // in-flight name generation has to be checked here too.
+            if (branchNameGen.generating) return;
+            renameForm.handleSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Rename branch</DialogTitle>
+            {/* The popup's aria-describedby, so the upstream note is announced
+                on open. It promises nothing about Push: that depends on the
+                push config. */}
+            <DialogDescription>
+              Renames{" "}
+              <span className="font-mono wrap-break-word">{shownTarget}</span>.
+              {shownUpstream && (
+                <>
+                  {" "}
+                  <span className="font-mono wrap-break-word">
+                    {shownTarget}
+                  </span>{" "}
+                  tracks{" "}
+                  <span className="font-mono wrap-break-word">
+                    {shownUpstream.remote}/{shownUpstream.branch}
+                  </span>
+                  . Renaming changes only the local name; the branch on{" "}
+                  <span className="font-mono wrap-break-word">
+                    {shownUpstream.remote}
+                  </span>{" "}
+                  keeps its name.
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <renameForm.AppField
+            name="name"
+            validators={{
+              onChange: ({ value }) =>
+                required(value) ??
+                (sanitizeRefName(value) === target ? "Unchanged" : undefined),
+            }}
+          >
+            {(field) => (
+              <field.TextField
+                label="New name"
+                warning={(value) =>
+                  sessionNameWarning(sanitizeRefName(value)) ??
+                  refNameWarning(value)
+                }
+              />
+            )}
+          </renameForm.AppField>
+          <GenerateBranchNameButton
+            gen={guardedGen}
+            action={generateAction}
+            hint={generateChord.hint}
+            aiEnabled={aiEnabled}
+            aiConfigured={aiConfigured}
+            hasChanges={hasChanges}
+            headExists={headExists}
+            nameTarget={targetIsCurrent ? "checked-out-branch" : "other-branch"}
+            committedFallback={shownCommittedFallback}
+            committedStatus={shownCommittedStatus}
+            // Renaming never picks a base — the fallback always applies here.
+            basedElsewhere={null}
+            heldReason={isSubmitting ? RENAME_PENDING_GENERATE_REASON : null}
+            onSetupAi={() => {
+              closeDialog();
+              onOpenSettings("ai");
+            }}
+          />
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={closeDialog}>
+              Cancel
+            </Button>
+            <renameForm.AppForm>
+              <renameForm.SubmitButton disabled={branchNameGen.generating}>
+                Rename
+              </renameForm.SubmitButton>
+            </renameForm.AppForm>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

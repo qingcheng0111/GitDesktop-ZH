@@ -1,0 +1,41 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+/.impeccable/critique/
+/.claude/skills/logo-creator/
+/.claude/worktrees/
+/design/
+/docs/
+.env
+/~/
+/.impeccable/critique/2026-06-11T15-21-04Z__src-features-welcome-welcomescreen-tsx.md
+/claude_strings.txt
+/.playwright-mcp/
+/.env.claude
+/.claude/settings.local.json
+
+# The owner's /delegate skill and agent definitions are junction-mounted here
+# from a private skills repo (personal workflow, not shipped with the project)
+/.claude/skills/delegate/
+/.claude/agents/

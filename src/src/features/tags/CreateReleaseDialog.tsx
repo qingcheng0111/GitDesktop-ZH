@@ -1,0 +1,1038 @@
+import {
+  CaretDownIcon,
+  GitBranchIcon,
+  GitCommitIcon,
+  PlusIcon,
+  SparkleIcon,
+  XIcon,
+} from "@phosphor-icons/react";
+import { useSelector } from "@tanstack/react-store";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  useEffect,
+  useEffectEvent,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { flushSync } from "react-dom";
+import { toast } from "sonner";
+import { DIALOG_SCROLL } from "@/components/dialog-scroll";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { LabeledGroup } from "@/components/form/labeled-group";
+import {
+  MarkdownEditor,
+  type MarkdownEditorHandle,
+} from "@/components/markdown-editor";
+import { RelativeTime } from "@/components/relative-time";
+import { Button } from "@/components/ui/button";
+import {
+  Combobox,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+} from "@/components/ui/combobox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  CREATE_PENDING_GENERATE_REASON,
+  useCancelOnIdentityChange,
+  useFinishAndSurface,
+} from "@/features/conversations/useAiStream";
+import { useMentionCandidates } from "@/features/conversations/useMentionCandidates";
+import { useAppForm } from "@/lib/form";
+import { normPath } from "@/lib/git/path";
+import {
+  useBranches,
+  useCreateRelease,
+  useForgeStatus,
+  useGithubReleaseNotes,
+  useRecentCommits,
+  useRepoStatus,
+  useTagList,
+} from "@/lib/git/queries";
+import type { CommitSummary, GeneratedNotes } from "@/lib/git/types";
+import { useGenerateChord } from "@/lib/hotkeys/useGenerateChord";
+import { listKeyboardNav } from "@/lib/list-keyboard-nav";
+import {
+  ACT_PENDING_REASON,
+  AI_DRAFT_PENDING_REASON,
+  refuseWhileOffline,
+  useOfflineHold,
+} from "@/lib/offline-writes";
+import { useAiEnabled } from "@/lib/settings/queries";
+import { originNoteFor } from "@/lib/stores/notifications";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError, toastErrorWithNote } from "@/lib/toast";
+import {
+  ARIA_DISABLED_CLASS,
+  useDisabledReason,
+} from "@/lib/use-disabled-reason";
+import { useSeedOnOpen } from "@/lib/use-seed-on-open";
+import { cn } from "@/lib/utils";
+import { useGenerateReleaseNotes } from "./useGenerateReleaseNotes";
+import { findPreviousTag, isNewTagName, validateTagName } from "./version";
+
+const RELEASE_DEFAULTS = {
+  tag: "",
+  title: "",
+  notes: "",
+  target: "",
+  prerelease: false,
+  latest: false,
+  draft: false,
+};
+
+/** The submit's hold while GitHub's own (non-AI) notes generator runs. */
+const GENERATED_NOTES_PENDING_REASON = "Wait for the generated notes to finish";
+
+/**
+ * Creates a GitHub release. The tag is a combobox — pick an existing tag, or
+ * type a new one, which is validated as it's typed. A valid new tag exposes the
+ * tabbed Target picker (branches / recent commits, à la GitHub) once the field
+ * settles. Notes can be hand-written (live Preview) or generated
+ * from GitHub's auto-notes / AI relative to a previous tag we resolve via semver
+ * and let the user override. Form state lives in `useAppForm`; the previous tag
+ * is generation-only (not a create input) so it stays derived local state.
+ */
+export function CreateReleaseDialog({
+  repoPath,
+  open,
+  onOpenChange,
+  initialTag,
+}: {
+  repoPath: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Pre-fill + lock the tag (creating a release for an existing tag). */
+  initialTag?: string;
+}) {
+  const createRelease = useCreateRelease(repoPath);
+  const offlineHold = useOfflineHold();
+  const githubNotes = useGithubReleaseNotes(repoPath);
+  const aiNotes = useGenerateReleaseNotes(repoPath);
+  const busyGenerating = githubNotes.isPending || aiNotes.generating;
+  // The dialog is retained across repo AND tag switches, so nothing a run settles
+  // may write this form or skip its seed for the identity now on screen: the
+  // GitHub mutation validates start-vs-live identity; the AI stream is cancelled
+  // at the switch and its settle swallowed.
+  const tagIdentity = initialTag ?? "";
+  const liveTagRef = useRef(tagIdentity);
+  useLayoutEffect(() => {
+    liveTagRef.current = tagIdentity;
+  }, [tagIdentity]);
+  const settleTagRef = useRef(tagIdentity);
+  // The notes live in THIS instance's form, which the tag host unmounts under a
+  // switch, a skeleton, or a release view: a View outliving it has nothing left.
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  // Closing mid-generation never cancels the run: it finishes into the retained
+  // form state, and this surfaces the result while the dialog is away. Both
+  // hosts pass a plain open setter, so `onOpenChange(true)` reopens.
+  const surface = useFinishAndSurface(repoPath, open, {
+    cancel: aiNotes.cancel,
+    // The AI stream alone: the From-GitHub mutation is not what a switch aborts.
+    generating: aiNotes.generating,
+    close: () => onOpenChange(false),
+    readyTitle: "Release notes ready",
+    readyDescription: "They're waiting in the dialog.",
+    reopen: () => {
+      // A tag switch drains the latch, so the notes are gone — say so instead of
+      // opening an emptied dialog. The selection is read live: an unmounted
+      // instance's refs never see the switch. Inert in TagsPanel (tagIdentity "").
+      const settleTag = settleTagRef.current;
+      const { selectedTag, repoTab } = useUiStore.getState();
+      const liveTag = selectedTag?.tag;
+      if (
+        liveTagRef.current !== settleTag ||
+        (settleTag !== "" && liveTag !== settleTag)
+      ) {
+        toast.info(
+          `Those notes were for ${settleTag} — they were discarded when you switched tags.`,
+        );
+        return;
+      }
+      // Only on the Tags tab: an <Activity> hide runs effect cleanups too.
+      if (settleTag !== "" && !mountedRef.current && repoTab === "tags") {
+        toast.info(`Those notes for ${settleTag} are no longer available.`);
+        return;
+      }
+      onOpenChange(true);
+    },
+  });
+  // Which draft the form holds, bumped only where the seed actually reseeds and
+  // on a tag switch (the draft on screen was the previous tag's). The repo stamp
+  // (`draftRepoRef`) can't tell drafts apart within one repo: an A→B→A round
+  // trip restores the same path behind different content.
+  const seedGenRef = useRef(0);
+  const tagSwitchAbortRef = useRef(false);
+  useCancelOnIdentityChange(tagIdentity, () => {
+    void surface.consumeSkipSeed();
+    tagSwitchAbortRef.current = aiNotes.generating;
+    aiNotes.cancel();
+    // The draft on screen was the previous tag's, so a create still in flight for
+    // it must not close whatever this dialog shows next. The close itself belongs
+    // to the host's tag-switch reset.
+    seedGenRef.current += 1;
+  });
+  // The From-GitHub run's identity while it is in flight; nothing cancels it.
+  const ghRunIdentityRef = useRef<{ repo: string; tag: string } | null>(null);
+  const ghRunIsForThisIdentity = () => {
+    const run = ghRunIdentityRef.current;
+    return (
+      run !== null && run.repo === normPath(repoPath) && run.tag === tagIdentity
+    );
+  };
+  // GitLab has no draft/pre-release/latest concepts and no auto-notes API, so
+  // those checkboxes and the "From GitHub" generator hide there (AI notes still
+  // work — they fall back to local commits).
+  const releaseProvider = useForgeStatus(repoPath).data?.provider;
+  const isGitLab = releaseProvider === "gitlab";
+  // GitHub (or an unrecognized host that still routes through gh) is the only
+  // provider with an auto-changelog API — gates the `gh` call in the AI hook.
+  const isGitHub =
+    releaseProvider !== "gitlab" && releaseProvider !== "bitbucket";
+  // Release notes autolink the same `@`/`#`/`!` references a comment does.
+  // Releases are repo-wide, so the candidate lists come off origin.
+  const mentions = useMentionCandidates({
+    repoPath,
+    lens: "origin",
+    provider: releaseProvider,
+  });
+  const status = useRepoStatus(repoPath);
+  const tagList = useTagList(repoPath);
+  const branches = useBranches(repoPath);
+  const recent = useRecentCommits(repoPath, 50, open);
+  const aiEnabled = useAiEnabled();
+  const selectTag = useUiStore((s) => s.selectTag);
+  const repoName = useUiStore((s) => s.repoName) ?? "";
+  const branch = status.data?.branch?.name ?? "";
+  const existingTags = tagList.data ?? [];
+  const tagNames = existingTags.map((t) => t.name);
+
+  // Ephemeral UI state (not release inputs): the tag combobox's created entries
+  // (list ordering only) and open state, the previous-tag override (null = use
+  // the resolved default), and which notes tab is showing.
+  const [createdTags, setCreatedTags] = useState<string[]>([]);
+  const [tagOpen, setTagOpen] = useState(false);
+  // The tag field's popup has closed, or Tab or a blur has left it, since the
+  // last edit. The Target picker waits on it so it doesn't mount and unmount
+  // while typing.
+  const [tagSettled, setTagSettled] = useState(false);
+  const tagErrorId = useId();
+  const [previousTagOverride, setPreviousTagOverride] = useState<string | null>(
+    null,
+  );
+  const notesEditorRef = useRef<MarkdownEditorHandle>(null);
+  // Which repo's draft the form holds — stamped on every open transition, ahead
+  // of the seed's skip arms (those hold a seed off only for a draft already this
+  // repo's). A dialog left open across a repo switch never re-seeds, so this
+  // still reads the submit's repo and the settle's close is the right one.
+  const draftRepoRef = useRef(repoPath);
+
+  const form = useAppForm({
+    defaultValues: RELEASE_DEFAULTS,
+    onSubmit: async ({ value }) => {
+      const submitGen = seedGenRef.current;
+      const submitTag = initialTag;
+      const tag = value.tag.trim();
+      if (!tag || refuseWhileOffline()) return;
+      const hasTarget = !initialTag && isNewTagName(tag, tagNames);
+      try {
+        const url = await createRelease.mutateAsync({
+          tag,
+          title: value.title.trim(),
+          notes: value.notes,
+          target: hasTarget ? value.target.trim() : "",
+          prerelease: value.prerelease,
+          draft: value.draft,
+          latest: value.latest,
+        });
+        // The create can settle after a repo switch, and this dialog is retained
+        // across one: the tag adoption answers to the live repo, the close to the
+        // draft's. The toast fires either way, naming where it came from.
+        const originNote = originNoteFor(repoPath);
+        const stillHere = originNote === undefined;
+        toast.success(value.draft ? "Draft saved" : `Released ${tag}`, {
+          description: originNote ? `${originNote} · ${url}` : url,
+          action: { label: "View", onClick: () => openUrl(url) },
+        });
+        // Closed whenever the form still holds THIS submit's draft — leaving an
+        // already-released draft open is a duplicate factory. Adopting the tag
+        // is a global write, so it takes the live-repo guard instead.
+        const ourDraft =
+          draftRepoRef.current === repoPath && seedGenRef.current === submitGen;
+        // The tag host's subject is its selected tag: once another is selected
+        // (a host showing that tag's release unmounts this dialog, so its refs
+        // can't see the switch) neither the close nor the selection is ours.
+        const onSubmitTag =
+          submitTag === undefined ||
+          useUiStore.getState().selectedTag?.tag === submitTag;
+        if (ourDraft && onSubmitTag) onOpenChange(false);
+        if (stillHere && onSubmitTag) selectTag({ tag });
+      } catch (e) {
+        // Read at the failure, not before it: a create that fails after a repo
+        // switch has to name the repo it belongs to, same as the success arm.
+        const originNote = originNoteFor(repoPath);
+        if (originNote) toastErrorWithNote(e, originNote);
+        else toastError(e);
+      }
+    },
+  });
+
+  const tag = useSelector(form.store, (s) => s.values.tag);
+  const target = useSelector(form.store, (s) => s.values.target);
+  const notes = useSelector(form.store, (s) => s.values.notes);
+  const draft = useSelector(form.store, (s) => s.values.draft);
+  const tagTrimmed = tag.trim();
+
+  // Created tags lead the list; the typed value stands on its own either way.
+  const tagItems = [...createdTags, ...tagNames].map((name) => ({ name }));
+  const tagValue = tag ? { name: tag } : null;
+  const isExistingTag = tagNames.includes(tagTrimmed);
+  // Only a typed new name is checked: an existing tag already passed git's rules.
+  const tagError =
+    !initialTag && tagTrimmed && !isExistingTag
+      ? validateTagName(tagTrimmed)
+      : null;
+  const isNewTag = !initialTag && isNewTagName(tagTrimmed, tagNames);
+  const canCreate = isNewTag && !createdTags.includes(tagTrimmed);
+  // The target is part of the payload for any new tag; the picker shows once
+  // the field settles.
+  const showTarget = isNewTag && tagSettled;
+
+  // Previous tag for generated notes: the user's override, else the semver
+  // resolution. Derived (not effect-synced) so it can't go stale across reopens.
+  const defaultPreviousTag = findPreviousTag(tagTrimmed, tagNames);
+  const previousTag = previousTagOverride ?? defaultPreviousTag;
+  const effectivePreviousTag = tagNames.includes(previousTag.trim())
+    ? previousTag.trim()
+    : "";
+  const previousTagValue = previousTag ? { name: previousTag } : null;
+  const previousTagUnknown = previousTag.trim() !== "" && !effectivePreviousTag;
+
+  const seedOnOpen = useEffectEvent(() => {
+    draftRepoRef.current = repoPath;
+    // A generation still streaming — or one that settled while the dialog was
+    // closed — leaves the notes and the rest of the draft in form state, which
+    // this reset would blank on reopen.
+    if (
+      surface.shouldSkipSeed(
+        aiNotes.generating && !tagSwitchAbortRef.current,
+      ) ||
+      (githubNotes.isPending && ghRunIsForThisIdentity())
+    )
+      return;
+    seedGenRef.current += 1;
+    form.reset(
+      {
+        ...RELEASE_DEFAULTS,
+        tag: initialTag ?? "",
+        target: initialTag ? "" : branch,
+      },
+      { keepDefaultValues: true },
+    );
+    setCreatedTags([]);
+    setTagSettled(false);
+    setPreviousTagOverride(null);
+    // The editor remounts with the dialog (Write tab) — no explicit reset needed.
+  });
+  useSeedOnOpen(open, seedOnOpen);
+
+  // A controlled close never reaches `onOpenChange`, so this settles the field
+  // itself.
+  function createNewTag(name: string) {
+    const n = name.trim();
+    if (!n) return;
+    if (!isExistingTag && !createdTags.includes(n)) {
+      setCreatedTags((p) => [n, ...p]);
+    }
+    form.setFieldValue("tag", n);
+    setTagOpen(false);
+    setTagSettled(true);
+  }
+
+  // Awaited like the submit above: react-query drops per-call callbacks once the
+  // observer loses listeners, and this dialog's host panel hides with its tab
+  // while generation is still in flight.
+  async function generateFromGithub() {
+    if (!tagTrimmed) return;
+    const requestedFor = tagTrimmed;
+    // This mutation outlives both axes, and no identity-cancel can abort it.
+    const startRepo = normPath(repoPath);
+    const startTag = tagIdentity;
+    const switchedAway = () =>
+      normPath(useUiStore.getState().repoPath ?? "") !== startRepo ||
+      liveTagRef.current !== startTag;
+    ghRunIdentityRef.current = { repo: startRepo, tag: startTag };
+    let gen: GeneratedNotes;
+    try {
+      gen = await githubNotes.mutateAsync({
+        tag: requestedFor,
+        target: isNewTag ? target.trim() : "",
+        previousTag: effectivePreviousTag,
+      });
+    } catch (e) {
+      if (switchedAway()) return;
+      toastError(e);
+      // Still a settle: the typed draft has to survive one reopen for a retry.
+      surface.noteRunSettled(false);
+      return;
+    } finally {
+      // The run is over on every arm, the foreign-refused ones included.
+      ghRunIdentityRef.current = null;
+    }
+    // Nothing below awaits, so this one check covers every settle arm that follows.
+    if (switchedAway()) return;
+    // The response belongs to the tag it was requested for — a reseeded or
+    // retyped form is another release, and stale notes must not touch it.
+    if (form.getFieldValue("tag").trim() !== requestedFor) {
+      surface.noteRunSettled(false);
+      return;
+    }
+    if (gen.body) form.setFieldValue("notes", gen.body);
+    if (gen.name && !form.getFieldValue("title").trim()) {
+      form.setFieldValue("title", gen.name);
+    }
+    notesEditorRef.current?.showPreview();
+    // Only a body is notes "waiting in the dialog" — a name-only response has
+    // nothing for the toast to promise.
+    settleTagRef.current = startTag;
+    surface.noteRunSettled(Boolean(gen.body));
+  }
+
+  function generateWithAi() {
+    if (!tagTrimmed) return;
+    // Same requestedFor rule as From-GitHub: a retyped form is another release.
+    const requestedFor = tagTrimmed;
+    form.setFieldValue("notes", "");
+    aiNotes
+      .generate({
+        tag: requestedFor,
+        target: isNewTag ? target.trim() : requestedFor,
+        previousTag: effectivePreviousTag,
+        repoName,
+        isGitHub,
+        onResult: (body) => {
+          if (form.getFieldValue("tag").trim() === requestedFor) {
+            form.setFieldValue("notes", body);
+          }
+        },
+      })
+      .then(
+        (final) => {
+          // The tag switch's own abort settles here — swallow it, never re-latch.
+          // Exactly one swallow consumes a settle; the repo flag can't also arm
+          // while tag hosts unmount on a repo switch — else, per-run tokens.
+          if (tagSwitchAbortRef.current) {
+            tagSwitchAbortRef.current = false;
+            return;
+          }
+          if (form.getFieldValue("tag").trim() !== requestedFor) {
+            surface.noteRunSettled(false);
+            return;
+          }
+          // Resolves with the COMPLETE notes, or null — an aborted stream still
+          // fired `onResult` with its partials, so that can't be the signal.
+          settleTagRef.current = tagIdentity;
+          surface.noteRunSettled(final !== null);
+        },
+        // Two-arm, never a trailing .catch: a settle must be reported exactly
+        // once, and a throw in the arm above must not report a second time. The
+        // swallow repeats here — only a settle clears the flag.
+        () => {
+          if (tagSwitchAbortRef.current) {
+            tagSwitchAbortRef.current = false;
+            return;
+          }
+          surface.noteRunSettled(false);
+        },
+      );
+  }
+
+  // The generate chord drives the AI item only — never the From-GitHub one, and
+  // it never opens the dropdown. Mounted on DialogContent, not the <form>: the X
+  // close button is a form SIBLING inside the Popup. It is swallowed here
+  // whenever it may fire (the hook mirrors the global listener's own guards),
+  // so the global generate-commit-message action can't run behind the dialog;
+  // while generating it swallows but DOESN'T cancel. A running create holds it
+  // like the menu: the draft it would revise has already been sent.
+  const isSubmitting = useSelector(form.store, (s) => s.isSubmitting);
+  const generateChord = useGenerateChord({
+    enabled:
+      aiEnabled && Boolean(tagTrimmed) && !busyGenerating && !isSubmitting,
+    run: generateWithAi,
+  });
+  // The chord's shortcut belongs on the item it drives; with AI off that item is
+  // disabled and says why instead.
+  const aiNotesHintTitle = generateChord.hint
+    ? `Summarize with AI${generateChord.hint}`
+    : undefined;
+  const aiNotesTitle = aiEnabled
+    ? aiNotesHintTitle
+    : "Enable AI in Settings first.";
+
+  // The one submit gate, shared by the button and the form's native submit:
+  // Enter must submit exactly when the button would. Publishing holds offline
+  // rather than park: a parked release would land after the dialog was left.
+  const submitBlocked =
+    !tagTrimmed || tagError !== null || busyGenerating || !!offlineHold;
+  // Each running notes draft, the running create, and offline carry a reason,
+  // ranked running-first, so a flip between them never drops focus to a native
+  // disable. The GitHub generator isn't AI (it stays offered with Hide AI on),
+  // so it gets its own non-AI line. An empty tag stays a plain disable: no copy
+  // names it. An invalid one is explained by the line under the tag field.
+  const offlineSubmit = useDisabledReason({
+    disabled: submitBlocked || isSubmitting,
+    reason: (() => {
+      switch (true) {
+        case aiNotes.generating:
+          return AI_DRAFT_PENDING_REASON;
+        case githubNotes.isPending:
+          return GENERATED_NOTES_PENDING_REASON;
+        case isSubmitting:
+          return ACT_PENDING_REASON;
+        default:
+          return offlineHold;
+      }
+    })(),
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {/* A fixed height (not a cap): release bodies routinely run thousands of
+          lines, so the notes editor claims the dialog's whole spare height. */}
+      <DialogContent
+        className="flex h-[85vh] flex-col sm:max-w-2xl"
+        onKeyDown={generateChord.onKeyDown}
+      >
+        <form
+          className="flex min-h-0 flex-1 flex-col gap-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (submitBlocked) return;
+            form.handleSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>
+              {initialTag ? `Release ${initialTag}` : "New release"}
+            </DialogTitle>
+            <DialogDescription>
+              Publishes a {isGitLab ? "GitLab" : "GitHub"} release. A new tag is
+              created from the target on publish.
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* Fields scroll; header and submit footer stay pinned. */}
+          <div
+            className={cn(DIALOG_SCROLL, "flex min-h-0 flex-1 flex-col gap-4")}
+          >
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="rel-tag">Tag</Label>
+                {initialTag ? (
+                  <Input
+                    id="rel-tag"
+                    value={tag}
+                    disabled
+                    className="font-mono"
+                  />
+                ) : (
+                  <Combobox
+                    items={tagItems}
+                    itemToStringLabel={(t: { name: string }) => t.name}
+                    isItemEqualToValue={(
+                      a: { name: string },
+                      b: { name: string },
+                    ) => a.name === b.name}
+                    inputValue={tag}
+                    onInputValueChange={(v: string) => {
+                      // The close-time sync below echoes the current text back;
+                      // only a real edit un-settles the field.
+                      if (v === form.getFieldValue("tag")) return;
+                      form.setFieldValue("tag", v);
+                      setTagSettled(false);
+                    }}
+                    // UNCLAMPED on purpose: Base UI syncs the input to the selected
+                    // item's label as the popup finishes closing, and a null selection
+                    // syncs it to "" — clamping to the list would wipe a typed tag.
+                    value={tagValue}
+                    onValueChange={(t: { name: string } | null) =>
+                      t && form.setFieldValue("tag", t.name)
+                    }
+                    open={tagOpen}
+                    onOpenChange={(o) => {
+                      setTagOpen(o);
+                      if (!o) setTagSettled(true);
+                    }}
+                    openOnInputClick
+                  >
+                    <ComboboxInput
+                      id="rel-tag"
+                      className="w-full font-mono"
+                      placeholder="v1.2.0"
+                      aria-invalid={tagError ? true : undefined}
+                      aria-describedby={tagError ? tagErrorId : undefined}
+                      // Tab settles before focus moves, so the Target picker is
+                      // mounted when the browser picks the next stop. Synchronous:
+                      // the commit has to land inside this keydown. Blur is the
+                      // backstop for leaving by pointer.
+                      onKeyDown={(e) => {
+                        if (e.key === "Tab")
+                          flushSync(() => setTagSettled(true));
+                      }}
+                      onBlur={() => setTagSettled(true)}
+                    />
+                    <ComboboxContent>
+                      <ComboboxEmpty>
+                        {canCreate ? null : "No matching tags."}
+                      </ComboboxEmpty>
+                      <ComboboxList>
+                        {(t: { name: string }) => (
+                          <ComboboxItem key={t.name} value={t}>
+                            <span className="truncate font-mono">{t.name}</span>
+                          </ComboboxItem>
+                        )}
+                      </ComboboxList>
+                      {canCreate && (
+                        <button
+                          type="button"
+                          onClick={() => createNewTag(tagTrimmed)}
+                          className="flex w-full items-center gap-1.5 border-t px-2 py-2 text-left text-xs hover:bg-accent"
+                        >
+                          <PlusIcon className="size-3.5 shrink-0" />
+                          Create new tag{" "}
+                          <span className="font-mono">{tagTrimmed}</span> on
+                          release
+                        </button>
+                      )}
+                    </ComboboxContent>
+                  </Combobox>
+                )}
+                {tagError && (
+                  <p id={tagErrorId} className="text-xs text-warning">
+                    {tagError}
+                  </p>
+                )}
+              </div>
+              {showTarget && (
+                <LabeledGroup label="Target" className="space-y-1.5">
+                  <TargetPicker
+                    // Agent-session branches are app-internal — never a release
+                    // target (same rule as BranchSwitcher).
+                    branches={(branches.data ?? [])
+                      .map((b) => b.name)
+                      .filter((n) => !n.startsWith("gd/session/"))}
+                    commits={recent.data ?? []}
+                    value={target}
+                    onChange={(v) => form.setFieldValue("target", v)}
+                  />
+                </LabeledGroup>
+              )}
+            </div>
+
+            <form.AppField name="title">
+              {(field) => (
+                <field.TextField
+                  label="Title (optional)"
+                  placeholder={tagTrimmed || "Release title"}
+                />
+              )}
+            </form.AppField>
+
+            {/* `space-y-0` cancels LabeledGroup's default child margin, which
+                would ADD to this group's own `gap-1.5` (tailwind-merge doesn't
+                dedupe space-y against gap). */}
+            <LabeledGroup
+              label="Release notes"
+              className="flex flex-1 flex-col gap-1.5 space-y-0"
+              actions={
+                existingTags.length > 0 && (
+                  <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span className="shrink-0">Previous tag</span>
+                    <Combobox
+                      items={tagNames.map((name) => ({ name }))}
+                      itemToStringLabel={(t: { name: string }) => t.name}
+                      isItemEqualToValue={(
+                        a: { name: string },
+                        b: { name: string },
+                      ) => a.name === b.name}
+                      inputValue={previousTag}
+                      onInputValueChange={setPreviousTagOverride}
+                      // UNCLAMPED, as on the tag field: a clamped selection would
+                      // wipe a typed name on close. The generators read the
+                      // clamped `effectivePreviousTag`, which the hint below names.
+                      value={previousTagValue}
+                      onValueChange={(t: { name: string } | null) =>
+                        setPreviousTagOverride(t ? t.name : "")
+                      }
+                      openOnInputClick
+                    >
+                      <ComboboxInput
+                        className="h-7 w-64 font-mono text-xs"
+                        placeholder="Automatic"
+                      />
+                      <ComboboxContent>
+                        <ComboboxEmpty>No matching tags.</ComboboxEmpty>
+                        <ComboboxList>
+                          {(t: { name: string }) => (
+                            <ComboboxItem key={t.name} value={t}>
+                              <span className="truncate font-mono">
+                                {t.name}
+                              </span>
+                            </ComboboxItem>
+                          )}
+                        </ComboboxList>
+                      </ComboboxContent>
+                    </Combobox>
+                  </div>
+                )
+              }
+            >
+              {/* Its own full-width line: the w-64 control is too narrow to
+                  carry it. */}
+              {existingTags.length > 0 && previousTagUnknown && (
+                <p className="text-[11px] text-muted-foreground">
+                  Not an existing tag, so generated notes ignore it and use
+                  their default range.
+                </p>
+              )}
+              <MarkdownEditor
+                ref={notesEditorRef}
+                aria-label="Release notes"
+                value={notes}
+                onChange={(v) => form.setFieldValue("notes", v)}
+                placeholder="What's changed… (or generate notes above)"
+                fill
+                // No `rows`/`resize-y` in fill mode: the explicit floor plus
+                // `flex-1` set the height, and a manual drag fights the flex sizing.
+                textareaClassName="min-h-32 font-mono"
+                mentions={mentions}
+                actions={
+                  // GitLab's only generator is the AI one — with AI hidden the
+                  // menu would hold a single disabled item, so hide it entirely.
+                  isGitLab && !aiEnabled ? undefined : busyGenerating ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      onClick={() => aiNotes.cancel()}
+                    >
+                      {githubNotes.isPending ? (
+                        <Spinner data-icon="inline-start" />
+                      ) : (
+                        <XIcon data-icon="inline-start" />
+                      )}
+                      {githubNotes.isPending ? "Generating…" : "Cancel"}
+                    </Button>
+                  ) : (
+                    <DropdownMenu>
+                      {/* Both generators revise the notes, so a running create
+                          holds the whole menu; an empty tag stays a plain
+                          disable, as on submit. */}
+                      <DropdownMenuTrigger
+                        render={
+                          <DisabledReasonButton
+                            type="button"
+                            variant="ghost"
+                            size="xs"
+                            disabled={!tagTrimmed || isSubmitting}
+                            reason={
+                              isSubmitting
+                                ? CREATE_PENDING_GENERATE_REASON
+                                : undefined
+                            }
+                          />
+                        }
+                      >
+                        <SparkleIcon data-icon="inline-start" />
+                        Generate notes
+                        <CaretDownIcon data-icon="inline-end" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="min-w-56">
+                        {!isGitLab && (
+                          <DropdownMenuItem
+                            onClick={() => void generateFromGithub()}
+                          >
+                            From GitHub (commits & PRs)
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem
+                          disabled={!aiEnabled}
+                          title={aiNotesTitle}
+                          onClick={generateWithAi}
+                        >
+                          Summarize with AI
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )
+                }
+              />
+            </LabeledGroup>
+
+            {/* GitLab computes "latest" itself and has no pre-release/draft. */}
+            {!isGitLab && (
+              <div className="flex flex-wrap gap-x-6 gap-y-2">
+                <form.AppField name="latest">
+                  {(field) => (
+                    <field.CheckboxField
+                      label="Set as the latest release"
+                      className="flex cursor-pointer items-center gap-2 text-xs"
+                    />
+                  )}
+                </form.AppField>
+                <form.AppField name="prerelease">
+                  {(field) => (
+                    <field.CheckboxField
+                      label="Pre-release"
+                      className="flex cursor-pointer items-center gap-2 text-xs"
+                    />
+                  )}
+                </form.AppField>
+                <form.AppField name="draft">
+                  {(field) => (
+                    <field.CheckboxField
+                      label="Save as draft"
+                      className="flex cursor-pointer items-center gap-2 text-xs"
+                    />
+                  )}
+                </form.AppField>
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <form.AppForm>
+              <span
+                className={cn(
+                  "inline-flex",
+                  offlineSubmit.blockedReason && "cursor-not-allowed",
+                )}
+                title={offlineSubmit.wrapperTitle}
+              >
+                <form.SubmitButton
+                  focusableWhenDisabled={!!offlineSubmit.blockedReason}
+                  disabled={submitBlocked}
+                  aria-describedby={offlineSubmit.describedBy}
+                  className={ARIA_DISABLED_CLASS}
+                >
+                  {draft ? "Save draft" : "Publish release"}
+                </form.SubmitButton>
+                {offlineSubmit.blockedReason ? (
+                  <span id={offlineSubmit.reasonId} className="sr-only">
+                    {offlineSubmit.blockedReason}
+                  </span>
+                ) : null}
+              </span>
+            </form.AppForm>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * GitHub-style release target picker: a button that opens a popover with a
+ * filter and Branches / Recent Commits tabs. Picking a row sets the target and
+ * closes. Arrow keys move within the active tab's list.
+ */
+function TargetPicker({
+  branches,
+  commits,
+  value,
+  onChange,
+}: {
+  branches: string[];
+  commits: CommitSummary[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<"branches" | "commits">("branches");
+  const [filter, setFilter] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
+
+  const q = filter.trim().toLowerCase();
+  const isBranch = branches.includes(value);
+  const selectedCommit = commits.find((c) => c.hash === value);
+
+  const rows: { key: string; node: React.ReactNode }[] =
+    tab === "branches"
+      ? branches
+          .filter((b) => b.toLowerCase().includes(q))
+          .map((b) => ({
+            key: b,
+            node: (
+              <>
+                <GitBranchIcon className="shrink-0 text-muted-foreground" />
+                <span className="truncate font-mono">{b}</span>
+              </>
+            ),
+          }))
+      : commits
+          .filter(
+            (c) => c.hash.startsWith(q) || c.subject.toLowerCase().includes(q),
+          )
+          .map((c) => ({
+            key: c.hash,
+            node: (
+              <>
+                <GitCommitIcon className="mt-0.5 shrink-0 self-start text-muted-foreground" />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{c.subject}</span>
+                  <span className="text-muted-foreground">
+                    <span className="font-mono">{c.hash.slice(0, 7)}</span> ·{" "}
+                    <RelativeTime date={c.date} />
+                  </span>
+                </span>
+              </>
+            ),
+          }));
+
+  function pick(key: string) {
+    onChange(key);
+    setOpen(false);
+  }
+
+  const onKeyDown = listKeyboardNav({
+    items: rows,
+    activeIndex,
+    onActivate: (_row, to) => setActiveIndex(to),
+    rowKey: (r) => r.key,
+  });
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(o) => {
+        setOpen(o);
+        if (o) {
+          setFilter("");
+          setActiveIndex(-1);
+        }
+      }}
+    >
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full justify-start gap-2 font-normal"
+          />
+        }
+      >
+        {isBranch ? (
+          <GitBranchIcon className="shrink-0 text-muted-foreground" />
+        ) : (
+          <GitCommitIcon className="shrink-0 text-muted-foreground" />
+        )}
+        <span className="truncate font-mono">
+          {value
+            ? isBranch
+              ? value
+              : `${value.slice(0, 7)}${
+                  selectedCommit ? ` ${selectedCommit.subject}` : ""
+                }`
+            : "Choose a target"}
+        </span>
+        <CaretDownIcon className="ml-auto shrink-0 text-muted-foreground" />
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-80 gap-0 p-0">
+        <div className="p-2">
+          <Input
+            autoFocus
+            value={filter}
+            onChange={(e) => {
+              setFilter(e.target.value);
+              setActiveIndex(-1);
+            }}
+            placeholder={
+              tab === "branches" ? "Filter branches…" : "Filter recent commits…"
+            }
+            className="h-8"
+          />
+        </div>
+        <Tabs
+          value={tab}
+          onValueChange={(v) => {
+            setTab(v as "branches" | "commits");
+            setActiveIndex(-1);
+          }}
+        >
+          <TabsList variant="line" className="px-2">
+            <TabsTrigger value="branches">Branches</TabsTrigger>
+            <TabsTrigger value="commits">Recent Commits</TabsTrigger>
+          </TabsList>
+          <TabsContent value={tab} className="mt-0">
+            <div onKeyDown={onKeyDown} className="max-h-64 overflow-y-auto p-1">
+              {rows.map((r) => (
+                <button
+                  key={r.key}
+                  type="button"
+                  data-row={r.key}
+                  onClick={() => pick(r.key)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      pick(r.key);
+                    }
+                  }}
+                  className={cn(
+                    "flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs outline-hidden hover:bg-accent focus:bg-accent",
+                    value === r.key && "bg-accent/50",
+                  )}
+                >
+                  {r.node}
+                </button>
+              ))}
+              {rows.length === 0 && (
+                <p className="px-2 py-3 text-center text-xs text-muted-foreground">
+                  No matches.
+                </p>
+              )}
+            </div>
+          </TabsContent>
+        </Tabs>
+      </PopoverContent>
+    </Popover>
+  );
+}

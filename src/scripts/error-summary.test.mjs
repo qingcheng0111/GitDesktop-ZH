@@ -1,0 +1,1436 @@
+// Pins which line of a failed push, fetch, or pull the one-line error summary
+// leads with. git's transfer report opens with a `To <remote>` / `From <remote>`
+// header (sideband `remote:` lines can precede it) and lists every ref it moved,
+// so the summarizer skips the header and the non-`!` per-ref lines as noise and
+// lands on git's reason. Matched and unmatched shapes: see the docs on
+// PUSH_TRANSFER_HEADER, TRANSFER_REF_LINE, and TRANSFER_DELETED_LINE in
+// src/lib/error-summary.ts.
+//
+// `src/lib/error-summary.ts` carries an `@/` value import, which Node's type
+// stripping cannot resolve, so the shared src hooks go in first. The import is
+// dynamic only because a static one links before any module body runs, i.e.
+// before the hooks exist. It is deliberately NOT wrapped in a skip guard: the
+// graph reaches no bare packages (`git/api` is a type-only import, and
+// `tauri/invoke` -> `transport/index` imports nothing), so this suite runs in the
+// no-install `guards` job too and any import failure there is a real breakage.
+import assert from "node:assert/strict";
+import { after, test } from "node:test";
+import { installSrcHooks } from "./lib/src-import-hooks.mjs";
+
+const hooks = installSrcHooks();
+after(() => hooks.deregister());
+
+const {
+  composedErrorPresentation,
+  isTransportError,
+  presentError,
+  RUST_TRANSPORT_PHRASES,
+} = await import("@/lib/error-summary");
+
+const REMOTE = "https://gitlab.com/x/y.git";
+const REJECTED = " ! [rejected]        main -> main (non-fast-forward)";
+/** git's column padding collapses to single spaces in the summary. */
+const REJECTED_SUMMARY = "! [rejected] main -> main (non-fast-forward)";
+const FAILED = `error: failed to push some refs to '${REMOTE}'`;
+const HINTS = [
+  "hint: Updates were rejected because the tip of your current branch is behind",
+  "hint: its remote counterpart. If you want to integrate the remote changes,",
+  "hint: use 'git pull' before pushing again.",
+];
+
+/** The Rust layer serializes a failed git call with `message` = the trimmed
+ *  stderr, which is why `stderr` repeats it here. */
+const gitError = (text) => ({
+  kind: "git",
+  message: text.trim(),
+  code: 1,
+  stderr: text.trim(),
+});
+
+/** The measured non-fast-forward push report, joined with `eol`. */
+const nonFastForward = (eol) =>
+  [`To ${REMOTE}`, REJECTED, FAILED, ...HINTS].join(eol);
+
+test("a rejected push leads with the ! [rejected] line, not the To header", () => {
+  const p = presentError(gitError(nonFastForward("\n")));
+  assert.equal(p.summary, REJECTED_SUMMARY);
+  assert.equal(p.label, "Git error");
+  assert.ok(
+    p.fullText.startsWith(`To ${REMOTE}\n`),
+    "fullText keeps the header",
+  );
+  assert.ok(
+    p.fullText.includes(REJECTED.trim()),
+    "fullText keeps git's column padding",
+  );
+  assert.doesNotMatch(p.summary, /\s{2}/, "summary collapses whitespace runs");
+  assert.equal(p.long, true);
+});
+
+test("header followed only by error: lands on the prefix-stripped error line", () => {
+  const p = presentError(gitError(`To ${REMOTE}\n${FAILED}`));
+  assert.equal(p.summary, `failed to push some refs to '${REMOTE}'`);
+});
+
+test("CRLF joints summarize the same as LF", () => {
+  const p = presentError(gitError(nonFastForward("\r\n")));
+  assert.equal(p.summary, REJECTED_SUMMARY);
+});
+
+test("scp-style and ssh remotes are skipped as the header too", () => {
+  for (const remote of [
+    "github.com:user/repo.git",
+    "git@github.com:user/repo.git",
+    "ssh://git@example.com:2222/user/repo.git",
+    "git+ssh://git@example.com/user/repo.git",
+    "http://example.com/user/repo.git",
+  ]) {
+    const p = presentError(gitError(`To ${remote}\n${REJECTED}\n${FAILED}`));
+    assert.equal(p.summary, REJECTED_SUMMARY, remote);
+  }
+});
+
+test("prose that opens with To keeps line one as the summary", () => {
+  for (const first of [
+    "To enable long paths, run git config --global core.longpaths true.",
+    "To continue, resolve the conflicts.",
+  ]) {
+    const p = presentError(
+      gitError(`${first}\nerror: something else went wrong`),
+    );
+    assert.equal(p.summary, first);
+    const plain = presentError(new Error(`${first}\nsecond line`));
+    assert.equal(plain.summary, first);
+  }
+});
+
+test("a lone word:token line is skipped too (accepted residual)", () => {
+  const p = presentError(gitError(`To origin:main\n${FAILED}`));
+  assert.equal(p.summary, `failed to push some refs to '${REMOTE}'`);
+});
+
+test("a Windows drive-letter or file:// header is skipped like a remote", () => {
+  for (const remote of [
+    "C:/temp/bare.git",
+    "C:\\temp\\bare.git",
+    "file:///C:/temp/bare.git",
+  ]) {
+    const p = presentError(gitError(`To ${remote}\n${REJECTED}\n${FAILED}`));
+    assert.equal(p.summary, REJECTED_SUMMARY, remote);
+  }
+});
+
+test("a local-path header is not matched and keeps line one", () => {
+  const header = "To /home/u/bare.git";
+  const p = presentError(gitError(`${header}\n${REJECTED}\n${FAILED}`));
+  assert.equal(p.summary, header);
+});
+
+test("a header-only message still summarizes as that line, never blank", () => {
+  assert.equal(presentError(gitError(`To ${REMOTE}`)).summary, `To ${REMOTE}`);
+  assert.equal(
+    presentError(gitError(`To ${REMOTE}\nhint: nothing else`)).summary,
+    `To ${REMOTE}`,
+  );
+});
+
+test("a plain Error carrying push output skips the header as well", () => {
+  const p = presentError(new Error(nonFastForward("\n")));
+  assert.equal(p.label, null);
+  assert.equal(p.summary, REJECTED_SUMMARY);
+});
+
+test("app prose in message still leads when the push output rides stderr", () => {
+  const p = presentError({
+    kind: "git",
+    message: "Couldn't push main.",
+    code: 1,
+    stderr: nonFastForward("\n"),
+  });
+  assert.equal(p.summary, "Couldn't push main.");
+  assert.ok(p.fullText.includes(`To ${REMOTE}`));
+});
+
+test("mapped families still outrank the fall-through", () => {
+  const staleInfo = [
+    `To ${REMOTE}`,
+    " ! [rejected]        main -> main (stale info)",
+    FAILED,
+  ].join("\n");
+  assert.match(
+    presentError(gitError(staleInfo)).summary,
+    /^Force push blocked — the remote moved since your last fetch\./,
+  );
+
+  // GitHub pads every `remote:` line with trailing spaces.
+  const pushProtection = [
+    "remote: error: GH013: Repository rule violations found for refs/heads/main.        ",
+    "remote: ",
+    "remote: - GITHUB PUSH PROTECTION        ",
+    "remote:     Resolve the following violations before pushing again        ",
+    "remote: ",
+    "remote:     - Push cannot contain secrets        ",
+    "remote: ",
+    "To https://github.com/x/y.git",
+    " ! [remote rejected] main -> main (push declined due to repository rule violations)",
+    "error: failed to push some refs to 'https://github.com/x/y.git'",
+  ].join("\n");
+  assert.match(
+    presentError(gitError(pushProtection)).summary,
+    /^GitHub blocked this push because it detected a likely secret/,
+  );
+});
+
+test("a rollback verdict on line one stays the summary", () => {
+  const verdict = "The cherry-pick was rolled back — main is unchanged.";
+  const message = [
+    verdict,
+    "Pick 1a2b3c4 failed, usually a conflict; nothing from this batch was kept.",
+    "error: could not apply 1a2b3c4... fix the parser",
+    "hint: Resolve all conflicts manually, mark them as resolved with",
+  ].join("\n");
+  assert.equal(presentError(gitError(message)).summary, verdict);
+});
+
+// Transfer-report shapes measured on git 2.51.1.windows.1 with piped stderr, the
+// Rust runner's own context. Remote paths shortened; the column padding is git's.
+const LOCAL_ORIGIN = "C:/temp/w/origin";
+const NEW_TAG = " * [new tag]         v2 -> v2";
+const FF_TABLE = "   22952d8..c5bdbe9  main       -> origin/main";
+const DIVERGED_HINTS = [
+  "hint: Diverging branches can't be fast-forwarded, you need to either:",
+  "hint:",
+  "hint: \tgit merge --ff-only",
+  "hint:",
+  "hint: or:",
+  "hint:",
+  "hint: \tgit rebase",
+  "hint:",
+  'hint: Disable this message with "git config set advice.diverging false"',
+];
+const NOT_FF = "fatal: Not possible to fast-forward, aborting.";
+const TAG_CLOBBER =
+  " ! [rejected]        v1         -> v1  (would clobber existing tag)";
+
+/** A push carrying a rejected branch and a new tag (`push.followTags`): the tag's
+ *  success line comes first in git's report. */
+const multiRefPush = (eol) =>
+  [
+    `To ${LOCAL_ORIGIN}.git`,
+    NEW_TAG,
+    REJECTED,
+    `error: failed to push some refs to '${LOCAL_ORIGIN}.git'`,
+    ...HINTS,
+  ].join(eol);
+
+/** `pull --ff-only` on a diverged branch: the fetch half's report, then git's
+ *  refusal. */
+const ffOnlyPull = (eol) =>
+  [`From ${LOCAL_ORIGIN}`, FF_TABLE, ...DIVERGED_HINTS, NOT_FF].join(eol);
+
+/** A merge-mode pull conflict as `full_failure_text` folds it: stderr (the fetch
+ *  report) first, stdout (the merge verdict) below. */
+const pullConflictFold = (eol) =>
+  [
+    `From ${LOCAL_ORIGIN}`,
+    "   c4ff0f4..22952d8  main       -> origin/main",
+    "Auto-merging a.txt",
+    "CONFLICT (content): Merge conflict in a.txt",
+    "Automatic merge failed; fix conflicts and then commit the result.",
+  ].join(eol);
+
+/** `fetch --tags` refusing to move an existing tag. */
+const tagClobber = (eol) => [`From ${LOCAL_ORIGIN}`, TAG_CLOBBER].join(eol);
+
+/** A push deleting one ref and rejecting another: the deletion prints first, with
+ *  no arrow. */
+const DELETED = " - [deleted]         doomed";
+const deletionPush = (eol) =>
+  [
+    `To ${LOCAL_ORIGIN}.git`,
+    DELETED,
+    REJECTED,
+    `error: failed to push some refs to '${LOCAL_ORIGIN}.git'`,
+  ].join(eol);
+
+/** A fetch naming a branch (bare `branch` summary word) beside a tag refusal and
+ *  a forced update. */
+const FETCH_BRANCH = " * branch            main       -> FETCH_HEAD";
+const FORCED =
+  " + c5bdbe9...1d0d257 main       -> origin/main  (forced update)";
+const mixedFetch = (eol, lines) => [`From ${LOCAL_ORIGIN}`, ...lines].join(eol);
+
+/** Fetching a `refs/remotes/*` ref names it with a two-word summary. */
+const REMOTE_TRACKING = " * remote-tracking branch mirror/main -> FETCH_HEAD";
+
+/** The Rust serialization verbatim: `message` is the trimmed stderr, `stderr`
+ *  the raw blob with git's trailing newline. */
+const rawGitError = (text) => ({
+  kind: "git",
+  message: text.trim(),
+  code: 1,
+  stderr: `${text}\n`,
+});
+
+for (const [name, eol] of [
+  ["LF", "\n"],
+  ["CRLF", "\r\n"],
+]) {
+  test(`a multi-ref push leads with the rejection, not the new tag's line (${name})`, () => {
+    for (const make of [gitError, rawGitError]) {
+      const p = presentError(make(multiRefPush(eol)));
+      assert.equal(p.summary, REJECTED_SUMMARY);
+      assert.ok(
+        p.fullText.includes(NEW_TAG.trim()),
+        "fullText keeps the tag line",
+      );
+    }
+  });
+
+  test(`a refused ff-only pull leads with git's reason (${name})`, () => {
+    for (const make of [gitError, rawGitError]) {
+      const p = presentError(make(ffOnlyPull(eol)));
+      assert.equal(p.summary, "Not possible to fast-forward, aborting.");
+      assert.ok(
+        p.fullText.startsWith(`From ${LOCAL_ORIGIN}`),
+        "fullText keeps the fetch report",
+      );
+      assert.ok(p.fullText.includes(FF_TABLE), "fullText keeps the table line");
+    }
+  });
+
+  test(`a merge-mode pull conflict still reads as a paused merge (${name})`, () => {
+    const p = presentError(gitError(pullConflictFold(eol)));
+    assert.equal(
+      p.summary,
+      "Merge paused — resolve the conflicts, then commit.",
+    );
+  });
+
+  test(`a tag-clobber refusal keeps its ! line as the summary (${name})`, () => {
+    const p = presentError(gitError(tagClobber(eol)));
+    assert.equal(
+      p.summary,
+      "! [rejected] v1 -> v1 (would clobber existing tag)",
+    );
+  });
+
+  test(`a push deletion above a rejection is skipped (${name})`, () => {
+    for (const make of [gitError, rawGitError]) {
+      const p = presentError(make(deletionPush(eol)));
+      assert.equal(p.summary, REJECTED_SUMMARY);
+      assert.ok(p.fullText.includes(DELETED.trim()), "fullText keeps it");
+    }
+  });
+
+  test(`a fetch's branch and forced-update lines are noise, its ! line is not (${name})`, () => {
+    const measured = mixedFetch(eol, [FETCH_BRANCH, TAG_CLOBBER, FORCED]);
+    assert.equal(
+      presentError(gitError(measured)).summary,
+      "! [rejected] v1 -> v1 (would clobber existing tag)",
+    );
+    // Without the ! line the report is all noise, so the header summarizes: both
+    // remaining per-ref lines were skipped.
+    const noiseOnly = mixedFetch(eol, [FETCH_BRANCH, FORCED]);
+    assert.equal(
+      presentError(gitError(noiseOnly)).summary,
+      `From ${LOCAL_ORIGIN}`,
+    );
+  });
+
+  test(`a fetched remote-tracking ref's line is noise above a rejection (${name})`, () => {
+    // Measured: the two-word summary column is followed by a single space.
+    const measured = mixedFetch(eol, [REMOTE_TRACKING, TAG_CLOBBER]);
+    assert.equal(
+      presentError(gitError(measured)).summary,
+      "! [rejected] v1 -> v1 (would clobber existing tag)",
+    );
+    assert.equal(
+      presentError(gitError(mixedFetch(eol, [REMOTE_TRACKING]))).summary,
+      `From ${LOCAL_ORIGIN}`,
+    );
+  });
+}
+
+test("app prose in message still leads when the pull report rides stderr", () => {
+  const p = presentError({
+    kind: "git",
+    message: "Couldn't pull main.",
+    code: 128,
+    stderr: ffOnlyPull("\n"),
+  });
+  assert.equal(p.summary, "Couldn't pull main.");
+  assert.ok(
+    p.fullText.includes(NOT_FF),
+    "fullText appends the distinct stderr",
+  );
+});
+
+test("the documented success flags (+ - * = t, and space) with known summaries are noise; ! is not", () => {
+  for (const line of [
+    FF_TABLE,
+    " + 22952d8...c5bdbe9 main       -> origin/main  (forced update)",
+    " - [deleted]         (none)     -> origin/gone",
+    NEW_TAG,
+    " * [new branch]      feat       -> origin/feat",
+    " = [up to date]      main       -> main",
+    " t [tag update]      v1         -> v1",
+    " * branch            main       -> FETCH_HEAD",
+    " * tag               v1         -> FETCH_HEAD",
+    " * remote-tracking branch mirror/main -> FETCH_HEAD",
+    // A push deletion prints no arrow, only the remote refname.
+    " - [deleted]         feat",
+  ]) {
+    const p = presentError(
+      gitError(`From ${LOCAL_ORIGIN}\n${line}\n${NOT_FF}`),
+    );
+    assert.equal(p.summary, "Not possible to fast-forward, aborting.", line);
+  }
+  for (const line of [
+    REJECTED,
+    " ! [remote rejected] main -> main (pre-receive hook declined)",
+  ]) {
+    const p = presentError(gitError(`To ${REMOTE}\n${line}\n${FAILED}`));
+    assert.equal(p.summary, line.trim().replace(/\s+/g, " "), line);
+  }
+});
+
+test("prose shaped near a per-ref line stays meaningful", () => {
+  for (const line of [
+    // The flag column without the arrow.
+    " - make sure the remote still exists",
+    // The deletion status followed by more than one refname-shaped token.
+    " - [deleted]         feat and the rest",
+    // An arrow mid-prose, without the flag column.
+    "Renamed main -> trunk on the remote.",
+    // A flag column whose summary is no `[…]` status, hex range, or bare
+    // `branch`/`tag` word.
+    "   Fix the parser -> faster builds",
+    " * note: main -> trunk",
+    " * branches main -> trunk",
+  ]) {
+    const p = presentError(
+      gitError(`From ${LOCAL_ORIGIN}\n${line}\n${NOT_FF}`),
+    );
+    assert.equal(p.summary, line.trim().replace(/\s+/g, " "), line);
+  }
+});
+
+test("a From header needs a remote token, like the To header", () => {
+  for (const first of [
+    "From /home/u/origin",
+    "From here on, retry the fetch.",
+  ]) {
+    const p = presentError(gitError(`${first}\n${NOT_FF}`));
+    assert.equal(p.summary, first);
+  }
+  for (const remote of [
+    "https://github.com/x/y.git",
+    "git@github.com:x/y.git",
+    "file:///C:/temp/origin",
+    "C:\\temp\\origin",
+  ]) {
+    const p = presentError(gitError(`From ${remote}\n${NOT_FF}`));
+    assert.equal(p.summary, "Not possible to fast-forward, aborting.", remote);
+  }
+});
+
+test("an all-noise report still summarizes its first non-empty line", () => {
+  // Header plus table: the header is the first non-empty line.
+  const headed = [`From ${LOCAL_ORIGIN}`, FF_TABLE, NEW_TAG].join("\n");
+  assert.equal(presentError(gitError(headed)).summary, `From ${LOCAL_ORIGIN}`);
+  // Table alone, indent intact (a plain Error is never trimmed upstream).
+  const tableOnly = ["", FF_TABLE, NEW_TAG].join("\n");
+  assert.equal(
+    presentError(new Error(tableOnly)).summary,
+    "22952d8..c5bdbe9 main -> origin/main",
+  );
+});
+
+// `git ls-remote` refusals measured on git 2.51.1.windows.1, 2026-09-24: an SSH
+// remote with no usable key, a missing local path, and an unresolvable SSH host
+// (the ssh client's lines end in CRLF, git's own in LF), all ending on git's
+// shared `fatal:` tail; and an https remote naming a missing project.
+const SSH_KEY_REFUSED_SUMMARY =
+  "The remote refused the SSH connection because no key it accepts was offered. Add or load an SSH key with access to this remote, then try again.";
+const UNREADABLE_TAIL =
+  "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n";
+const sshNoAccess = (host) =>
+  `git@${host}: Permission denied (publickey).\r\n${UNREADABLE_TAIL}`;
+const MISSING_PATH_LINE =
+  "'C:/definitely-not-a-repo-x7q9z' does not appear to be a git repository";
+const UNRESOLVED_HOST_LINE =
+  "ssh: Could not resolve hostname definitely-not-a-host-x7q9z.invalid: Name or service not known";
+
+test("an SSH remote with no usable key gets the calm key-refusal line", () => {
+  for (const host of ["gitlab.com", "github.com"]) {
+    for (const make of [gitError, rawGitError]) {
+      const p = presentError(make(sshNoAccess(host)));
+      assert.equal(p.summary, SSH_KEY_REFUSED_SUMMARY, host);
+      assert.ok(
+        p.fullText.includes(`git@${host}: Permission denied (publickey).`),
+        "fullText keeps the ssh line",
+      );
+    }
+  }
+});
+
+test("an https missing-project refusal keeps its remote: line", () => {
+  const gitlabLine =
+    "remote: The project you were looking for could not be found or you don't have permission to view it.";
+  const githubLine = "remote: Repository not found.";
+  for (const [first, url] of [
+    [gitlabLine, "https://gitlab.com/x/y.git/"],
+    [githubLine, "https://github.com/x/y.git/"],
+  ]) {
+    const text = `${first}\nfatal: repository '${url}' not found\n`;
+    for (const make of [gitError, rawGitError]) {
+      assert.equal(presentError(make(text)).summary, first, url);
+    }
+  }
+});
+
+test("first-contact failures on git's shared tail keep their own first line", () => {
+  for (const [text, summary] of [
+    [`fatal: ${MISSING_PATH_LINE}\n${UNREADABLE_TAIL}`, MISSING_PATH_LINE],
+    [`${UNRESOLVED_HOST_LINE}\r\n${UNREADABLE_TAIL}`, UNRESOLVED_HOST_LINE],
+  ]) {
+    for (const make of [gitError, rawGitError]) {
+      assert.equal(presentError(make(text)).summary, summary);
+    }
+  }
+});
+
+test("constructed method lists: publickey among several maps, keyless lists fall through", () => {
+  const withKey = "git@example.com: Permission denied (publickey,password).";
+  assert.equal(
+    presentError(gitError(withKey)).summary,
+    SSH_KEY_REFUSED_SUMMARY,
+  );
+  for (const keyless of [
+    "git@example.com: Permission denied (password).",
+    "git@example.com: Permission denied (keyboard-interactive).",
+  ]) {
+    assert.equal(presentError(gitError(keyless)).summary, keyless);
+  }
+});
+
+test("a composed presentation headlines the title over one error's own text", () => {
+  const error = gitError(sshNoAccess("gitlab.com"));
+  const own = presentError(error);
+  const p = composedErrorPresentation("Created issue #12, but it failed.", [
+    error,
+  ]);
+  assert.equal(p.summary, "Created issue #12, but it failed.");
+  assert.equal(p.label, own.label);
+  assert.equal(p.fullText, own.fullText);
+  assert.equal(p.long, own.long);
+});
+
+test("a composed presentation sections several errors under their headings", () => {
+  const first = gitError("fatal: first failure");
+  const second = new Error("second failure\nwith detail");
+  const p = composedErrorPresentation(
+    "Created issue #12, but two steps failed.",
+    [first, second],
+    ["Adding to project", "Setting labels"],
+  );
+  assert.deepEqual(p, {
+    label: null,
+    summary: "Created issue #12, but two steps failed.",
+    fullText:
+      "Adding to project\nfatal: first failure\n\nSetting labels\nsecond failure\nwith detail",
+    long: true,
+  });
+  // Without headings the sections join bare.
+  assert.equal(
+    composedErrorPresentation("t", [first, second]).fullText,
+    "fatal: first failure\n\nsecond failure\nwith detail",
+  );
+});
+
+test("a composed presentation carries the toast's View link into Details", () => {
+  const link = {
+    url: "https://github.com/o/r/issues/12",
+    label: "View on GitHub",
+  };
+  const one = gitError("fatal: first failure");
+  const single = composedErrorPresentation(
+    "Created issue #12, but it failed.",
+    [one],
+    undefined,
+    link,
+  );
+  assert.deepEqual(single.link, link);
+  // The link rides along; the single-error headline contract is unchanged.
+  assert.equal(single.summary, "Created issue #12, but it failed.");
+  assert.equal(single.fullText, presentError(one).fullText);
+  const several = composedErrorPresentation(
+    "Created issue #12, but two steps failed.",
+    [one, new Error("second failure")],
+    ["Adding to project", "Setting labels"],
+    link,
+  );
+  assert.deepEqual(several.link, link);
+  assert.equal(several.long, true);
+});
+
+test("a composed presentation without a link has no link key, and presentError never sets one", () => {
+  const error = gitError("fatal: first failure");
+  assert.equal("link" in composedErrorPresentation("t", [error]), false);
+  assert.equal(
+    "link" in composedErrorPresentation("t", [error, new Error("second")]),
+    false,
+  );
+  assert.equal("link" in presentError(error), false);
+});
+
+test("a lone error with a heading becomes one headed section and routes through Details", () => {
+  // Short on purpose: bare, this presents as `long: false` (Copy, no heading).
+  const error = "Field is read-only";
+  assert.equal(presentError(error).long, false);
+  const p = composedErrorPresentation(
+    "1 of 5 cards failed to move — Field is read-only",
+    [error],
+    ["Zebra card"],
+  );
+  assert.deepEqual(p, {
+    label: null,
+    summary: "1 of 5 cards failed to move — Field is read-only",
+    fullText: "Zebra card\nField is read-only",
+    long: true,
+  });
+  // Same section format as one entry of the multi branch.
+  const multi = composedErrorPresentation(
+    "t",
+    [error, "other"],
+    ["Zebra card", "Alpha card"],
+  );
+  assert.ok(multi.fullText.startsWith(`${p.fullText}\n\n`));
+  // An AppError keeps its own kind label under the heading.
+  const git = gitError("fatal: first failure");
+  const headed = composedErrorPresentation("t", [git], ["Adding to project"]);
+  assert.equal(headed.label, "Git error");
+  assert.equal(headed.fullText, "Adding to project\nfatal: first failure");
+  assert.equal(headed.long, true);
+});
+
+test("a lone error without a heading is exactly its own presentation under the title", () => {
+  for (const error of [
+    "Field is read-only",
+    gitError("fatal: first failure"),
+    gitError(sshNoAccess("gitlab.com")),
+    new Error("second failure\nwith detail"),
+  ]) {
+    const expected = { ...presentError(error), summary: "t" };
+    assert.deepEqual(composedErrorPresentation("t", [error]), expected);
+    assert.deepEqual(composedErrorPresentation("t", [error], []), expected);
+    // An empty heading reads as none, as it does in the multi branch.
+    assert.deepEqual(composedErrorPresentation("t", [error], [""]), expected);
+  }
+});
+
+test("per-item sections keep the order their headings were given in", () => {
+  const p = composedErrorPresentation(
+    "3 of 5 cards failed to move — Field is read-only",
+    ["Field is read-only", "Resource not accessible", "Field is read-only"],
+    ["Zebra card", "Alpha card", "Middle card"],
+  );
+  assert.equal(
+    p.fullText,
+    "Zebra card\nField is read-only\n\nAlpha card\nResource not accessible\n\nMiddle card\nField is read-only",
+  );
+  assert.equal(p.summary, "3 of 5 cards failed to move — Field is read-only");
+});
+
+test("ssh's key refusal after other text on its line falls through", () => {
+  const line = "warning: git@gitlab.com: Permission denied (publickey).";
+  const p = presentError(gitError(line));
+  assert.notEqual(p.summary, SSH_KEY_REFUSED_SUMMARY);
+  assert.equal(p.summary, line);
+});
+
+// ── Network classification for the forge and transport kinds ──
+
+const HOST_BY_KIND = {
+  gh: "GitHub",
+  glab: "GitLab",
+  bitbucket: "Bitbucket",
+  jira: "Jira",
+};
+const reach = (host) =>
+  `Couldn't reach ${host} — check your network connection.`;
+const appError = (kind, message) => ({ kind, message });
+
+/** The curated transport phrases every network kind reads. */
+const TRANSPORT_PHRASES = [
+  "dial tcp",
+  "no such host",
+  "connection refused",
+  "connection reset",
+  "context deadline exceeded",
+  "TLS handshake timeout",
+  "i/o timeout",
+  "error connecting to",
+  "Could not resolve host",
+  "network is unreachable",
+  "forcibly closed by the remote host",
+  "proxyconnect tcp",
+];
+/** GitLab's OFFLINE_STATUS phrases from forge/session.rs. */
+const GLAB_OUTAGE_PHRASES = [
+  "Bad Gateway",
+  "Service Unavailable",
+  "Gateway Timeout",
+  "Proxy Authentication Required",
+];
+/** gh also recognizes outage answers carrying only a numeric status. */
+const GH_ONLY_PHRASES = [
+  "HTTP 500",
+  "HTTP 502",
+  "HTTP 503",
+  "HTTP 504",
+  "status code: 503",
+];
+
+test("the Rust transport phrases are pinned (cross-language canary)", () => {
+  // forge/http.rs and forge/jira.rs put these literals in a transport failure;
+  // rewording either side without the other silently drops the friendly copy.
+  assert.deepEqual(
+    [...RUST_TRANSPORT_PHRASES],
+    ["connection failed", "request timed out"],
+  );
+  for (const kind of ["bitbucket", "jira"]) {
+    for (const phrase of RUST_TRANSPORT_PHRASES) {
+      const message = `request to https://example.com/rest/x: ${phrase}`;
+      const p = presentError(appError(kind, message));
+      assert.equal(p.summary, reach(HOST_BY_KIND[kind]), `${kind}: ${phrase}`);
+    }
+  }
+});
+
+test("every transport phrase classifies for every network kind that reads it", () => {
+  for (const [kind, host] of Object.entries(HOST_BY_KIND)) {
+    const phrases = [
+      ...TRANSPORT_PHRASES,
+      ...RUST_TRANSPORT_PHRASES,
+      ...(kind === "gh" || kind === "glab" ? GLAB_OUTAGE_PHRASES : []),
+      ...(kind === "gh" ? GH_ONLY_PHRASES : []),
+    ];
+    for (const phrase of phrases) {
+      const message = `request failed: ${phrase} (https://example.com/)`;
+      const p = presentError(appError(kind, message));
+      assert.equal(p.summary, reach(host), `${kind}: ${phrase}`);
+      assert.equal(p.fullText, message, "fullText keeps the raw text");
+      assert.equal(p.long, true, "the raw text stays reachable via Details");
+    }
+  }
+});
+
+test("realistic transport lines classify", () => {
+  // gh lines measured behind a failing proxy (forge/session.rs
+  // GH_NETWORK_ERRORS); the rest are Go's and git's resolver wording.
+  for (const [kind, message] of [
+    [
+      "gh",
+      'Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host',
+    ],
+    [
+      "gh",
+      'Get "https://api.github.com/": dial tcp 140.82.112.6:443: connect: connection refused',
+    ],
+    ["gh", 'Get "https://api.github.com/": net/http: TLS handshake timeout'],
+    [
+      "gh",
+      'Get "https://api.github.com/": proxyconnect tcp: dial tcp 10.0.0.1:8080: i/o timeout',
+    ],
+    ["gh", 'Get "https://api.github.com/": context deadline exceeded'],
+    [
+      "gh",
+      'Get "https://api.github.com/": read tcp 127.0.0.1:50615->127.0.0.1:9902: wsarecv: An existing connection was forcibly closed by the remote host.',
+    ],
+    ["gh", 'Get "https://api.github.com/": Bad Gateway'],
+    ["gh", 'Get "https://api.github.com/": Proxy Authentication Required'],
+    ["gh", "HTTP 503: Service Unavailable (http://api.github.localhost/)"],
+    ["gh", "HTTP 500: Server Error (http://api.github.localhost/)"],
+    ["gh", 'non-200 OK status code: 503 Service Unavailable body: "{}"'],
+    [
+      "gh",
+      "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+    ],
+    [
+      "glab",
+      'Get "https://gitlab.com/api/v4/user": dial tcp: lookup gitlab.com: no such host',
+    ],
+    ["glab", "fatal: unable to access: Could not resolve host: gitlab.com"],
+  ]) {
+    assert.equal(
+      presentError(appError(kind, message)).summary,
+      reach(HOST_BY_KIND[kind]),
+      message,
+    );
+  }
+});
+
+test("names, paths and bare numbers never classify (measured misfires)", () => {
+  for (const [kind, message] of [
+    [
+      "gh",
+      "GraphQL: Could not resolve to a Repository with the name 'acme/network-tools'",
+    ],
+    ["gh", "No commits between main and feature/tls-upgrade"],
+    ["gh", "HTTP 422: Validation Failed ... (maximum is 500 characters)"],
+    [
+      "io",
+      "failed to read C:/Users/x/repos/network-lib/.git/config (os error 3)",
+    ],
+    ["bitbucket", "repository acme/dns-lookup not found"],
+  ]) {
+    assert.equal(
+      presentError(appError(kind, message)).summary,
+      message,
+      `${kind}: ${message}`,
+    );
+  }
+});
+
+test("io errors are never rewritten as a network failure, even with transport wording", () => {
+  const message = "io error: connection refused (os error 111)";
+  const p = presentError(appError("io", message));
+  // Only the Rust lead goes; the OS text keeps its own words and case.
+  assert.equal(p.summary, "connection refused (os error 111)");
+  assert.equal(p.fullText, message);
+});
+
+test("GitLab outage phrases map for glab; Bitbucket and Jira keep their raw line", () => {
+  for (const kind of ["glab", "bitbucket", "jira"]) {
+    for (const word of GLAB_OUTAGE_PHRASES) {
+      const message = `request failed: ${word}`;
+      assert.equal(
+        presentError(appError(kind, message)).summary,
+        kind === "glab" ? reach("GitLab") : message,
+        `${kind}: ${word}`,
+      );
+    }
+  }
+});
+
+test("gh-only numeric outage statuses leave other kinds' raw line", () => {
+  for (const kind of ["glab", "bitbucket", "jira"]) {
+    for (const word of GH_ONLY_PHRASES) {
+      const message = `request failed: ${word}`;
+      assert.equal(
+        presentError(appError(kind, message)).summary,
+        message,
+        `${kind}: ${word}`,
+      );
+    }
+  }
+});
+
+test("glab's padded ERROR banner gives way to Unauthenticated (banner negative control)", () => {
+  const message =
+    "          \n   ERROR  \n          \n  Unauthenticated.        ";
+  const p = presentError(appError("glab", message));
+  assert.equal(p.summary, "Unauthenticated.");
+  assert.equal(p.fullText, message);
+});
+
+test("glab's padded ERROR banner with Bad Gateway maps to GitLab (outage negative control)", () => {
+  const message = "          \n   ERROR  \n          \n  Bad Gateway        ";
+  assert.equal(
+    presentError(appError("glab", message)).summary,
+    reach("GitLab"),
+  );
+});
+
+test("glab's wrapped Members-list Bad Gateway classifies (whitespace-collapse revert detector)", () => {
+  const message = [
+    "   ERROR  ",
+    "          ",
+    '  Get "https://gitlab.com/api/v4/projects/theBGuy%2Fgitdesktop-gitlab-demo/members/all?per_page=100&page=1": Bad        ',
+    "  Gateway.        ",
+  ].join("\n");
+  const p = presentError(appError("glab", message));
+  assert.equal(p.summary, reach("GitLab"));
+  assert.equal(p.fullText, message);
+});
+
+test("glab's wrapped connection refused classifies (transport-collapse revert detector)", () => {
+  // The bare refusal must classify without an intact dial tcp masking the wrap.
+  for (const prefix of ["dial tcp 192.0.2.1:443: ", ""]) {
+    const message = [
+      "   ERROR  ",
+      "          ",
+      `  Get "https://example.com/api/v4/user": ${prefix}connection        `,
+      "  refused.        ",
+    ].join("\n");
+    const p = presentError(appError("glab", message));
+    assert.equal(p.summary, reach("GitLab"), message);
+    assert.equal(p.fullText, message);
+  }
+});
+
+test("glab's short single-line Bad Gateway still classifies", () => {
+  const message = 'Get "https://gitlab.com/api/v4/user": Bad Gateway';
+  assert.equal(
+    presentError(appError("glab", message)).summary,
+    reach("GitLab"),
+  );
+});
+
+test("glab's padded ERROR banner alone keeps the first non-empty fallback", () => {
+  const message = "          \n   ERROR  \n          ";
+  assert.equal(presentError(appError("glab", message)).summary, "ERROR");
+});
+
+test("gh skips a padded ERROR line and keeps the real message", () => {
+  const message =
+    "          \n   ERROR  \n          \n  Example failure.        ";
+  assert.equal(
+    presentError(appError("gh", message)).summary,
+    "Example failure.",
+  );
+});
+
+test("Bitbucket keeps Bad Gateway as its raw summary", () => {
+  assert.equal(
+    presentError(appError("bitbucket", "Bad Gateway")).summary,
+    "Bad Gateway",
+  );
+});
+
+test("bare transport words and phrases inside identifiers never classify", () => {
+  for (const message of [
+    "network error",
+    "connection closed",
+    "lookup failed",
+    "timeout",
+    "unexpected EOF",
+    "connections refused by policy",
+    "reconnection refused",
+    "the dial tcpip adapter is disabled",
+    "repository acme/proxyconnect not found",
+    "port 5030 rejected the token",
+    "request id 1503-a rejected",
+    "thereof",
+  ]) {
+    for (const kind of ["gh", "bitbucket"]) {
+      assert.equal(
+        presentError(appError(kind, message)).summary,
+        message,
+        `${kind}: ${message}`,
+      );
+    }
+  }
+});
+
+test("an answered 401/403 or a rate limit outranks transport phrases", () => {
+  // Each carries a phrase that classifies on its own, so the precedence is
+  // what keeps the raw line.
+  for (const message of [
+    "HTTP 401: token revoked; connection refused on retry (https://api.github.com/)",
+    "HTTP 403: Resource protected by organization SAML enforcement; connection reset",
+    "HTTP 401: Bad credentials from proxy after HTTP 503",
+    "HTTP 403: API rate limit exceeded; context deadline exceeded",
+    "HTTP 429: too many requests, connection refused",
+    "API rate limit exceeded; connection failed",
+  ]) {
+    const p = presentError(appError("gh", message));
+    assert.notEqual(p.summary, reach("GitHub"), message);
+    assert.equal(p.summary, message);
+  }
+});
+
+test("a message Rust already wrote as Couldn't reach keeps its own words", () => {
+  const message =
+    "Couldn't reach github.com to check the GitHub sign-in: dial tcp: lookup github.com: no such host";
+  const p = presentError(appError("gh", message));
+  assert.equal(p.summary, message);
+});
+
+test("non-network kinds and git's own transport lines are untouched", () => {
+  for (const [kind, message, summary = message] of [
+    ["command", "connection failed"],
+    ["keyring", "connection failed"],
+    ["invalidArgument", "connection failed"],
+    // The Rust Timeout variant's own message, which names no host; only its
+    // display lead is capitalized.
+    [
+      "timeout",
+      "git operation timed out after 120s",
+      "Git operation timed out after 120s",
+    ],
+  ]) {
+    assert.equal(presentError(appError(kind, message)).summary, summary, kind);
+  }
+  // git-kind stderr keeps its first line (see the first-contact test above).
+  const p = presentError(
+    gitError("fatal: unable to access 'x': Could not resolve host: connection"),
+  );
+  assert.ok(!p.summary.startsWith("Couldn't reach"), p.summary);
+});
+
+test("status-like numbers in URLs and Jira keys don't suppress the rewrite", () => {
+  for (const [kind, message] of [
+    [
+      "bitbucket",
+      "Bitbucket request to https://api.bitbucket.org/2.0/repositories/acme/app/pullrequests/403/diff: connection failed",
+    ],
+    [
+      "jira",
+      "Jira request to https://acme.atlassian.net/rest/api/3/issue/ABC-401: request timed out",
+    ],
+    ["jira", "Couldn't load ABC-401: connection failed"],
+    [
+      "gh",
+      'Get "https://api.github.com/repos/acme/app/pulls/429": dial tcp: lookup api.github.com: no such host',
+    ],
+  ]) {
+    assert.equal(
+      presentError(appError(kind, message)).summary,
+      reach(HOST_BY_KIND[kind]),
+      message,
+    );
+  }
+});
+
+test("status-like digits in a dotted host or its port don't suppress the rewrite", () => {
+  // SYNTHETIC: invented hostnames whose labels and ports spell status codes.
+  for (const [kind, message] of [
+    ["glab", "lookup gitlab-429.acme.com: no such host"],
+    ["glab", "dial tcp: lookup gitlab-401.acme.com:8443: no such host"],
+    ["gh", "dial tcp ghe.acme.com:403: connect: connection refused"],
+    ["bitbucket", "request to bb-403.acme.com: connection failed"],
+  ]) {
+    const p = presentError(appError(kind, message));
+    assert.equal(p.summary, reach(HOST_BY_KIND[kind]), message);
+    assert.equal(p.long, true, "the raw text stays reachable via Details");
+  }
+});
+
+test("a real status beside a masked host still suppresses the rewrite", () => {
+  for (const message of [
+    "401 unauthorized",
+    "gitlab.acme.com: 401 unauthorized; no such host on retry",
+    "gitlab.acme.com:8443: 429 too many requests; connection refused",
+  ]) {
+    const p = presentError(appError("glab", message));
+    assert.equal(p.summary, message, message);
+  }
+});
+
+test("lookup undotted 429, dial undotted 401 and IPv6 401 hosts allow the rewrite", () => {
+  // SYNTHETIC: Go transport slots identify hosts without a known probe host.
+  for (const message of [
+    "lookup gitlab-429: no such host",
+    "dial tcp proxy-401:8080: connect: connection refused",
+    "dial tcp [2001:db8::401]:443: connect: connection refused",
+    "connect to [2001:db8::401]: connection refused",
+  ]) {
+    assert.equal(
+      presentError(appError("glab", message)).summary,
+      reach("GitLab"),
+      message,
+    );
+  }
+});
+
+test("connecting and whitespace-separated transport hosts allow both network consumers", () => {
+  for (const [kind, message] of [
+    ["gh", "error connecting to ghe-401: connection refused"],
+    ["glab", "lookup\n    gitlab-429.internal: no such host"],
+    ["glab", "lookup\n    gitlab-429: no such host"],
+    ["glab", "lookup    gitlab-429: no such host"],
+    ["glab", "dial\n  tcp\n    proxy-401:443: connection refused"],
+    ["glab", "dial tcp    proxy-401:443: connection refused"],
+  ]) {
+    const error = appError(kind, message);
+    assert.equal(
+      presentError(error).summary,
+      reach(HOST_BY_KIND[kind]),
+      message,
+    );
+    assert.equal(isTransportError(error), true, message);
+  }
+});
+
+test("transport host positions cannot supply the masked hint scan's evidence", () => {
+  for (const message of [
+    "error connecting to proxyconnect",
+    "lookup\n    proxyconnect",
+    "dial\n  tcp\n    proxyconnect",
+  ]) {
+    assert.equal(
+      isTransportError(appError("command", message)),
+      false,
+      message,
+    );
+  }
+});
+
+test("real 401 and 429 beside masked undotted and IPv6 hosts still suppress the rewrite", () => {
+  for (const message of [
+    "lookup gitlab-429: no such host; HTTP 401 unauthorized",
+    "dial tcp proxy-401:8080: connect: connection refused; HTTP 429",
+    "dial tcp [2001:db8::401]:443: connect: connection refused; HTTP 401",
+  ]) {
+    assert.equal(
+      presentError(appError("glab", message)).summary,
+      message,
+      message,
+    );
+  }
+});
+
+test("glab Client.Timeout fixture keeps its raw summary", () => {
+  const message =
+    "net/http: request canceled (Client.Timeout exceeded while awaiting headers)";
+  assert.equal(presentError(appError("glab", message)).summary, message);
+});
+
+test("transport hint gate recognizes gh DNS/502/proxy, Rust prefix and both Rust suffixes", () => {
+  for (const [kind, message] of [
+    ["gh", "lookup api.github.com: no such host"],
+    ["gh", "HTTP 502: Bad Gateway"],
+    ["gh", "proxyconnect tcp: connection refused"],
+    ["gh", "Couldn't reach GitHub: HTTP 401 from proxy"],
+    ["bitbucket", "Bitbucket request 401: request timed out"],
+    ["jira", "Jira request 403: connection failed"],
+  ]) {
+    assert.equal(isTransportError(appError(kind, message)), true, message);
+  }
+});
+
+for (const [name, kind, message] of [
+  ["bare EOF suffix", "gh", 'Get "https://api.github.com/user": EOF'],
+  ["unexpected EOF", "gh", 'Get "https://api.github.com/user": unexpected EOF'],
+  [
+    "Client.Timeout",
+    "gh",
+    'Get "https://api.github.com/user": net/http: request canceled (Client.Timeout exceeded while awaiting headers)',
+  ],
+  ["proxyconnect", "gh", 'Get "https://api.github.com/user": proxyconnect'],
+  [
+    "bad gateway",
+    "bitbucket",
+    'Post "https://github.com/login/oauth/token": Bad Gateway',
+  ],
+  [
+    "service unavailable",
+    "bitbucket",
+    'Post "https://github.com/login/oauth/token": Service Unavailable',
+  ],
+  [
+    "gateway timeout",
+    "bitbucket",
+    'Post "https://github.com/login/oauth/token": Gateway Timeout',
+  ],
+  [
+    "proxy authentication required",
+    "bitbucket",
+    'Post "https://github.com/login/oauth/token": Proxy Authentication Required',
+  ],
+]) {
+  test(`transport hint gate recognizes ${name}`, () => {
+    assert.equal(isTransportError(appError(kind, message)), true, message);
+  });
+}
+
+test("transport hint gate leaves EOF prose eligible for scope hints", () => {
+  for (const message of [
+    "EOF",
+    "The parser expected an EOF marker",
+    'Get "https://api.github.com/user": EOF while parsing a response',
+  ]) {
+    assert.equal(isTransportError(appError("gh", message)), false, message);
+  }
+});
+
+for (const [name, message] of [
+  [
+    "403 with a proxyconnect URL path",
+    "HTTP 403: Resource not accessible by integration (https://github.com/o/proxyconnect)",
+  ],
+  [
+    "403 with a client.timeout.acme.com host",
+    "HTTP 403: Resource not accessible by integration on client.timeout.acme.com",
+  ],
+]) {
+  test(`transport hint gate keeps ${name} eligible for scope hints`, () => {
+    assert.equal(isTransportError(appError("gh", message)), false, message);
+  });
+}
+
+test("transport hint gate preserves a real Client.Timeout diagnostic beside a masked URL", () => {
+  const message =
+    'Get "https://client.timeout.acme.com/repos/o/proxyconnect": net/http: request canceled (Client.Timeout exceeded while awaiting headers)';
+  assert.equal(isTransportError(appError("gh", message)), true);
+});
+
+test("transport hint gate keeps a gh 403 permissions error eligible for scope hints", () => {
+  assert.equal(
+    isTransportError(
+      appError("gh", "HTTP 403: Resource not accessible by integration"),
+    ),
+    false,
+  );
+});
+
+test("empty messages fall through to a non-blank summary", () => {
+  assert.equal(
+    presentError({ kind: "git", message: "", code: 1, stderr: "" }).summary,
+    "Git error",
+  );
+  assert.equal(presentError(new Error("")).summary, "Unexpected error");
+});
+
+// The display-register pass over the Rust `#[error]` leads (src-tauri/src/error.rs).
+
+/** The reset refusal's message as git/ops.rs builds it. */
+const RESET_REFUSAL =
+  "invalid argument: resetting would overwrite an untracked path (notes.txt) — move or remove it first";
+
+test("the reset refusal summarizes without its Rust lead, sentence-cased", () => {
+  const p = presentError(appError("invalidArgument", RESET_REFUSAL));
+  assert.equal(
+    p.summary,
+    "Resetting would overwrite an untracked path (notes.txt) — move or remove it first",
+  );
+  assert.equal(p.label, "Invalid input");
+  assert.equal(p.fullText, RESET_REFUSAL, "Details keeps the raw text");
+});
+
+test("app-written invalid-argument prose is capitalized after the lead goes", () => {
+  for (const [message, summary] of [
+    ["invalid argument: invalid branch name", "Invalid branch name"],
+    ["invalid argument: a title is required", "A title is required"],
+    [
+      "invalid argument: couldn't parse the remote URL",
+      "Couldn't parse the remote URL",
+    ],
+    ["invalid argument: no remote named upstream", "No remote named upstream"],
+    // Noun-led producer prose (measured producer spellings).
+    [
+      "invalid argument: remote does not exist: origin",
+      "Remote does not exist: origin",
+    ],
+    [
+      "invalid argument: repository names must start with a letter or digit",
+      "Repository names must start with a letter or digit",
+    ],
+    [
+      "invalid argument: due date must be YYYY-MM-DD, got 2026-13-01",
+      "Due date must be YYYY-MM-DD, got 2026-13-01",
+    ],
+    [
+      "invalid argument: binary file — resolve this conflict by hand",
+      "Binary file — resolve this conflict by hand",
+    ],
+    ["invalid argument: file is too large", "File is too large"],
+    [
+      "invalid argument: worktree path must not contain '..'",
+      "Worktree path must not contain '..'",
+    ],
+    [
+      "invalid argument: terminal command not found: wt",
+      "Terminal command not found: wt",
+    ],
+  ]) {
+    assert.equal(
+      presentError(appError("invalidArgument", message)).summary,
+      summary,
+    );
+  }
+});
+
+test("an interpolated name leading the detail keeps its case (must-not-match)", () => {
+  for (const [message, summary] of [
+    [
+      "invalid argument: main has no upstream branch to reset to.",
+      "main has no upstream branch to reset to.",
+    ],
+    [
+      "invalid argument: main's upstream moved since this was measured",
+      "main's upstream moved since this was measured",
+    ],
+    [
+      "invalid argument: deadbee is listed more than once in the rewrite plan",
+      "deadbee is listed more than once in the rewrite plan",
+    ],
+    [
+      "invalid argument: file_path does not exist: x",
+      "file_path does not exist: x",
+    ],
+    [
+      "invalid argument: write:discussion scope missing",
+      "write:discussion scope missing",
+    ],
+  ]) {
+    assert.equal(
+      presentError(appError("invalidArgument", message)).summary,
+      summary,
+    );
+  }
+});
+
+test("sibling kinds' Rust leads read in the summary's register", () => {
+  for (const [kind, message, summary] of [
+    [
+      "keyring",
+      "keychain error: Platform secure storage failure: locked",
+      "Platform secure storage failure: locked",
+    ],
+    [
+      "io",
+      "io error: The system cannot find the path specified. (os error 3)",
+      "The system cannot find the path specified. (os error 3)",
+    ],
+    [
+      "notARepo",
+      "not a git repository: C:\\work\\gone",
+      "Not a Git repository: C:\\work\\gone",
+    ],
+    ["gitNotFound", "git executable not found", "Git executable not found"],
+  ]) {
+    const p = presentError(appError(kind, message));
+    assert.equal(p.summary, summary, kind);
+    assert.equal(p.fullText, message, `${kind} Details keeps the raw text`);
+  }
+});
+
+test("a lead outside its kind, mid-message, or respelled is left alone (must-not-match)", () => {
+  for (const [kind, message] of [
+    // Keyed by kind: another kind quoting the lead is that kind's own text.
+    ["command", "invalid argument: resetting would overwrite x"],
+    ["gh", "keychain error: Platform secure storage failure"],
+    // Start-anchored: app prose quoting a lead mid-line.
+    ["invalidArgument", "couldn't read invalid argument: x"],
+    // Case-sensitive: only Rust's exact spelling is a lead.
+    ["invalidArgument", "Invalid argument: resetting would overwrite x"],
+    ["notARepo", "Not a git repository: C:\\x"],
+  ]) {
+    assert.equal(presentError(appError(kind, message)).summary, message, kind);
+  }
+  // A plain Error is never an AppError kind.
+  assert.equal(
+    presentError(new Error("invalid argument: resetting would overwrite x"))
+      .summary,
+    "invalid argument: resetting would overwrite x",
+  );
+});
+
+test("inline surfaces' measured invalid-argument refusals read as sentences", () => {
+  // forge/jira.rs (create issue) and forge/bitbucket.rs + forge/jira.rs (account
+  // setup) raise these as InvalidArgument.
+  for (const [message, summary] of [
+    ["invalid argument: a summary is required", "A summary is required"],
+    [
+      "invalid argument: an email and API token are both required",
+      "An email and API token are both required",
+    ],
+  ]) {
+    assert.equal(
+      presentError(appError("invalidArgument", message)).summary,
+      summary,
+    );
+  }
+});
+
+test("a partial-post review failure with a transport tail summarizes as the network line", () => {
+  // The reason SubmitReviewDialog renders its error verbatim: the summary would
+  // drop the "do NOT resubmit" warning (forge/bitbucket.rs submit_review; the
+  // GitLab twin carries the same disclosure).
+  const message =
+    "The review was posted, but the approve step failed: the 3 review comment(s) were already posted successfully — do NOT resubmit them; only re-run the approve action on Bitbucket. (Bitbucket request failed: error sending request: connection failed)";
+  const p = presentError(appError("bitbucket", message));
+  assert.equal(p.summary, reach("Bitbucket"));
+  assert.doesNotMatch(p.summary, /resubmit/);
+  assert.equal(p.fullText, message);
+});
+
+test("a lead with nothing after it falls back to the kind label", () => {
+  assert.equal(
+    presentError(appError("invalidArgument", "invalid argument: ")).summary,
+    "Invalid input",
+  );
+});
+
+test("a composed presentation of a raw refusal stays raw in Details, under its heading", () => {
+  // A lone error with a heading always composes into one headed section.
+  const p = composedErrorPresentation(
+    "Couldn't move Launch checklist",
+    [appError("invalidArgument", RESET_REFUSAL)],
+    ["Launch checklist"],
+  );
+  assert.equal(p.label, "Invalid input");
+  assert.equal(p.summary, "Couldn't move Launch checklist");
+  assert.equal(p.fullText, `Launch checklist\n${RESET_REFUSAL}`);
+  assert.equal(p.long, true);
+  // Without a heading, the own presentation keeps only its title swapped in.
+  const bare = composedErrorPresentation("Reset failed", [
+    appError("invalidArgument", RESET_REFUSAL),
+  ]);
+  assert.equal(bare.summary, "Reset failed");
+  assert.equal(bare.fullText, RESET_REFUSAL);
+});
+
+test("a plain-string error summarizes to its first line and keeps the raw text", () => {
+  const raw =
+    "Provider returned 401: invalid API key for this model endpoint, check the key\n  at request (client.js:1)\n  at retry (client.js:2)";
+  const p = presentError(raw);
+  assert.equal(p.label, null);
+  assert.equal(
+    p.summary,
+    "Provider returned 401: invalid API key for this model endpoint, check the key",
+  );
+  assert.equal(p.fullText, raw);
+  assert.equal(p.long, true);
+});
+
+test("a busy error's summary names what holds the repository", () => {
+  // The pinned wire shape (busy_serializes_to_the_pinned_wire_shape, error.rs).
+  const sentence =
+    "A worktree removal is still running — try again when it finishes.";
+  const p = presentError({
+    kind: "busy",
+    message: sentence,
+    holder: "a worktree removal",
+  });
+  assert.equal(p.label, "Operation in progress");
+  assert.equal(p.summary, sentence);
+  assert.equal(p.long, false);
+});
+
+/** `created_repo_response`'s disclosure (forge/bitbucket.rs), verbatim with
+ *  `{url}` filled in, over a transport cause in http.rs's message shape. */
+const BB_CREATED_HEADLINE =
+  "The repository WAS created at https://bitbucket.org/ws/repo — add it as a remote and push manually, or delete it there and retry.";
+const BB_TRANSPORT_LINE =
+  "could not read Bitbucket response: error decoding response body: connection failed";
+const BB_CREATED_DISCLOSURE = `${BB_CREATED_HEADLINE}\n${BB_TRANSPORT_LINE}`;
+
+test("a Bitbucket app sentence on line one outranks a transport phrase below it", () => {
+  const p = presentError(appError("bitbucket", BB_CREATED_DISCLOSURE));
+  assert.equal(p.summary, BB_CREATED_HEADLINE);
+  assert.equal(p.fullText, BB_CREATED_DISCLOSURE);
+  assert.equal(p.long, true);
+});
+
+test("isTransportError reads a Bitbucket disclosure by its headline", () => {
+  assert.equal(
+    isTransportError(appError("bitbucket", BB_CREATED_DISCLOSURE)),
+    false,
+  );
+  assert.equal(
+    isTransportError(appError("bitbucket", BB_TRANSPORT_LINE)),
+    true,
+  );
+});
+
+test("a bare Bitbucket transport failure still reads as unreachable", () => {
+  assert.equal(
+    presentError(appError("bitbucket", BB_TRANSPORT_LINE)).summary,
+    reach("Bitbucket"),
+  );
+});

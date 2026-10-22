@@ -1,0 +1,1904 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use tokio::process::Command;
+use tokio::sync::OnceCell;
+
+use crate::error::{AppError, AppResult};
+use crate::state::{AppState, HolderSlot, LockDomain};
+
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Adding and removing a worktree both write or delete a whole checkout, so their
+/// cost is proportional to the tree rather than fixed. A node_modules-scale
+/// worktree exceeds the default budget by a wide margin on Windows, and the kill
+/// lands mid-materialize or mid-delete — leaving exactly the half-state the
+/// registered/prunable reconciliation in `git::worktree` then has to clean up.
+pub const WORKTREE_OP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a caller waits for the working-tree or worktree-admin lock before
+/// reporting [`AppError::Busy`]. Short on purpose: the ops holding those domains
+/// are local index/ref work, so a wait this long already means the user should be
+/// told what they are queued behind rather than watching a spinner.
+pub(crate) const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same bound for the network domain, where a legitimate holder is a transfer
+/// whose own budget is `NETWORK_TIMEOUT` — a wait of a minute is still ordinary.
+pub(crate) const NETWORK_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The holder label for a hold whose operation has no better name.
+pub(crate) const DEFAULT_HOLDER: &str = "another Git operation";
+
+/// A held domain lock, which publishes its holder's label for as long as it lives
+/// so a waiter that times out can name what it lost to.
+#[derive(Debug)]
+pub(crate) struct RepoLockGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    holder: HolderSlot,
+}
+
+impl Drop for RepoLockGuard {
+    fn drop(&mut self) {
+        *self.holder.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// Publish `label` as the domain's holder and wrap the guard, so the label is
+/// cleared on every release path.
+fn hold(
+    domain: &LockDomain,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    label: &'static str,
+) -> RepoLockGuard {
+    let holder = domain.holder_slot();
+    *holder.lock().unwrap_or_else(|p| p.into_inner()) = Some(label);
+    RepoLockGuard {
+        _guard: guard,
+        holder,
+    }
+}
+
+/// Wait up to `bound` for `domain`, labelling the hold `label`. On expiry the
+/// CURRENT holder's label rides the error, so the user reads what they are waiting
+/// for instead of watching an unbounded hang.
+///
+/// `bound` is a parameter rather than a constant so tests can pass
+/// `Duration::ZERO`: `tokio::time::timeout` polls its inner future first, so a zero
+/// budget still succeeds against a FREE lock and fails immediately against a held
+/// one — free/held is decided by the lock, never by scheduling.
+pub(crate) async fn acquire_repo_lock(
+    domain: &LockDomain,
+    bound: Duration,
+    label: &'static str,
+) -> AppResult<RepoLockGuard> {
+    match tokio::time::timeout(bound, domain.lock().lock_owned()).await {
+        Ok(guard) => Ok(hold(domain, guard, label)),
+        Err(_) => Err(AppError::Busy {
+            holder: domain.holder_label().unwrap_or(DEFAULT_HOLDER).to_string(),
+        }),
+    }
+}
+
+/// Wait indefinitely for `domain`. For the holds a user never initiated (agent
+/// session turns) and the ones that ARE the long operation: erroring there would
+/// only move the failure, so they queue.
+pub(crate) async fn acquire_repo_lock_unbounded(
+    domain: &LockDomain,
+    label: &'static str,
+) -> RepoLockGuard {
+    let guard = domain.lock().lock_owned().await;
+    hold(domain, guard, label)
+}
+
+/// Take `domain` only if it is free right now. `None` means someone else holds it
+/// and the caller's work is skippable — never a queue.
+pub(crate) fn try_acquire_repo_lock(
+    domain: &LockDomain,
+    label: &'static str,
+) -> Option<RepoLockGuard> {
+    let guard = domain.lock().try_lock_owned().ok()?;
+    Some(hold(domain, guard, label))
+}
+
+/// How a git subcommand is named to the NEXT caller waiting on the same domain.
+/// The user's word for the operation, not git's — this text lands in a toast.
+///
+/// Compound holds pass their own label instead (`"a history rewrite"`,
+/// `"a submodule change"`), since the sequence is what the user did, not any one
+/// of its commands.
+pub(crate) fn holder_label(subcommand: &str) -> &'static str {
+    match subcommand {
+        "commit" => "a commit",
+        // `apply` reaches this runner only as diff.rs's hunk stage/unstage/discard,
+        // which the user knows as staging — never as a standalone patch tool.
+        "add" | "apply" => "a staging operation",
+        "restore" => "a file restore",
+        // git::submodule's paths hold the working-tree lock themselves under
+        // their own labels; the arm keeps a future submodule argv from being
+        // mislabeled.
+        "submodule" => "a submodule update",
+        "checkout" | "switch" => "a checkout",
+        "stash" => "a stash operation",
+        "worktree" => "a worktree operation",
+        "branch" => "a branch update",
+        "merge" => "a merge",
+        "rebase" => "a rebase",
+        "cherry-pick" => "a cherry-pick",
+        "revert" => "a revert",
+        "reset" => "a reset",
+        "pull" => "a pull",
+        "push" => "a push",
+        "fetch" => "a fetch",
+        // `remote set-head --auto` — a real network call holding the network domain.
+        "remote" => "a remote change",
+        _ => DEFAULT_HOLDER,
+    }
+}
+
+/// The subcommand in an argv that may open with `-c key=value` config pairs
+/// (`op_continue`'s `core.editor`, the forge pushes' credential entries), which
+/// would otherwise label every one of those holds generically.
+pub(crate) fn subcommand_of<'a>(args: &[&'a str]) -> &'a str {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if *arg == "-c" {
+            rest.next();
+        } else if !arg.starts_with('-') {
+            return arg;
+        }
+    }
+    ""
+}
+
+pub struct GitOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub code: i32,
+}
+
+impl GitOutput {
+    pub fn stdout_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
+    /// [`run_git`]'s verdict over a raw run: a non-zero exit is [`AppError::Git`]
+    /// carrying stderr alone.
+    pub(crate) fn exit_verdict(self) -> AppResult<Self> {
+        if self.code != 0 {
+            return Err(AppError::Git {
+                code: self.code,
+                stderr: self.stderr,
+            });
+        }
+        Ok(self)
+    }
+
+    /// The text describing a non-zero exit: stderr, or stdout when stderr is
+    /// EMPTY. Correct only for the families that report on stdout ALONE — a
+    /// conflicted merge or `stash pop` (measured, git 2.51.1) — where an error
+    /// carrying that empty stderr renders as "git exited with code N". Anything
+    /// that splits ONE report across both streams needs
+    /// [`full_failure_text`](Self::full_failure_text) instead.
+    pub fn failure_text(&self) -> String {
+        let stderr = self.stderr.trim();
+        if stderr.is_empty() {
+            self.stdout_lossy().trim().to_string()
+        } else {
+            stderr.to_string()
+        }
+    }
+
+    /// Both halves of a non-zero exit, stderr first and stdout below it, each
+    /// omitted when empty.
+    ///
+    /// [`failure_text`](Self::failure_text) substitutes rather than combines, so
+    /// it is a silent no-op wherever git splits ONE report across both streams:
+    /// a conflicted revert/cherry-pick/rebase puts its diagnostic on stderr and
+    /// its `CONFLICT (…)` file list on stdout, and a merge-mode `pull` puts the
+    /// fetch summary on stderr and the whole merge verdict on stdout (measured,
+    /// git 2.51.1). Dropping either half is data loss at the moment the user is
+    /// deciding how to resolve.
+    ///
+    /// stderr leads because the frontend reads line 1 alone: `ROLLBACK_VERDICTS`
+    /// and `firstMeaningfulLine` (`src/lib/error-summary.ts`), and the rollback
+    /// funnels in `git::ops` prepend their verdict above whatever this returns.
+    /// `strip_eol_warnings` runs over the stdout half too — the runner filters
+    /// only stderr, so autocrlf advisories would otherwise ride into Details.
+    ///
+    /// One consequence to know: git's sequencer status stdout can carry
+    /// `(all conflicts fixed: run "git cherry-pick --continue")`, which matches
+    /// the frontend's `OP_ADVICE`, so combining the streams puts stdout advice
+    /// within reach of the summary scanner.
+    pub fn full_failure_text(&self) -> String {
+        let stdout = strip_eol_warnings(&self.stdout_lossy());
+        [self.stderr.trim(), stdout.trim()]
+            .into_iter()
+            .filter(|half| !half.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// The resolved `git` binary, memoized for the process lifetime.
+///
+/// `run_git_spawn` is the base of the whole git call stack (status, diffs,
+/// history, staging — all firing continuously as the user works), and a packaged
+/// GUI app on macOS doesn't inherit the user's shell PATH. So we resolve `git`
+/// the way the About screen does (`crate::agent::resolve_named`: PATH + known
+/// install dirs + a macOS login-shell fallback / the live Windows registry PATH)
+/// rather than a bare `Command::new("git")`, which finds nothing when the app is
+/// launched from Finder/Dock.
+///
+/// The result is cached because resolving isn't free: the login-shell fallback
+/// (for a git install outside `candidate_dirs()`, e.g. MacPorts `/opt/local/bin`)
+/// spawns `$SHELL -lic` with a 20s timeout, and re-running it on every git call
+/// would serialize the whole app behind it. Only a *successful* resolution is
+/// cached — `get_or_try_init` leaves the cell empty on error — so a git installed
+/// after launch is still picked up on the next call without a restart.
+static GIT_BIN: OnceCell<PathBuf> = OnceCell::const_new();
+
+pub(crate) async fn git_bin() -> AppResult<PathBuf> {
+    GIT_BIN
+        .get_or_try_init(|| async {
+            crate::agent::resolve_named(&["git"], None)
+                .await
+                .ok_or(AppError::GitNotFound)
+        })
+        .await
+        .cloned()
+}
+
+/// A Windows Job Object holding a spawned git process, armed so that closing the
+/// last handle kills everything still in it.
+///
+/// `kill_on_drop` only reaps the process we spawned, and on Windows that is
+/// usually `cmd\git.exe` — the Git-for-Windows SHIM, which runs the real
+/// `mingw64\bin\git.exe` as a child. Killing the shim on timeout therefore leaves
+/// the real git running as an orphan, still deleting/mutating the repo long after
+/// the app reported failure and released the per-repo lock. `GitGroup` is the
+/// unix counterpart, so both platforms kill the whole tree.
+#[cfg(windows)]
+struct GitJob(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a job-object HANDLE is a process-wide kernel handle with no thread
+// affinity, and the raw pointer is only ever handed back to Win32. The wrapper
+// exists so the guard can be held across awaits inside a `Send` future.
+#[cfg(windows)]
+unsafe impl Send for GitJob {}
+
+#[cfg(windows)]
+impl GitJob {
+    /// Puts `process` in a fresh kill-on-close job. `None` on any Win32 failure —
+    /// the caller then degrades to plain `kill_on_drop` rather than failing the
+    /// git call over a missing safety net.
+    ///
+    /// Processes the child spawns before the assignment lands don't join the job.
+    /// Assignment is two syscalls issued immediately after spawn while the shim has
+    /// yet to start the real git, so losing that race should take a pathological
+    /// scheduling delay — and `kill_on_drop` still covers the direct child anyway.
+    fn arm(process: std::os::windows::io::RawHandle) -> Option<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        // SAFETY: null attributes + null name is the documented way to create an
+        // unnamed job with default security; it returns null on failure.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return None;
+        }
+        // Owned from here so every early return closes the handle.
+        let job = GitJob(handle);
+        if !job.set_limit_flags(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) {
+            return None;
+        }
+        // SAFETY: `job.0` is the handle we just created and `process` is the live
+        // child's handle, valid for as long as the caller holds the `Child`.
+        if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+            return None;
+        }
+        Some(job)
+    }
+
+    /// Consumes the guard, clearing the kill-on-close limit before its handle is
+    /// closed. git can leave legitimately detached descendants behind a command that
+    /// SUCCEEDED (a background `gc --auto`), and those must outlive the guard. Only a
+    /// REAPED command disarms: every abandoned path — a timeout, a failed stdin
+    /// write, a failed wait — drops the guard still armed and takes the tree with it.
+    ///
+    /// A failure to clear leaks the handle instead of closing it: the kernel
+    /// reclaims it at process exit, whereas closing a still-armed job would kill
+    /// those descendants.
+    fn disarm(self) {
+        if !self.set_limit_flags(0) {
+            std::mem::forget(self);
+        }
+    }
+
+    fn set_limit_flags(&self, flags: u32) -> bool {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        };
+
+        // SAFETY: the struct is plain old data, so an all-zero value is a valid
+        // (limit-free) instance.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = flags;
+        // SAFETY: `self.0` is a valid job handle and the pointer/length pair
+        // describes the fully-initialized `info` living on this stack frame.
+        unsafe {
+            SetInformationJobObject(
+                self.0,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GitJob {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a handle this type created and owns exclusively.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// SIGKILLs the process group `pgid` (a child spawned with `process_group(0)` leads
+/// one whose id is its pid) through `killpg` itself: no spawn, so no PATH lookup and
+/// no procps-ng `kill` argv parsing, which misreads `-KILL -<pgid>` (wrong group,
+/// `kill(-1)`, or the caller's own group). Ids that can't name a child's group are
+/// refused, since `killpg(0)` signals the caller's own group.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pgid: u32) {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: `killpg` takes plain integers and touches no memory of ours. The result
+    // is ignored: ESRCH means the group is already gone.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+/// The process group of a spawned git on unix (git leads it via `process_group(0)`),
+/// armed so that dropping the guard kills the whole group: `kill_on_drop` reaches
+/// only git itself, not the hooks and helpers it spawned. Same contract as
+/// `GitJob`: only a REAPED command disarms. Leading its own group, git has no
+/// foreground terminal: in an app launched from a shell (`tauri dev`, an AppImage
+/// run from a terminal), a child that reads /dev/tty, such as an ssh passphrase or
+/// host-key prompt, is stopped (SIGTTIN) until the call's timeout. A GUI launch has
+/// no controlling tty.
+#[cfg(unix)]
+struct GitGroup(u32);
+
+#[cfg(unix)]
+impl GitGroup {
+    /// Consumes the guard without the kill, so a successful git's detached
+    /// descendants (a background `gc --auto`) survive.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GitGroup {
+    fn drop(&mut self) {
+        // Synchronous, so the group is signalled before the caller's next git step
+        // (a rollback's abort).
+        kill_process_group(self.0);
+    }
+}
+
+/// Runs git and returns the raw output regardless of exit code.
+/// Only spawn failures and timeouts are errors.
+pub async fn run_git_raw(
+    repo_path: Option<&str>,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_raw_input(repo_path, args, None, timeout).await
+}
+
+/// Like `run_git_raw`, but optionally feeds `input` to git's stdin
+/// (e.g. a patch for `git apply -`).
+pub async fn run_git_raw_input(
+    repo_path: Option<&str>,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_raw_input_bytes(repo_path, args, input.map(str::as_bytes), timeout).await
+}
+
+/// [`run_git_raw_input`] over a stdin that need not be text. Callers whose input
+/// carries PATH bytes want this: git's path handling is byte-domain, so a name
+/// that is not valid UTF-8 has no `&str` spelling that reaches git unchanged.
+pub async fn run_git_raw_input_bytes(
+    repo_path: Option<&str>,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_spawn(repo_path, args, input, &[], timeout).await
+}
+
+/// [`run_git_raw`] with extra environment pairs set on the git process, after the
+/// runner's own. Only the history rewrite's rebase start and continue use it, to pin
+/// GIT_SEQUENCE_EDITOR and GIT_EDITOR: env vars outrank any `-c` editor config. git
+/// exports both to every exec line and hook the rebase runs; only GIT_EDITOR=true
+/// makes an editor launch there a no-op.
+pub(crate) async fn run_git_raw_env(
+    repo_path: Option<&str>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_spawn(repo_path, args, None, envs, timeout).await
+}
+
+/// The one spawn path under every raw runner. An abandoned run (a timeout, a failed
+/// wait) kills git's whole process tree on both platforms (`GitJob`, `GitGroup`).
+async fn run_git_spawn(
+    repo_path: Option<&str>,
+    args: &[&str],
+    input: Option<&[u8]>,
+    envs: &[(&str, &str)],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    // A zero budget refuses before spawning — no production caller passes one (they
+    // all use a *_TIMEOUT constant), and it makes the tests' `Duration::ZERO` seam
+    // deterministic: a nonzero expired budget loses the race to a fast child (Linux).
+    if timeout.is_zero() {
+        return Err(AppError::Timeout(0));
+    }
+    let git = git_bin().await?;
+    let mut cmd = Command::new(&git);
+    // Also covers the credential helpers git spawns in turn.
+    crate::agent::sanitize_child_env(&mut cmd);
+    // Git for Windows gates long-path support on core.longpaths — the OS
+    // LongPathsEnabled flag alone is not enough (probe-proven). Per-invocation so
+    // the user's own git config is never mutated; other platforms ignore the key.
+    // Diff section keying (diff split, AI ignore) needs literal `a/` `b/` headers, so
+    // the prefix keys are pinned over diff.noprefix / custom / mnemonic user config.
+    cmd.args([
+        "-c",
+        "core.quotePath=false",
+        "-c",
+        "color.ui=false",
+        "-c",
+        "core.longpaths=true",
+        "-c",
+        "diff.noprefix=false",
+        "-c",
+        "diff.srcPrefix=a/",
+        "-c",
+        "diff.dstPrefix=b/",
+        "-c",
+        "diff.mnemonicPrefix=false",
+    ]);
+    cmd.args(args);
+    if let Some(repo) = repo_path {
+        cmd.current_dir(repo);
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    if cfg!(test) {
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1");
+    }
+    cmd.envs(envs.iter().copied());
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+
+    // `git_bin()` already confirmed the binary exists, so a spawn-time NotFound
+    // means the memoized path went stale mid-session (git moved/removed) — still
+    // "git not found" to the user; anything else is a genuine I/O error.
+    let spawn_err = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::GitNotFound
+        } else {
+            AppError::Io(e)
+        }
+    };
+    let run = async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut child = cmd.spawn().map_err(spawn_err)?;
+        #[cfg(windows)]
+        let job = child.raw_handle().and_then(GitJob::arm);
+        // Declared after `child`, so on an abandoned run it drops (and kills) while
+        // the unreaped leader still holds the group id.
+        #[cfg(unix)]
+        let group = child.id().map(GitGroup);
+
+        // git interleaves reading stdin with writing stdout, so the write and both
+        // drains have to run CONCURRENTLY: writing all of stdin first wedges as soon
+        // as git's output fills its pipe buffer — git stops reading, our write
+        // blocks behind it, and the whole exchange dies on the timeout below.
+        // Local futures rather than `tokio::spawn`, because `input` is borrowed and
+        // a `'static` copy would clone a multi-MB patch on every hunk stage.
+        let stdin_pipe = child.stdin.take();
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let write = async move {
+            let (Some(mut pipe), Some(bytes)) = (stdin_pipe, input) else {
+                return Ok(());
+            };
+            let written = pipe.write_all(bytes).await;
+            // Close the pipe the moment the write ends (error path included) so
+            // git sees EOF while the drains still poll — `--stdin` blocks forever
+            // without it; the explicit drop pins that close point across refactors.
+            drop(pipe);
+            written
+        };
+        let drain_stdout = async move {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let drain_stderr = async move {
+            let mut buf = Vec::new();
+            stderr_pipe.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let (written, stdout, stderr) = tokio::join!(write, drain_stdout, drain_stderr);
+
+        // The child's own verdict outranks a failed stdin write: that write fails
+        // almost exclusively as a broken pipe from git exiting early, and git's
+        // stderr and exit code are what say why. The write error surfaces only when
+        // there is no child result to report instead.
+        let reaped = match (stdout, stderr) {
+            (Ok(out), Ok(err)) => child.wait().await.map(|status| (out, err, status)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+        let (stdout, stderr, status) = match reaped {
+            Ok(reaped) => reaped,
+            // Abandoned without a reaped child, so the guard stays ARMED (see `disarm`).
+            Err(e) => return Err(AppError::Io(written.err().unwrap_or(e))),
+        };
+        #[cfg(windows)]
+        if let Some(job) = job {
+            job.disarm();
+        }
+        #[cfg(unix)]
+        if let Some(group) = group {
+            group.disarm();
+        }
+        Ok(GitOutput {
+            stdout,
+            stderr: strip_eol_warnings(&String::from_utf8_lossy(&stderr)),
+            code: status.code().unwrap_or(-1),
+        })
+    };
+    tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| AppError::Timeout(timeout.as_secs()))?
+}
+
+/// With core.autocrlf on, git emits a "LF will be replaced by CRLF the next
+/// time Git touches it" advisory for every touched file. It's harmless noise
+/// that bloats error toasts (and rides along when a command genuinely fails),
+/// so drop those lines — and the CRLF→LF variant — from captured stderr.
+fn strip_eol_warnings(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| !is_eol_warning(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_eol_warning(line: &str) -> bool {
+    line.contains("will be replaced by CRLF")
+        || line.contains("will be replaced by LF")
+        || line.contains("original line endings in your working directory")
+}
+
+/// Runs git, treating any non-zero exit code as an error carrying stderr.
+pub async fn run_git(
+    repo_path: Option<&str>,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_input(repo_path, args, None, timeout).await
+}
+
+/// `run_git` with optional stdin input.
+pub async fn run_git_input(
+    repo_path: Option<&str>,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_raw_input(repo_path, args, input, timeout)
+        .await?
+        .exit_verdict()
+}
+
+/// The working tree's toplevel for `repo_path`, which may be any directory
+/// inside it.
+///
+/// Anything that reads repo-relative NAMES out of git, or hands git pathspecs
+/// meant to match them, has to bind to this rather than to the path it was
+/// given: git prints and resolves both relative to the cwd, so a subdirectory
+/// silently re-scopes the answer while still looking well-formed. The MCP server
+/// takes `--repo` verbatim, so that subdirectory is reachable.
+pub(crate) async fn worktree_toplevel(repo_path: &str) -> AppResult<String> {
+    let out = run_git(
+        Some(repo_path),
+        &["rev-parse", "--show-toplevel"],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    let stdout = out.stdout_lossy();
+    // Line endings ONLY: a trailing space can be part of the directory name, and
+    // `trim()` would strip it into a path that does not exist.
+    let toplevel = stdout.trim_end_matches(['\r', '\n']).to_string();
+    if toplevel.is_empty() {
+        return Err(AppError::NotARepo(repo_path.to_string()));
+    }
+    Ok(toplevel)
+}
+
+/// Runs a mutating git command under the repo's WORKING-TREE lock, retrying once
+/// on index.lock contention caused by external tools (editors, other clients). The
+/// wait is bounded by [`LOCK_WAIT_TIMEOUT`] and reports [`AppError::Busy`] naming
+/// the current holder, so a caller is never queued behind a long op with no word.
+///
+/// A repo has three independent domains — working-tree, worktree-admin
+/// (`run_git_worktree_admin`), network (`remote::run_git_mutating_with_creds`) —
+/// and every one of them is non-reentrant. Compound sequences take their domain's
+/// lock themselves, so their guards, anchors and rollback see one unbroken view,
+/// and must NOT call a mutating runner of THAT domain from inside the hold: use the
+/// lock-free runners (`run_git`, `run_git_raw`, the `_input` pair,
+/// `remote::run_git_with_creds_once`), which lose the retry above, or
+/// `run_git_raw_index_retry`, which keeps it for a raw run.
+/// Crossing domains is allowed in ONE direction: a working-tree hold may take the
+/// network lock (a pull is a transfer plus a merge), never the reverse, which is
+/// what keeps the wait graph acyclic. Either way the locks serialize callers in
+/// THIS process: a separate MCP-server process has its own and is not covered.
+pub async fn run_git_mutating(
+    state: &AppState,
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    run_git_mutating_input(state, repo_path, args, None, timeout).await
+}
+
+/// `run_git_mutating` without its non-zero-exit verdict: same lock and same
+/// one-shot index.lock retry, but the raw output comes back so the caller can
+/// read STDOUT on failure. [`GitOutput::full_failure_text`] is the shaping those
+/// callers share; [`GitOutput::failure_text`] only suits the ones whose failure
+/// lands on stdout ALONE, which is merge.
+pub async fn run_git_mutating_raw(
+    state: &AppState,
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    let domain = state.working_tree_lock(repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(args)),
+    )
+    .await?;
+    run_git_raw_index_retry(repo_path, args, timeout).await
+}
+
+/// The mutating runners' one-shot index.lock retry over a raw run, lock-free — the
+/// caller already holds the working-tree domain.
+pub(crate) async fn run_git_raw_index_retry(
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    let out = run_git_raw(Some(repo_path), args, timeout).await?;
+    if out.code != 0 && out.stderr.contains("index.lock") {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return run_git_raw(Some(repo_path), args, timeout).await;
+    }
+    Ok(out)
+}
+
+/// `run_git_mutating` with optional stdin input.
+pub async fn run_git_mutating_input(
+    state: &AppState,
+    repo_path: &str,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    let domain = state.working_tree_lock(repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(args)),
+    )
+    .await?;
+    match run_git_input(Some(repo_path), args, input, timeout).await {
+        Err(AppError::Git { ref stderr, .. }) if stderr.contains("index.lock") => {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            run_git_input(Some(repo_path), args, input, timeout).await
+        }
+        other => other,
+    }
+}
+
+/// How long a config write waits before its one retry. git never waits on
+/// `.git/config.lock` itself, and the writers it collides with hold it for milliseconds.
+pub(crate) const CONFIG_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Whether a failed git run lost `.git/config.lock` to another writer. Read per line in
+/// git's C-locale text: a lock line counts when bare or ending `: File exists`; bare lines
+/// must count, as section rename/remove print no reason (measured, git 2.51.1), so a
+/// read-only disk there still does. Any other reason on any lock line means no retry
+/// helps. Colon-space delimits the reason, so a drive-letter path never reads as one.
+pub(crate) fn is_config_lock_contention(stderr: &str) -> bool {
+    let mut lost = false;
+    for line in stderr.lines() {
+        let Some((_, rest)) = line.split_once("could not lock config file") else {
+            continue;
+        };
+        if let Some((_, reason)) = rest.rsplit_once(": ") {
+            if reason.trim_end() != "File exists" {
+                return false;
+            }
+        }
+        lost = true;
+    }
+    lost
+}
+
+/// The lead every [`config_lock_busy`] refusal opens with, so a wrapping caller can
+/// recognize one and re-tail it.
+pub(crate) const CONFIG_LOCK_BUSY_LEAD: &str =
+    "Another Git process was saving this repository's settings, so ";
+
+/// The refusal once a writer's repair failed after a lost config lock: `tail` says what
+/// landed and the next step. The text never carries git's lock-file path, and line 1
+/// is the toast title.
+pub(crate) fn config_lock_busy(tail: &str) -> AppError {
+    AppError::Command(format!("{CONFIG_LOCK_BUSY_LEAD}{tail}"))
+}
+
+/// Runs `attempt` once more after [`CONFIG_LOCK_RETRY_DELAY`] when its first run lost
+/// the config lock; any other outcome, the retry's included, comes back as-is. Generic
+/// over the run so the policy is testable without timing a real collision.
+pub(crate) async fn retry_on_config_lock<F, Fut>(mut attempt: F) -> AppResult<GitOutput>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = AppResult<GitOutput>>,
+{
+    let out = attempt().await?;
+    if out.code != 0 && is_config_lock_contention(&out.stderr) {
+        tokio::time::sleep(CONFIG_LOCK_RETRY_DELAY).await;
+        return attempt().await;
+    }
+    Ok(out)
+}
+
+/// A `git config` write under the repo's config-write mutex alone (no domain lock),
+/// with the one config-lock retry; raw output, so the caller maps exit codes
+/// (`--unset`'s 5) and a second lost race itself.
+pub(crate) async fn run_git_config_write(
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    with_config_write_lock(repo_path, |held| async move {
+        run_git_config_write_held(&held, repo_path, args, timeout).await
+    })
+    .await
+}
+
+type ConfigWriteLocks = std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// One mutex per repository for this process's `.git/config` writers: held across the
+/// spawn of short writes (branch, remote, identity, archive flag, submodule set-url),
+/// and only across the repair leg of commands too long to hold it through (`push -u`,
+/// submodule add/update/deinit, `worktree add -b`). Held legs never collide; those first
+/// runs and other processes can, which the retry and repairs cover. Outside it: gh-run
+/// writers (`gh repo create --push`, `fork --remote`, `set-default`), whose git is gh's
+/// own, and `--global` writers, which lock another file. A LEAF lock: taken after any
+/// domain lock, never before one.
+static CONFIG_WRITE_LOCKS: OnceLock<ConfigWriteLocks> = OnceLock::new();
+
+/// The config-write mutex for `repo_path`, keyed by the common git dir because every
+/// checkout of a repository writes the same `.git/config`. An unresolvable identity
+/// falls back to the raw spelling, which can only under-serialize onto the retry.
+async fn config_write_lock(repo_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let identity = crate::git::repo::repo_identity(repo_path)
+        .await
+        .unwrap_or_else(|_| repo_path.to_string());
+    let key = crate::git::worktree::normalize_wt_path(&identity);
+    let mut locks = CONFIG_WRITE_LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    Arc::clone(locks.entry(key).or_default())
+}
+
+/// Proof that the holder is inside [`with_config_write_lock`], so the held runner
+/// below is never reached without the mutex (re-taking it inside would deadlock).
+/// Only that function mints one, and a body may make any number of writes with a
+/// borrow of it. Callers must keep those writes inside the body: nothing in the type
+/// stops the token escaping through the body's return value, past the hold.
+pub(crate) struct ConfigWriteHeld(());
+
+/// Runs `body` holding `repo_path`'s config-write mutex. The wait is unbounded and a
+/// hold lasts as long as its git work: a tracking switch, or any checked-out create
+/// without --no-track, keeps it across the whole checkout (smudge filters,
+/// post-checkout hooks) plus its repairs, up to `DEFAULT_TIMEOUT` per spawn, and a
+/// linked worktree's rename or delete queued behind it keeps ITS working-tree domain
+/// meanwhile, so staging there can report Busy.
+pub(crate) async fn with_config_write_lock<F, Fut, T>(repo_path: &str, body: F) -> T
+where
+    F: FnOnce(ConfigWriteHeld) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let lock = config_write_lock(repo_path).await;
+    #[cfg(test)]
+    let _ = CONFIG_WRITE_LOCK_EVENTS.try_with(|event| event("waiting"));
+    let held = lock.lock().await;
+    #[cfg(test)]
+    let _ = CONFIG_WRITE_LOCK_EVENTS.try_with(|event| event("acquired"));
+    let out = body(ConfigWriteHeld(())).await;
+    drop(held);
+    #[cfg(test)]
+    let _ = CONFIG_WRITE_LOCK_EVENTS.try_with(|event| event("freed"));
+    out
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Runs before each held config-write attempt, so a test can release a held
+    /// `.git/config.lock` between a first attempt and its retry without timing either.
+    pub(crate) static CONFIG_WRITE_ATTEMPT_HOOK: Arc<dyn Fn() + Send + Sync>;
+
+    /// Told "waiting" just before the config-write mutex is requested, "acquired" once
+    /// it is held and "freed" once released, so a test can order a parked writer
+    /// against its own release, and a long command against the hold.
+    pub(crate) static CONFIG_WRITE_LOCK_EVENTS: Arc<dyn Fn(&'static str) + Send + Sync>;
+}
+
+/// A [`CONFIG_WRITE_ATTEMPT_HOOK`] that deletes `lock` just before held attempt
+/// number `release_at` (1-based), plus the attempt counter it bumps.
+#[cfg(test)]
+pub(crate) fn release_config_lock_before_attempt(
+    lock: PathBuf,
+    release_at: usize,
+) -> (
+    Arc<dyn Fn() + Send + Sync>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let hook = move || {
+        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == release_at {
+            std::fs::remove_file(&lock).expect("the held config.lock is released");
+        }
+    };
+    (Arc::new(hook), calls)
+}
+
+/// Holds `repo`'s `.git/config.lock` the way another writer would, until the returned
+/// path is removed.
+#[cfg(test)]
+pub(crate) fn hold_config_lock(repo: impl AsRef<std::path::Path>) -> PathBuf {
+    let lock = repo.as_ref().join(".git").join("config.lock");
+    std::fs::write(&lock, b"").expect("the config.lock is held");
+    lock
+}
+
+/// Each config-write mutex event, with a probe's verdict at that moment.
+#[cfg(test)]
+pub(crate) type LockLog = Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>;
+
+/// A [`CONFIG_WRITE_LOCK_EVENTS`] hook logging each mutex event with `probe()`'s
+/// verdict at that moment, so a test can place a long command against the hold.
+#[cfg(test)]
+pub(crate) fn lock_events(
+    probe: impl Fn() -> bool + Send + Sync + 'static,
+) -> (Arc<dyn Fn(&'static str) + Send + Sync>, LockLog) {
+    let log = LockLog::default();
+    let sink = Arc::clone(&log);
+    let hook = move |event| sink.lock().unwrap().push((event, probe()));
+    (Arc::new(hook), log)
+}
+
+/// [`run_git_config_write`] for a caller already holding the config-write mutex.
+pub(crate) async fn run_git_config_write_held(
+    _held: &ConfigWriteHeld,
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    retry_on_config_lock(|| {
+        #[cfg(test)]
+        let _ = CONFIG_WRITE_ATTEMPT_HOOK.try_with(|hook| hook());
+        run_git_raw(Some(repo_path), args, timeout)
+    })
+    .await
+}
+
+/// A working-tree mutation that also rewrites `.git/config` (`branch -m`/`-D`, a
+/// tracking switch, the `remote` verbs): the working-tree domain, then the config-write
+/// mutex, each taken ONCE. On a lost config lock `repair` gets the raw output and the
+/// held mutex and redoes only what the loss left undone, never a branch command's ref
+/// change, which lands before git writes the config. Busy as [`run_git_mutating`]; a
+/// non-zero exit is [`AppError::Git`] with [`GitOutput::full_failure_text`].
+pub(crate) async fn run_git_mutating_config_write<F, Fut>(
+    state: &AppState,
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+    repair: F,
+) -> AppResult<GitOutput>
+where
+    F: FnOnce(GitOutput, ConfigWriteHeld) -> Fut,
+    Fut: std::future::Future<Output = AppResult<GitOutput>>,
+{
+    let domain = state.working_tree_lock(repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(args)),
+    )
+    .await?;
+    let out = with_config_write_lock(repo_path, |held| async move {
+        let out = run_git_raw_index_retry(repo_path, args, timeout).await?;
+        if is_config_lock_contention(&out.stderr) {
+            return repair(out, held).await;
+        }
+        Ok(out)
+    })
+    .await?;
+    if out.code != 0 {
+        return Err(AppError::Git {
+            code: out.code,
+            stderr: out.full_failure_text(),
+        });
+    }
+    Ok(out)
+}
+
+/// Runs a `git worktree …` admin command under the repo's WORKTREE-ADMIN lock —
+/// the domain that keeps a multi-minute removal from stalling staging, commits and
+/// the worktree list. Same bounded wait and [`AppError::Busy`] contract as
+/// [`run_git_mutating`]; no index.lock retry, since these commands touch the admin
+/// registry rather than the index.
+pub(crate) async fn run_git_worktree_admin(
+    state: &AppState,
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    let domain = state.worktree_admin_lock(repo_path).await;
+    let _guard = acquire_repo_lock(&domain, LOCK_WAIT_TIMEOUT, "a worktree operation").await?;
+    run_git(Some(repo_path), args, timeout).await
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    /// A zero budget is the deterministic seam for both verdicts: it resolves for a
+    /// FREE lock (timeout polls its inner future first) and expires immediately for
+    /// a held one, so neither arm rests on scheduling.
+    #[tokio::test]
+    async fn a_bounded_acquire_names_the_current_holder() {
+        let state = AppState::default();
+        let domain = state.worktree_admin_lock("C:/repos/busy").await;
+
+        let held = acquire_repo_lock(&domain, Duration::ZERO, "a worktree removal")
+            .await
+            .expect("a free lock is taken at a zero budget");
+
+        let err = acquire_repo_lock(&domain, Duration::ZERO, "a commit")
+            .await
+            .expect_err("a held lock refuses rather than queueing");
+        let AppError::Busy { holder } = &err else {
+            panic!("expected Busy, got {err:?}");
+        };
+        assert_eq!(holder, "a worktree removal");
+        assert_eq!(
+            err.to_string(),
+            "A worktree removal is still running — try again when it finishes."
+        );
+
+        // Released ⇒ free again, and the stale label is gone with it.
+        drop(held);
+        assert_eq!(domain.holder_label(), None);
+        acquire_repo_lock(&domain, Duration::ZERO, "a commit")
+            .await
+            .expect("the released lock is taken immediately");
+    }
+
+    /// An unlabeled holder still has to produce a sentence, so the waiter never
+    /// reads a headless one.
+    #[tokio::test]
+    async fn an_unlabeled_holder_falls_back_to_the_generic_name() {
+        let state = AppState::default();
+        let domain = state.working_tree_lock("C:/repos/unlabeled").await;
+        let raw = domain.lock();
+        let _held = raw.lock().await;
+
+        let err = acquire_repo_lock(&domain, Duration::ZERO, "a commit")
+            .await
+            .expect_err("the raw hold still blocks");
+        assert!(
+            matches!(&err, AppError::Busy { holder } if holder == DEFAULT_HOLDER),
+            "{err:?}"
+        );
+    }
+
+    /// The domains are independent by construction: a removal holding ADMIN must
+    /// not delay a commit, which is the whole point of the split.
+    #[tokio::test]
+    async fn the_three_domains_do_not_block_each_other() {
+        let state = AppState::default();
+        let repo = "C:/repos/domains";
+        let _admin = acquire_repo_lock(
+            &state.worktree_admin_lock(repo).await,
+            Duration::ZERO,
+            "a worktree removal",
+        )
+        .await
+        .expect("admin is free");
+
+        for domain in [
+            state.working_tree_lock(repo).await,
+            state.network_lock(repo).await,
+        ] {
+            acquire_repo_lock(&domain, Duration::ZERO, "a commit")
+                .await
+                .expect("another domain is unaffected by the admin hold");
+        }
+    }
+
+    /// Every accessor call for one repo path hands back the SAME mutex, and a
+    /// different path a different one. The whole scheme rests on this: a registry
+    /// that minted a fresh domain per call would serialize nothing while every
+    /// acquire still succeeded, and one that ignored the path would serialize every
+    /// repo against every other.
+    #[tokio::test]
+    async fn one_repo_path_shares_one_working_tree_mutex() {
+        let state = AppState::default();
+        let repo = "C:/repos/same-mutex";
+        let _held = state.working_tree_lock(repo).await.lock().lock_owned().await;
+
+        assert!(
+            state
+                .working_tree_lock(repo)
+                .await
+                .lock()
+                .try_lock()
+                .is_err(),
+            "a second lookup of the same path must find the held mutex"
+        );
+        assert!(
+            state
+                .working_tree_lock("C:/repos/other")
+                .await
+                .lock()
+                .try_lock()
+                .is_ok(),
+            "another repo path must be an independent mutex"
+        );
+    }
+
+    /// The classifier keys on git's own config-lock wording and nothing nearby:
+    /// index.lock has its own retry, a permissions failure is no transient hold, and a
+    /// different failure must surface unretried.
+    #[test]
+    fn config_lock_contention_matches_only_the_config_lock_failure() {
+        assert!(is_config_lock_contention(
+            "error: could not lock config file .git/config: File exists"
+        ));
+        assert!(is_config_lock_contention(
+            "warning: could not lock config file C:/r/.git/config: File exists\n"
+        ));
+        for other in [
+            "",
+            "error: could not lock config file .git/config: Permission denied",
+            "fatal: Unable to create 'C:/r/.git/index.lock': File exists.",
+            "error: key does not contain a section: gitdesktopArchived",
+            "fatal: not a git repository (or any of the parent directories): .git",
+        ] {
+            assert!(!is_config_lock_contention(other), "{other:?}");
+        }
+    }
+
+    /// The per-line reason rule: git's bare form (no reason, as the section rename and
+    /// remove paths print it) and `File exists` count, a drive-letter path never reads
+    /// as a reason, and any other reason is no transient hold.
+    #[test]
+    fn config_lock_contention_reads_only_the_lines_reason() {
+        for held in [
+            "error: could not lock config file .git/config\nwarning: update of config-file failed",
+            "error: could not lock config file .git/config",
+            "error: could not lock config file .git/config\n\
+             error: Could not remove config section 'remote.origin'",
+            "error: could not lock config file .git/config: File exists",
+            "error: could not lock config file C:/Users/me/repo/.git/config: File exists\r\n",
+            "error: could not lock config file .git/config\n\
+             error: could not lock config file .git/config: File exists",
+            "error: could not lock config file .git/config\n\
+             error: could not lock config file .git/config",
+        ] {
+            assert!(is_config_lock_contention(held), "{held:?}");
+        }
+        for other in [
+            "error: could not lock config file .git/config\n\
+             error: could not lock config file .git/config: Permission denied",
+            "error: could not lock config file C:/r/.git/config: Permission denied",
+            "error: could not lock config file .git/config: Read-only file system",
+            "error: could not lock config file .git/config: No space left on device",
+            "fatal: could not unset 'remote.pushDefault'",
+        ] {
+            assert!(!is_config_lock_contention(other), "{other:?}");
+        }
+    }
+
+    fn output(code: i32, stderr: &str) -> GitOutput {
+        GitOutput {
+            stdout: Vec::new(),
+            stderr: stderr.to_string(),
+            code,
+        }
+    }
+
+    /// A lost config lock gets exactly one more attempt; success, an unrelated
+    /// failure, and a second lost race all stop there.
+    #[tokio::test]
+    async fn the_config_write_retries_once_and_only_on_the_config_lock() {
+        const LOST: &str = "error: could not lock config file .git/config: File exists";
+        for (script, want_calls, want_code) in [
+            (vec![output(255, LOST), output(0, "")], 2, 0),
+            (vec![output(255, LOST), output(255, LOST)], 2, 255),
+            (vec![output(0, "")], 1, 0),
+            (vec![output(5, "")], 1, 5),
+            (vec![output(128, "fatal: other")], 1, 128),
+        ] {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let script = std::sync::Mutex::new(std::collections::VecDeque::from(script));
+            let out = retry_on_config_lock(|| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let next = script.lock().unwrap().pop_front().expect("a scripted run");
+                async move { Ok(next) }
+            })
+            .await
+            .expect("the scripted runs never error");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), want_calls);
+            assert_eq!(out.code, want_code);
+        }
+    }
+
+    /// The label a waiter reads comes from the argv, and a leading `-c` pair must
+    /// not hide the subcommand behind it.
+    #[test]
+    fn the_holder_label_reads_past_leading_config_pairs() {
+        assert_eq!(subcommand_of(&["commit", "-m", "x"]), "commit");
+        assert_eq!(
+            subcommand_of(&["-c", "core.editor=true", "rebase", "--continue"]),
+            "rebase"
+        );
+        assert_eq!(subcommand_of(&["-c", "a=b", "-c", "c=d", "push"]), "push");
+        assert_eq!(subcommand_of(&[]), "");
+        assert_eq!(holder_label("cherry-pick"), "a cherry-pick");
+        assert_eq!(holder_label("bisect"), DEFAULT_HOLDER);
+    }
+}
+
+#[cfg(test)]
+mod stdin_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nosystem_suppresses_an_explicitly_redirected_system_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("system.config");
+        std::fs::write(&config, "[gitdesktopFixture]\n poison = visible\n").unwrap();
+        let git = git_bin().await.unwrap();
+        // The config poison is measured; attribute suppression relies on Git's
+        // behavior confirmed with `git var GIT_ATTR_SYSTEM`, not a redirected
+        // system-attributes fixture. Explicit `config --system` bypasses NOSYSTEM.
+        for suppress in [false, true] {
+            let mut cmd = Command::new(&git);
+            cmd.current_dir(dir.path())
+                .args(["config", "--get", "gitdesktopFixture.poison"])
+                .env("GIT_CONFIG_SYSTEM", &config)
+                .env_remove("GIT_CONFIG_NOSYSTEM");
+            if suppress {
+                cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+            }
+            let out = cmd.output().await.unwrap();
+            assert_eq!(out.status.code(), Some(if suppress { 1 } else { 0 }));
+            assert_eq!(
+                out.stdout,
+                if suppress { b"".as_slice() } else { b"visible\n" },
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+    }
+
+    /// Both sides have to clear the point where a write-then-read runner wedges,
+    /// and that point is platform-specific: on unix the stdin write blocks once the
+    /// 64KB pipe buffer fills, while on Windows tokio absorbs the first
+    /// `DEFAULT_MAX_BUF_SIZE` (2 MiB, measured against tokio 1.53) into its
+    /// `Blocking` wrapper before the write can stall at all. 50k paths of 100 bytes
+    /// send ~4.8 MiB and draw ~5.5 MiB back (four NUL-joined tokens per match, 15
+    /// bytes of them fixed), which clears both by a wide margin.
+    const PATH_COUNT: usize = 50_000;
+    const PAD: usize = 80;
+
+    /// Output far larger than the pipe buffer, produced while stdin is still being
+    /// written: the shape that deadlocked a write-then-read runner into a spurious
+    /// timeout. `git_ignored_files` hits it for real — every path it sends matches
+    /// by construction, and `--verbose` answers with four tokens per one sent.
+    #[tokio::test]
+    async fn large_interleaved_stdin_and_output_complete() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-runner-stdin-")
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        run_git(Some(&repo), &["init", "-q"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        // `*` in the repo's own `.gitignore` outranks any global excludes the
+        // machine happens to carry, so every path matches this one rule.
+        std::fs::write(dir.path().join(".gitignore"), "*\n").unwrap();
+
+        // One directory, long names: the bytes come from the filename so git has a
+        // single parent to look for nested ignore files in.
+        let pad = "f".repeat(PAD);
+        let paths: Vec<String> = (0..PATH_COUNT)
+            .map(|i| format!("generated/{pad}{i:06}.bin"))
+            .collect();
+        let input: String = paths.iter().map(|p| format!("{p}\0")).collect();
+        assert!(
+            input.len() > 4 * 1024 * 1024,
+            "stdin must outrun tokio's 2 MiB Windows write buffer, got {} bytes",
+            input.len()
+        );
+
+        // The deadlock can only present as a timeout, so any explicit bound keeps
+        // a regression finite; 30s leaves ~10x headroom for slow contended CI
+        // runners (measured ~0.8s idle on a 32-thread dev machine).
+        let out = run_git_raw_input(
+            Some(&repo),
+            &["check-ignore", "--verbose", "-z", "--stdin"],
+            Some(&input),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("check-ignore answers inside the timeout");
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        assert!(
+            out.stdout.len() > 1024 * 1024,
+            "output must exceed every pipe buffer, got {} bytes",
+            out.stdout.len()
+        );
+
+        // Byte-compared, not lossy-parsed: partial or interleaved drains would
+        // corrupt exactly here. `-z` terminates every token, so the split's last
+        // element is empty.
+        let tokens: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+        assert_eq!(tokens.len(), PATH_COUNT * 4 + 1, "one record per path sent");
+        assert_eq!(tokens[PATH_COUNT * 4], b"");
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(tokens[i * 4], b".gitignore");
+            assert_eq!(tokens[i * 4 + 1], b"1");
+            assert_eq!(tokens[i * 4 + 2], b"*");
+            assert_eq!(tokens[i * 4 + 3], path.as_bytes(), "record {i}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// The per-invocation `-c` block is a behavior contract, not a preference:
+    /// `core.longpaths` is what lets Git for Windows write past 260 chars, and
+    /// the parse/color settings are what every output parser in the app assumes.
+    /// Read back through git so the assertion covers the value REACHING the
+    /// child, not merely the argv we build.
+    #[tokio::test]
+    async fn injected_config_reaches_git() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-runner-config-")
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        run_git(Some(&repo), &["init", "-q"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+
+        // `-c` is the command-line scope, which outranks the machine's own
+        // system/global/local config — so this holds on any dev box.
+        for (key, want) in [
+            ("core.longpaths", "true"),
+            ("core.quotepath", "false"),
+            ("color.ui", "false"),
+            ("diff.noprefix", "false"),
+            ("diff.srcprefix", "a/"),
+            ("diff.dstprefix", "b/"),
+            ("diff.mnemonicprefix", "false"),
+        ] {
+            let out = run_git(Some(&repo), &["config", "--get", key], DEFAULT_TIMEOUT)
+                .await
+                .unwrap_or_else(|e| panic!("read {key}: {e}"));
+            assert_eq!(out.stdout_lossy().trim(), want, "{key}");
+        }
+    }
+
+    /// The prefix pins reach a real `git diff`: a repo whose own config asks for
+    /// `diff.noprefix`, `diff.mnemonicPrefix` and custom prefixes still gets `a/` `b/`
+    /// headers, which every section-keying parser downstream assumes. Unpinned, the
+    /// same repo prints `diff --git x x` (measured, git 2.51.1).
+    #[tokio::test]
+    async fn diff_headers_keep_literal_prefixes_against_repo_config() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-runner-prefix-")
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let git = |args: &'static [&'static str]| {
+            let repo = repo.clone();
+            async move {
+                run_git(Some(&repo), args, DEFAULT_TIMEOUT)
+                    .await
+                    .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+                    .stdout_lossy()
+            }
+        };
+        git(&["init", "-q"]).await;
+        git(&["config", "user.email", "t@t.local"]).await;
+        git(&["config", "user.name", "T"]).await;
+        std::fs::write(dir.path().join("x"), "one\n").unwrap();
+        git(&["add", "x"]).await;
+        git(&["commit", "-qm", "seed"]).await;
+        git(&["config", "diff.noprefix", "true"]).await;
+        git(&["config", "diff.mnemonicPrefix", "true"]).await;
+        git(&["config", "diff.srcPrefix", "SRC/"]).await;
+        git(&["config", "diff.dstPrefix", "DST/"]).await;
+        std::fs::write(dir.path().join("x"), "two\n").unwrap();
+
+        let first_line = |text: String| text.lines().next().unwrap_or_default().to_string();
+        assert_eq!(first_line(git(&["diff"]).await), "diff --git a/x b/x");
+        assert_eq!(
+            first_line(git(&["diff", "HEAD"]).await),
+            "diff --git a/x b/x"
+        );
+
+        // mnemonicPrefix OUTRANKS srcPrefix/dstPrefix whatever the `-c` order, so
+        // its own pin is required (measured, git 2.51.1): re-enabled after the
+        // runner's block, it wins over the still-pinned `a/` `b/`.
+        assert_eq!(
+            first_line(git(&["-c", "diff.mnemonicPrefix=true", "diff"]).await),
+            "diff --git i/x w/x"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_write_lock_tests {
+    use super::*;
+
+    async fn git(repo: &str, args: &[&str]) -> String {
+        run_git(Some(repo), args, DEFAULT_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+            .stdout_lossy()
+    }
+
+    async fn seeded_repo(tag: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("gd-runner-{tag}-"))
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.to_string_lossy().into_owned();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.email", "t@t.local"]).await;
+        git(&repo, &["config", "user.name", "T"]).await;
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "seed"]).await;
+        (dir, repo)
+    }
+
+    async fn config_value(repo: &str, key: &str) -> String {
+        git(repo, &["config", "--get", key])
+            .await
+            .trim()
+            .to_string()
+    }
+
+    /// Every checkout of one repository writes the same `.git/config`, so a linked
+    /// worktree lands on the main checkout's mutex and another repository on its own.
+    #[tokio::test]
+    async fn config_writers_share_one_mutex_per_repository() {
+        let (dir, repo) = seeded_repo("cfg-mutex-key").await;
+        let wt = dir.path().join("wt").to_string_lossy().into_owned();
+        git(&repo, &["worktree", "add", "-q", "-b", "side", &wt, "HEAD"]).await;
+        let (_other_dir, other) = seeded_repo("cfg-mutex-other").await;
+
+        let main = config_write_lock(&repo).await;
+        assert!(Arc::ptr_eq(&main, &config_write_lock(&wt).await));
+        assert!(!Arc::ptr_eq(&main, &config_write_lock(&other).await));
+    }
+
+    /// A config-only writer takes the mutex alone: a held working-tree domain never
+    /// delays it. The bound only turns a regression's hang into a failure.
+    #[tokio::test]
+    async fn a_config_only_write_never_waits_on_the_working_tree_domain() {
+        let state = AppState::default();
+        let (_dir, repo) = seeded_repo("cfg-no-domain").await;
+        let domain = state.working_tree_lock(&repo).await;
+        let _held = acquire_repo_lock(&domain, Duration::ZERO, "a commit")
+            .await
+            .expect("the domain is free");
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_git_config_write(&repo, &["config", "gd.probe", "1"], DEFAULT_TIMEOUT),
+        )
+        .await
+        .expect("a config-only write is not queued behind the domain")
+        .expect("the write runs");
+        assert_eq!(out.code, 0, "{}", out.stderr);
+    }
+
+    /// Mutual exclusion, pinned by event order rather than timing. On a current-thread
+    /// runtime a writer runs uninterrupted from its "waiting" event to its next await,
+    /// so it could log "acquired" ahead of the test's "released" only if the mutex
+    /// never parked it. Both writer kinds, the domain-holding one included.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_config_mutex_parks_every_writer_until_released() {
+        let state = Arc::new(AppState::default());
+        let (_dir, repo) = seeded_repo("cfg-mutex-exclusion").await;
+        for mutating in [false, true] {
+            let blocker = config_write_lock(&repo).await.lock_owned().await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let tx = std::sync::Mutex::new(Some(tx));
+            let events: Arc<dyn Fn(&'static str) + Send + Sync> = {
+                let log = Arc::clone(&log);
+                Arc::new(move |event| {
+                    log.lock().unwrap().push(event);
+                    if event == "waiting" {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                })
+            };
+            let (state_w, repo_w) = (Arc::clone(&state), repo.clone());
+            let writer = tokio::spawn(CONFIG_WRITE_LOCK_EVENTS.scope(events, async move {
+                let args = ["config", "gd.exclusive", "1"];
+                if mutating {
+                    run_git_mutating_config_write(
+                        &state_w,
+                        &repo_w,
+                        &args,
+                        DEFAULT_TIMEOUT,
+                        |out, _| async move { Ok(out) },
+                    )
+                    .await
+                } else {
+                    run_git_config_write(&repo_w, &args, DEFAULT_TIMEOUT).await
+                }
+            }));
+
+            rx.await.expect("the writer reached the mutex");
+            log.lock().unwrap().push("released");
+            drop(blocker);
+            let out = tokio::time::timeout(Duration::from_secs(60), writer)
+                .await
+                .expect("the writer finishes once released")
+                .unwrap()
+                .expect("the write runs");
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert_eq!(
+                *log.lock().unwrap(),
+                ["waiting", "released", "acquired", "freed"],
+                "mutating writer: {mutating}"
+            );
+        }
+    }
+
+    /// Lock order is domain, then mutex. A mutating config write parked on the
+    /// mutex WHILE holding the domain, and a config-only write queued on the same
+    /// mutex, both finish once it frees: the wait graph has no cycle. Exclusion
+    /// itself is pinned by the event-order test above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mutating_and_a_plain_config_write_overlap_without_deadlock() {
+        let state = Arc::new(AppState::default());
+        let (_dir, repo) = seeded_repo("cfg-lock-order").await;
+        let blocker = config_write_lock(&repo).await.lock_owned().await;
+
+        let mutating = tokio::spawn({
+            let (state, repo) = (Arc::clone(&state), repo.clone());
+            async move {
+                run_git_mutating_config_write(
+                    &state,
+                    &repo,
+                    &["config", "gd.mutating", "1"],
+                    DEFAULT_TIMEOUT,
+                    |out, _| async move { Ok(out) },
+                )
+                .await
+            }
+        });
+        // Parked holding the domain: its holder label is published only while held.
+        let domain = state.working_tree_lock(&repo).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while domain.holder_label().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mutating write never took the domain"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let plain = tokio::spawn({
+            let repo = repo.clone();
+            async move {
+                run_git_config_write(&repo, &["config", "gd.plain", "1"], DEFAULT_TIMEOUT).await
+            }
+        });
+
+        drop(blocker);
+        let bound = Duration::from_secs(60);
+        tokio::time::timeout(bound, mutating)
+            .await
+            .expect("no deadlock")
+            .unwrap()
+            .expect("the mutating write lands");
+        let out = tokio::time::timeout(bound, plain)
+            .await
+            .expect("no deadlock")
+            .unwrap()
+            .expect("the plain write runs");
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(config_value(&repo, "gd.mutating").await, "1");
+        assert_eq!(config_value(&repo, "gd.plain").await, "1");
+        assert_eq!(domain.holder_label(), None, "and the domain is released");
+    }
+}
+
+#[cfg(test)]
+mod tree_kill_tests {
+    use super::*;
+
+    /// The call's budget, and the hook's run time well past it.
+    const BUDGET: Duration = Duration::from_secs(3);
+    const HOOK_SECS: u64 = 6;
+
+    /// A timed-out git takes its whole process tree down on every platform, so a
+    /// hook it spawned never finishes. Without the tree kill the hook outlives the
+    /// timeout and writes its marker.
+    #[tokio::test]
+    async fn a_timed_out_git_takes_its_hook_down_with_it() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-runner-tree-kill-")
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@t.local"],
+            &["config", "user.name", "T"],
+        ] {
+            run_git(Some(&repo), args, DEFAULT_TIMEOUT).await.unwrap();
+        }
+        let git_dir = dir.path().join(".git");
+        let hook = git_dir.join("hooks").join("pre-commit");
+        std::fs::create_dir_all(git_dir.join("hooks")).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ntouch .git/hook-started\nsleep {HOOK_SECS}\ntouch .git/hook-finished\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let result = run_git(Some(&repo), &["commit", "--allow-empty", "-m", "x"], BUDGET).await;
+        match result {
+            Err(AppError::Timeout(_)) => {}
+            Ok(out) => panic!("the commit finished inside the budget: {}", out.stderr),
+            Err(e) => panic!("expected a timeout, got {e:?}"),
+        }
+        assert!(
+            git_dir.join("hook-started").exists(),
+            "the hook was running when the budget ran out"
+        );
+        // Past the latest moment the hook could finish, plus a margin.
+        tokio::time::sleep(Duration::from_secs(HOOK_SECS + 3)).await;
+        assert!(
+            !git_dir.join("hook-finished").exists(),
+            "the hook died with git"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod group_tests {
+    use super::{kill_process_group, GitGroup};
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+
+    /// How long the grandchild waits before writing its marker. Bounds the whole
+    /// fixture: nothing it spawns outlives this by more than the margins below.
+    const DELAY_SECS: u64 = 3;
+
+    /// A `sh` group leader whose backgrounded subshell (a GRANDCHILD tree) marks
+    /// that it started, sleeps, then writes `survived`. The marker files are an
+    /// observable scoped to this test, unlike a process search.
+    fn spawn_marker_tree(dir: &Path) -> (std::process::Child, PathBuf, PathBuf) {
+        let started = dir.join("started");
+        let survived = dir.join("survived");
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "(touch \"$1\"; sleep {DELAY_SECS}; touch \"$2\") & wait"
+            ))
+            .arg("sh")
+            .arg(&started)
+            .arg(&survived)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the marker tree");
+        (child, started, survived)
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cond()
+    }
+
+    /// The kill reaches only the named group: a process outside it survives (and so
+    /// does this test's own group, or the test runner would die with it).
+    #[test]
+    fn a_group_kill_spares_a_process_outside_the_group() {
+        let sleeper = || {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a sleeper")
+        };
+        let mut target = sleeper();
+        let mut bystander = sleeper();
+
+        kill_process_group(target.id());
+        let status = target.wait().expect("reap the target");
+        assert!(
+            !status.success(),
+            "the target's group was killed: {status:?}"
+        );
+        // Time for a mistargeted signal to land.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(
+            bystander.try_wait().expect("poll the bystander").is_none(),
+            "the bystander survives"
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
+    /// Dropping an ARMED group guard kills the grandchild along with its parent.
+    #[test]
+    fn armed_group_drop_kills_the_grandchild() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-group-armed-")
+            .tempdir()
+            .expect("create temp dir");
+        let (mut child, started, survived) = spawn_marker_tree(dir.path());
+        let group = GitGroup(child.id());
+        assert!(
+            wait_until(|| started.exists(), 30),
+            "the grandchild started"
+        );
+
+        drop(group);
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_secs(DELAY_SECS + 5));
+        assert!(!survived.exists(), "the grandchild died with the group");
+    }
+
+    /// The control that proves the observable can fail: a DISARMED guard kills
+    /// nothing, and a direct kill of the parent leaves the grandchild running (git's
+    /// detached `gc --auto` relies on exactly this).
+    #[test]
+    fn disarmed_group_drop_leaves_the_grandchild_running() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-group-disarmed-")
+            .tempdir()
+            .expect("create temp dir");
+        let (mut child, started, survived) = spawn_marker_tree(dir.path());
+        let group = GitGroup(child.id());
+        assert!(
+            wait_until(|| started.exists(), 30),
+            "the grandchild started"
+        );
+
+        group.disarm();
+        child.kill().expect("kill the direct child");
+        let _ = child.wait();
+        assert!(
+            wait_until(|| survived.exists(), DELAY_SECS + 15),
+            "the grandchild survives a disarmed guard plus a direct parent kill"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod job_tests {
+    use super::GitJob;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::path::{Path, PathBuf};
+
+    /// How long the grandchild holds its lock. Bounds the whole fixture: even a
+    /// failing assertion can only leave a process around for this long.
+    const HOLD_SECS: u32 = 10;
+
+    /// A `cmd.exe` parent whose PowerShell GRANDCHILD opens a file with no sharing.
+    /// "Is the grandchild alive?" is then answerable by trying to open that file —
+    /// an observable scoped to this test, unlike a process-name search, which also
+    /// matches the prober and other sessions' processes.
+    fn spawn_locking_tree(dir: &Path) -> (std::process::Child, PathBuf) {
+        let lock = dir.join("held.lock");
+        let script = dir.join("hold.ps1");
+        // PowerShell escapes a single quote inside a single-quoted string by doubling
+        // it; an apostrophe in the temp path (a `C:\Users\O'Brien` profile) would
+        // otherwise close the literal and fail the test for the wrong reason.
+        let quoted = lock.display().to_string().replace('\'', "''");
+        std::fs::write(
+            &script,
+            format!(
+                "$f=[IO.File]::Open('{quoted}','OpenOrCreate','ReadWrite','None')\n\
+                 Start-Sleep -Seconds {HOLD_SECS}\n\
+                 $f.Close()\n"
+            ),
+        )
+        .expect("write the holder script");
+        // A delay in front of the launch puts the grandchild strictly AFTER `arm()`,
+        // so neither test races the assignment. `ping` rather than `timeout`, which
+        // this fixture's null stdin breaks; and ONE raw argument, because std's
+        // quoting would escape the `&` that chains the two commands.
+        let command = format!(
+            "ping -n 2 127.0.0.1 >nul & powershell -NoProfile -NonInteractive \
+             -ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        );
+        let child = std::process::Command::new("cmd.exe")
+            .arg("/c")
+            .raw_arg(&command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the locking tree");
+        (child, lock)
+    }
+
+    /// Whether someone still holds the lock file exclusively. A file that doesn't
+    /// exist yet counts as unheld — the grandchild hasn't reached the open.
+    fn lock_held(lock: &Path) -> bool {
+        match std::fs::OpenOptions::new().write(true).open(lock) {
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        }
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cond()
+    }
+
+    /// Closing an ARMED job kills descendants the direct child spawned — the
+    /// behavior a timed-out `git` needs, since the Git-for-Windows shim runs the
+    /// real git as a child of its own.
+    #[test]
+    fn armed_job_close_kills_the_grandchild() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-job-armed-")
+            .tempdir()
+            .expect("create temp dir");
+        let (mut child, lock) = spawn_locking_tree(dir.path());
+        let job = GitJob::arm(child.as_raw_handle()).expect("job object armed");
+        assert!(
+            wait_until(|| lock_held(&lock), 30),
+            "the grandchild took the lock"
+        );
+
+        drop(job);
+        let _ = child.wait();
+        assert!(
+            wait_until(|| !lock_held(&lock), 15),
+            "the lock is released, so the grandchild died with the tree"
+        );
+    }
+
+    /// The control that proves the observable can fail: on the success path the job
+    /// is DISARMED before it closes, and Windows never cascades a kill on its own,
+    /// so the grandchild outlives the parent (git's detached `gc --auto` relies on
+    /// exactly this).
+    #[test]
+    fn disarmed_job_close_leaves_the_grandchild_running() {
+        let dir = tempfile::Builder::new()
+            .prefix("gd-job-disarmed-")
+            .tempdir()
+            .expect("create temp dir");
+        let (mut child, lock) = spawn_locking_tree(dir.path());
+        let job = GitJob::arm(child.as_raw_handle()).expect("job object armed");
+        assert!(
+            wait_until(|| lock_held(&lock), 30),
+            "the grandchild took the lock"
+        );
+
+        job.disarm();
+        child.kill().expect("kill the direct child");
+        let _ = child.wait();
+        assert!(
+            lock_held(&lock),
+            "the grandchild survives a disarmed close plus a direct parent kill"
+        );
+
+        // No leaked process: the holder's bounded sleep expires on its own.
+        assert!(
+            wait_until(|| !lock_held(&lock), u64::from(HOLD_SECS) + 15),
+            "the orphaned holder exits on its own"
+        );
+    }
+}

@@ -1,0 +1,3990 @@
+import { Popover } from "@base-ui/react/popover";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CaretDownIcon,
+  CheckIcon,
+  CircleNotchIcon,
+  CloudArrowDownIcon,
+  CloudSlashIcon,
+  CloudXIcon,
+  GitBranchIcon,
+  GitPullRequestIcon,
+  TreeStructureIcon,
+  WarningIcon,
+} from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { MENU_HELD_ROW_CLASS } from "@/components/menu-held-row";
+import { RelativeTime } from "@/components/relative-time";
+import { Badge } from "@/components/ui/badge";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { Input } from "@/components/ui/input";
+import {
+  isDeletionBlocked,
+  isMergeMethodAllowed,
+  isPromotionBranch,
+  requiresPullRequest,
+} from "@/lib/branch-rules/match";
+import {
+  useEffectiveBranchRules,
+  useEffectiveBranchRulesSettling,
+} from "@/lib/branch-rules/queries";
+import { clipTitle } from "@/lib/clip-title";
+import { copyText } from "@/lib/clipboard";
+import { isDirtyTreeRefusal, presentError } from "@/lib/error-summary";
+import { forgeDetectForkPrForBranch, gitBranches } from "@/lib/git/api";
+import { normPath } from "@/lib/git/path";
+import {
+  headTrackingMatchesRow,
+  rowTrackingMatches,
+} from "@/lib/git/push-tracking";
+import {
+  BRANCH_PUSH_ACTIVE_MESSAGE,
+  type BranchPushState,
+  branchPublishLabel,
+  branchPushHoldItemReason,
+  branchPushHoldReason,
+  branchPushLabel,
+  branchRewriteStatusOptions,
+  forgeFeatureReady,
+  nextPushLatch,
+  REMOTE_BRANCHES_STALE_TIME,
+  refuseWhilePushRuns,
+  remoteBranchesOptions,
+  repoKeys,
+  repoStatusOptions,
+  useBranchAhead,
+  useBranchDivergence,
+  useBranches,
+  useBranchResetToUpstream,
+  useBranchRewriteStatus,
+  useCheckoutBranch,
+  useCheckoutRemoteBranch,
+  useDefaultBranch,
+  useDeleteBranch,
+  useDeleteRemoteBranch,
+  useDiscardAll,
+  useForgeStatus,
+  useHardResetToCommit,
+  useMergeBranch,
+  usePendingBranchPushes,
+  usePendingBranchPushIds,
+  usePendingLocalPrWrites,
+  usePrList,
+  usePush,
+  useRebaseBranch,
+  useRebaseOnto,
+  useRemoteBranches,
+  useRemotes,
+  useRepoStatus,
+  userWorktreesOptions,
+  useSetBranchArchived,
+  useStashAll,
+  useStashCount,
+  useStashPop,
+  useSwitchAutostash,
+  useUnlockUserWorktree,
+  useUpdateBranchFrom,
+  useUserWorktrees,
+} from "@/lib/git/queries";
+import { isSessionBranchName } from "@/lib/git/ref-name";
+import type {
+  Branch,
+  BranchHead,
+  ForkPrMatch,
+  RemoteBranch,
+} from "@/lib/git/types";
+import { listUserWorktrees, type UserWorktree } from "@/lib/git/worktree";
+import { secondaryClickLabel } from "@/lib/hotkeys/binding";
+import { dispatchAction, useHotkeyAction } from "@/lib/hotkeys/hotkeys";
+import { listKeyboardNav } from "@/lib/list-keyboard-nav";
+import {
+  OFFLINE_ITEM_REASON,
+  pendingItemReason,
+  refuseWhileOffline,
+  useOfflineHold,
+} from "@/lib/offline-writes";
+import {
+  LOCAL_AUDIT_STATE,
+  PR_AUDIT_TONE,
+  PR_RANK,
+  type PrAuditState,
+  REMOTE_AUDIT_STATE,
+} from "@/lib/pulls/audit";
+import { useLocalPrs } from "@/lib/pulls/queries";
+import { useSetRepoLens } from "@/lib/repo-lens/queries";
+import {
+  useAiConfigured,
+  useAiEnabled,
+  useSaveSettings,
+  useSettings,
+} from "@/lib/settings/queries";
+import { useConfirm } from "@/lib/stores/confirm";
+import {
+  landedIn,
+  refuseIfSwitched,
+  repoNameFromPath,
+} from "@/lib/stores/notifications";
+import { useStashReapplyMarker } from "@/lib/stores/stash-reapply-marker";
+import { type SelectedPr, useUiStore } from "@/lib/stores/ui";
+import {
+  isWorktreePromoting,
+  promotionBlocksCheckout,
+  useWorktreeRemovalStore,
+  useWorktreeRemovals,
+  WORKTREE_PROMOTING_MESSAGE,
+} from "@/lib/stores/worktree-removal";
+import { isAppError } from "@/lib/tauri/invoke";
+import { errorToastAction, toastError } from "@/lib/toast";
+import {
+  ARIA_DISABLED_CLASS,
+  useDisabledReason,
+} from "@/lib/use-disabled-reason";
+import { useRetained } from "@/lib/use-retained";
+import { cn } from "@/lib/utils";
+import {
+  BranchMergePickerDialog,
+  type MergeRunOptions,
+  type PickerMode,
+} from "./BranchMergePickerDialog";
+import {
+  CleanupBranchesDialog,
+  prCheckStateFrom,
+  worktreeCheckStateFrom,
+} from "./CleanupBranchesDialog";
+import { CreateBranchDialog } from "./CreateBranchDialog";
+import {
+  baseName,
+  PROMOTION_BLOCKS_CHECKOUT,
+  rowCheckoutCopy,
+} from "./checkout-copy";
+import { DeleteWorktreeDialog } from "./DeleteWorktreeDialog";
+import { ForkPrPublishGuard } from "./ForkPrPublishGuard";
+import { OperationHistoryDialog } from "./OperationHistoryDialog";
+import { PromoteWorktreeDialog } from "./PromoteWorktreeDialog";
+import { RebaseOntoDialog } from "./RebaseOntoDialog";
+import { RenameBranchDialog } from "./RenameBranchDialog";
+import { StashesDialog } from "./StashesDialog";
+import { statusReadFailed } from "./StatusReadError";
+import { SwitchWithChangesDialog } from "./SwitchWithChangesDialog";
+import {
+  STATUS_PENDING_REASON,
+  STATUS_READ_FAILED_REASON,
+} from "./sync-controls-state";
+import { repoOpenWatermark, useOpenWorktree } from "./useOpenRepoByPath";
+import {
+  reportAutostashOutcome,
+  useStashReapplyRecovery,
+} from "./useStashReapplyRecovery";
+import {
+  LockWorktreeDialog,
+  RenameWorktreeDialog,
+  refuseWhileLeaving,
+  worktreeItemLabel,
+} from "./WorktreesDialog";
+
+/** Sentence-initial form of the platform's secondary-click word — for
+ *  status-icon hints where the phrase leads a sentence. */
+const secondaryClickCapitalized =
+  secondaryClickLabel.charAt(0).toUpperCase() + secondaryClickLabel.slice(1);
+
+/** How many closed PRs the branch surfaces scan. Merged state lives only in the
+ *  closed list, and gh's default 30 covers too little history for the cleanup
+ *  dialog's merged badge. The open list keeps the default so it goes on sharing a
+ *  cache entry with the session PR audit. */
+const CLOSED_PR_SCAN_LIMIT = 100;
+
+/** How many diverged rows get their rewrite status warmed when the popover opens.
+ *  The prefetch exists to keep a right-click from painting a slot whose identity
+ *  is still in flight; each entry costs several rev-list spawns, so it is capped
+ *  rather than run per branch. Rows past the cap fall back to the waiting slot. */
+const MAX_REWRITE_PREFETCH = 4;
+
+interface BranchPr {
+  state: PrAuditState;
+  /** "#123" for a remote PR, "local" for a local-only one. */
+  label: string;
+  /** The branch this PR targets. A merge into anything but the default branch
+   *  can't stand in for "merged into the default branch". */
+  base: string;
+  select: SelectedPr;
+}
+
+/** A publish's fork-PR detection: the row it paints, the remote it would publish
+ *  to (null = git's own routing), and the repo it runs in. */
+interface PublishDetect {
+  branch: string;
+  remote: string | null;
+  repo: string;
+}
+
+/** Sentence-initial state words for the badge's own hint — the audit chip's
+ *  labels lead with "PR", which reads wrong mid-sentence here. */
+const PR_STATE_LABEL: Record<PrAuditState, string> = {
+  open: "Open",
+  draft: "Draft",
+  merged: "Merged",
+  closed: "Closed",
+};
+
+/** `branches` (already sorted) reordered by a snapshot of names: snapshot names in
+ *  snapshot order, then branches the snapshot lacks in their sorted order. Names
+ *  gone from `branches` drop out; a null snapshot keeps the sorted order. */
+function applyFrozenOrder(
+  branches: Branch[],
+  frozen: readonly string[] | null,
+): Branch[] {
+  if (frozen === null) return branches;
+  const rank = new Map(frozen.map((name, i) => [name, i] as const));
+  const known = branches
+    .filter((b) => rank.has(b.name))
+    .sort((a, b) => (rank.get(a.name) ?? 0) - (rank.get(b.name) ?? 0));
+  return [...known, ...branches.filter((b) => !rank.has(b.name))];
+}
+
+function MenuRow({
+  disabled,
+  reason,
+  onClick,
+  children,
+}: {
+  disabled?: boolean;
+  /** Why the row is held. Absent leaves an ordinary native disable — used where
+   *  the label already states the reason. */
+  reason?: string | null;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  const { blockedReason, reasonId, wrapperTitle, describedBy, nativeProps } =
+    useDisabledReason({ disabled, reason, onClick });
+  return (
+    // Block, not the span default: the row's `w-full` needs a full-width parent
+    // to size against inside the menu's block container.
+    <span
+      className={cn("block w-full", blockedReason && "cursor-not-allowed")}
+      title={wrapperTitle}
+    >
+      <button
+        {...nativeProps}
+        type="button"
+        aria-describedby={describedBy}
+        className={cn(
+          "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50",
+          ARIA_DISABLED_CLASS,
+        )}
+      >
+        {children}
+      </button>
+      {blockedReason ? (
+        <span id={reasonId} className="sr-only">
+          {blockedReason}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+export function BranchSwitcher({ repoPath }: { repoPath: string }) {
+  const status = useRepoStatus(repoPath);
+  const branches = useBranches(repoPath);
+  const defaultBranch = useDefaultBranch(repoPath);
+  const stashCount = useStashCount(repoPath);
+  const checkout = useCheckoutBranch(repoPath);
+  const checkoutRemote = useCheckoutRemoteBranch(repoPath);
+  const deleteBranch = useDeleteBranch(repoPath);
+  const deleteRemoteBranch = useDeleteRemoteBranch(repoPath);
+  const discardAll = useDiscardAll(repoPath);
+  const stashAll = useStashAll(repoPath);
+  const stashPop = useStashPop(repoPath);
+  const switchAutostash = useSwitchAutostash(repoPath);
+  const mergeBranch = useMergeBranch(repoPath);
+  const rebaseBranch = useRebaseBranch(repoPath);
+  const rebaseOnto = useRebaseOnto(repoPath);
+  const updateBranchFrom = useUpdateBranchFrom(repoPath);
+  const resetToUpstream = useBranchResetToUpstream(repoPath);
+  const hardReset = useHardResetToCommit(repoPath);
+  const push = usePush(repoPath);
+  // Push, publish and delete-on-remote hold offline rather than park: a parked
+  // one lands on the remote whenever the connection returns.
+  const offlineHold = useOfflineHold();
+  const offlineSuffix = offlineHold ? ` (${OFFLINE_ITEM_REASON})` : "";
+  const remotes = useRemotes(repoPath);
+  const setBranchArchived = useSetBranchArchived(repoPath);
+  const openWorktree = useOpenWorktree();
+  const unlockWorktree = useUnlockUserWorktree(repoPath);
+  const recovery = useStashReapplyRecovery(repoPath);
+  const settings = useSettings();
+  const saveSettings = useSaveSettings();
+  const rulesConfig = useEffectiveBranchRules(repoPath);
+  // While either rules scope is on its first read the effective config stands in
+  // as empty, so every protection check reads not-blocked — the delete surfaces
+  // hold on this rather than acting on that stand-in.
+  const rulesSettling = useEffectiveBranchRulesSettling(repoPath);
+  const amendingHash = useUiStore((s) => s.amendingHash);
+  const openSettings = useUiStore((s) => s.openSettings);
+  const aiEnabled = useAiEnabled();
+  const aiConfigured = useAiConfigured();
+
+  const [open, setOpen] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  // Remote-only branches show expanded by default (the point is to see them);
+  // archived shows collapsed (it's intentionally-hidden clutter).
+  const [showRemote, setShowRemote] = useState(true);
+  const [branchFilter, setBranchFilter] = useState("");
+  // The branch row the keyboard nav last landed on (drives arrow-key movement).
+  const [activeBranch, setActiveBranch] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const shownDeleteTarget = useRetained(deleteTarget);
+  // The delete confirm's open session: minted by openDelete with the repo it
+  // opened in, dropped by every close. The confirm is dismissible mid-delete and
+  // this switcher outlives repo switches, so a settle closes only the confirm it
+  // was fired from, never one reopened on a same-named branch here or in another
+  // repo, and a confirm answered after a switch refuses.
+  const deleteSessionRef = useRef<{ repo: string } | null>(null);
+  function openDelete(branch: string) {
+    deleteSessionRef.current = { repo: repoPath };
+    setDeleteTarget(branch);
+  }
+  function closeDelete() {
+    deleteSessionRef.current = null;
+    setDeleteTarget(null);
+  }
+  // The worktree a branch row offers to remove (resolved from `userWorktrees`).
+  const [removeWorktreeTarget, setRemoveWorktreeTarget] =
+    useState<UserWorktree | null>(null);
+  // The remote-only branch pending a server-side delete confirm. Every confirm
+  // below records the repo it opened in (`repo`, or the `…In` value itself): a
+  // confirm answered after a switch away from it refuses.
+  const [remoteDeleteTarget, setRemoteDeleteTarget] = useState<{
+    remote: string;
+    name: string;
+    repo: string;
+  } | null>(null);
+  const shownRemoteDeleteTarget = useRetained(remoteDeleteTarget);
+  const [discardAllIn, setDiscardAllIn] = useState<string | null>(null);
+  const [stashAllIn, setStashAllIn] = useState<string | null>(null);
+  const [stashPopIn, setStashPopIn] = useState<string | null>(null);
+  const [stashesOpen, setStashesOpen] = useState(false);
+  // Which view the Stashes dialog opens to — "recoverable" for "Recover lost
+  // work…" and its palette action, "stashes" otherwise.
+  const [stashesView, setStashesView] = useState<"stashes" | "recoverable">(
+    "stashes",
+  );
+  const [opHistoryOpen, setOpHistoryOpen] = useState(false);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [picker, setPicker] = useState<{
+    mode: PickerMode;
+    repo: string;
+  } | null>(null);
+  const [rebaseOntoIn, setRebaseOntoIn] = useState<string | null>(null);
+  // The publish intercepted by the fork-PR guard, with everything needed to
+  // resume it verbatim if the user publishes anyway.
+  const [forkGuard, setForkGuard] = useState<{
+    match: ForkPrMatch;
+    branch: Branch;
+    remote?: string;
+    repo: string;
+  } | null>(null);
+  // A publish's fork-PR detection in flight, with the repo it runs in: it paints
+  // the row's spinner and counts as a running push. The ref mirrors it for the
+  // fire-time guard and the hotkey continuations, which a stale render misleads.
+  const [publishDetect, setPublishDetect] = useState<PublishDetect | null>(
+    null,
+  );
+  const publishDetectRef = useRef<PublishDetect | null>(null);
+  // The pending switch target. `remote` is set only for remote-only rows, which
+  // check out via `--track <remote>/<name>` (honoring the row's promised remote
+  // + dodging multi-remote DWIM ambiguity); local switches leave it null.
+  const [switchTarget, setSwitchTarget] = useState<{
+    name: string;
+    remote: string | null;
+    repo: string;
+  } | null>(null);
+  // "Reapply after switching" — seeded from the saved preference each time the
+  // dialog opens fresh, and persisted back when the user changes it.
+  const [reapplyOnSwitch, setReapplyOnSwitch] = useState(false);
+  // Whether the user touched that checkbox since the dialog last opened. A ref
+  // because the dirty-tree refusal branch reads it after an await. It gates two
+  // things: the auto-tick there (an explicit untick is the user's call and is
+  // never overridden) and the persist below, so an auto-tick stays session-only.
+  const reapplyTouchedRef = useRef(false);
+  // Why a first switch attempt didn't work, shown when the dialog re-opens.
+  const [switchHint, setSwitchHint] = useState<string | null>(null);
+  // The worktree pending a "Promote to main workspace" confirm — set by the
+  // palette action and the branch row's worktree menu (the Worktrees dialog
+  // hosts its own promote flow).
+  const [promoteTarget, setPromoteTarget] = useState<UserWorktree | null>(null);
+  // Branch-row worktree menu targets — the rename and lock flows reuse the
+  // Worktrees dialog's own dialogs.
+  const [renameWorktreeTarget, setRenameWorktreeTarget] =
+    useState<UserWorktree | null>(null);
+  const [lockWorktreeTarget, setLockWorktreeTarget] =
+    useState<UserWorktree | null>(null);
+
+  const head = status.data?.branch;
+  const currentName = head?.name ?? null;
+  // The live branch name, readable AFTER an await. A handler's closure still holds
+  // the `currentName` of the render that created it, and `status.data` read inside
+  // one is that same render's snapshot — neither can tell whether HEAD moved
+  // during a confirmation the user left open. Same ref pattern SyncControls uses
+  // to guard its reset. Load-bearing for `git reset --hard`, which carries no
+  // branch identity: it rewrites whatever HEAD points at now.
+  const currentNameRef = useRef(currentName);
+  useEffect(() => {
+    currentNameRef.current = currentName;
+  }, [currentName]);
+  const currentLabel = head?.detached
+    ? `detached @ ${head.oid?.slice(0, 7) ?? "?"}`
+    : (currentName ?? "…");
+  // Agent-session branches (`gd/session/*`) are app-internal — never list or act
+  // on them in the switcher. Critically, a *kept* session's worktree is removed
+  // but its branch persists, so without this filter its branch would show here
+  // with Delete enabled, and `git branch -D` would destroy a branch the sessions
+  // registry still needs to Resume. (Worktrees-side exclusion doesn't cover the
+  // branch list, which comes straight from `git for-each-ref`.)
+  const allBranches = (branches.data ?? []).filter(
+    (b) => !b.name.startsWith("gd/session/"),
+  );
+  // Archived branches are hidden from the list and the merge picker.
+  const otherBranches = allBranches.filter((b) => !b.isCurrent && !b.archived);
+  const defaultName = defaultBranch.data ?? null;
+  // Merge-into-current is gated by the current branch's protection: a
+  // "require pull request" rule blocks all direct merges, and a merge-method
+  // restriction blocks the disallowed methods.
+  const lockCurrent = currentName
+    ? requiresPullRequest(rulesConfig, currentName)
+    : false;
+  // A promotion branch takes its changes through promotions, so the one-click
+  // update from the default branch is withheld (the current-branch twin of the
+  // per-row `rowPromotion`).
+  const currentPromotion = Boolean(
+    currentName && isPromotionBranch(rulesConfig, currentName),
+  );
+  const canMergeIntoCurrent =
+    !lockCurrent &&
+    (currentName
+      ? isMergeMethodAllowed(rulesConfig, currentName, "merge")
+      : true);
+  const canSquashIntoCurrent =
+    !lockCurrent &&
+    (currentName
+      ? isMergeMethodAllowed(rulesConfig, currentName, "squash")
+      : true);
+  // Ahead/behind vs. the default branch, fetched only while the menu is open.
+  const divergence = useBranchDivergence(repoPath, defaultName, open);
+  const divByName = useMemo(
+    () => new Map((divergence.data ?? []).map((d) => [d.name, d] as const)),
+    [divergence.data],
+  );
+
+  // The row whose context menu is open, when that row is DIVERGED from its own
+  // upstream — the only case worth several rev-list spawns. One slot is enough:
+  // a context menu is singular, so the probe follows whichever row was opened
+  // last and every other row renders as it always has.
+  const [rewriteProbe, setRewriteProbe] = useState<string | null>(null);
+  const rewrite = useBranchRewriteStatus(repoPath, rewriteProbe, {
+    enabled: rewriteProbe !== null,
+  });
+  const queryClient = useQueryClient();
+
+  // Warm those probes when the POPOVER opens, so a right-click a moment later
+  // paints its final identity instead of the disabled waiting slot swapping
+  // under the pointer. The probe is fast enough locally that the swap lands
+  // AFTER the menu paints, which reads as a flash; the only way to remove it is
+  // to have the answer before the menu exists. The waiting slot stays as the
+  // fallback for a genuinely slow probe.
+  //
+  // A newline-joined signature, not the array: `allBranches` gets a new identity
+  // on every branches refetch, and this must re-run when the diverged SET
+  // changes, not when its container does. Git forbids control characters in a
+  // ref name, so `\n` can't appear inside one.
+  //
+  // Capped: each entry is several rev-list spawns, and a repo where many branches
+  // are BOTH ahead and behind would otherwise fan out one probe per branch on
+  // every popover open. The rows past the cap keep the waiting slot, which is
+  // exactly what it is for. Four covers the ordinary 0-2 and leaves headroom
+  // without turning an open into a burst.
+  const divergedSignature = allBranches
+    .filter((b) => b.upstreamAhead > 0 && b.upstreamBehind > 0)
+    .slice(0, MAX_REWRITE_PREFETCH)
+    .map((b) => b.name)
+    .join("\n");
+  useEffect(() => {
+    if (!open || divergedSignature === "") return;
+    for (const name of divergedSignature.split("\n")) {
+      // `prefetchQuery` honors the options' staleTime, so a still-fresh entry
+      // costs nothing and a reopen inside 30s spawns no git at all.
+      void queryClient.prefetchQuery(
+        branchRewriteStatusOptions(repoPath, name),
+      );
+    }
+  }, [open, divergedSignature, repoPath, queryClient]);
+
+  // Per-branch PR badge: remote PRs (open + closed, the latter carrying merged)
+  // fetched while the menu OR the cleanup dialog is open AND the repo's forge
+  // reports pull-request support — mirrors the divergence gate above. The cleanup
+  // hotkey closes the menu on its way to the dialog, so gating on `open` alone
+  // would leave that dialog's merged badges permanently empty. Local PRs are not
+  // gated. Both reads are forge-neutral: they work for GitHub and GitLab alike.
+  const gh = useForgeStatus(repoPath);
+  const canGh = forgeFeatureReady(gh.data, "pullRequests");
+  const prsWanted = canGh && (open || cleanupOpen);
+  // Origin lens: the branch popover lists the FORK's own branch PRs; the
+  // fork/upstream lens is a Pulls/Issues-tab affordance.
+  const openPrs = usePrList(repoPath, prsWanted, "open", undefined, "origin");
+  const closedPrs = usePrList(
+    repoPath,
+    prsWanted,
+    "closed",
+    CLOSED_PR_SCAN_LIMIT,
+    "origin",
+  );
+  const localPrs = useLocalPrs(repoPath);
+  const openPr = useUiStore((s) => s.openPr);
+  const repoName = useUiStore((s) => s.repoName);
+  const setLens = useSetRepoLens(repoPath);
+
+  const prByBranch = useMemo(() => {
+    const map = new Map<string, BranchPr>();
+    const consider = (branchName: string, cand: BranchPr) => {
+      const cur = map.get(branchName);
+      if (!cur || PR_RANK[cand.state] > PR_RANK[cur.state]) {
+        map.set(branchName, cand);
+      }
+    };
+    // Remote PRs first, so they win ties against a local PR of equal state.
+    for (const pr of [...(openPrs.data ?? []), ...(closedPrs.data ?? [])]) {
+      // A cross-repository PR's head lives in a contributor's fork, so it must not
+      // badge a same-named local branch. Safe as a blanket skip only because both
+      // lists above are origin-pinned. A deliberately checked-out fork-PR head
+      // loses its badge too: accepted over-hide, since by name alone the two
+      // cases are indistinguishable.
+      if (pr.crossRepository) continue;
+      const state: PrAuditState =
+        pr.isDraft && pr.state === "OPEN"
+          ? "draft"
+          : (REMOTE_AUDIT_STATE[pr.state] ?? "open");
+      consider(pr.headRefName, {
+        state,
+        label: `#${pr.number}`,
+        base: pr.baseRefName,
+        select: { kind: "remote", id: String(pr.number) },
+      });
+    }
+    for (const pr of localPrs.data ?? []) {
+      const state: PrAuditState = LOCAL_AUDIT_STATE[pr.status];
+      consider(pr.head, {
+        state,
+        label: "local",
+        base: pr.base,
+        select: { kind: "local", id: pr.id },
+      });
+    }
+    return map;
+  }, [openPrs.data, closedPrs.data, localPrs.data]);
+
+  // Branch name → the merged PR that carries it, for the cleanup dialog. Remote
+  // PRs only: a local PR's merge is a real git merge, which divergence already
+  // sees, and it has no PR number to attribute the badge to. The base must be the
+  // default branch — a PR merged into a release branch or a stack parent says
+  // nothing about the default branch, which is what that dialog is about. A null
+  // `defaultName` matches nothing, so an unresolved default badges nothing.
+  const mergedPrByBranch = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const [name, pr] of prByBranch) {
+      if (
+        pr.state === "merged" &&
+        pr.select.kind === "remote" &&
+        pr.base === defaultName
+      )
+        map.set(name, pr.label);
+    }
+    return map;
+  }, [prByBranch, defaultName]);
+
+  const openPrChip = (select: SelectedPr) => {
+    // Through the store's navigator rather than a bare select + tab switch: these
+    // chips badge merged and closed PRs too, and only this door arms the align
+    // that moves the Pulls list to the tab the PR is actually on.
+    openPr({
+      kind: select.kind,
+      repoPath,
+      repoName: repoName ?? repoNameFromPath(repoPath),
+      ref: select.id,
+      section: null,
+      // A remote PR here is a fork (origin) PR — force the origin lens (which also
+      // clears any stale upstream remote selection) before navigating to it. Inside
+      // the navigator's callback, so the lens and the selection land together.
+      beforeSelect:
+        select.kind === "remote" ? () => setLens("origin") : undefined,
+    });
+    setOpen(false);
+  };
+
+  // Branches checked out in *another* worktree → that worktree's path. Git
+  // forbids the same branch in two worktrees, so these can't be checked out
+  // here; the row opens that worktree instead. The active repo's own branch is
+  // excluded (it's the one you're on). Fetched while the menu OR the cleanup
+  // dialog is open: that dialog's archive and delete exclusions read this map,
+  // and the cleanup hotkey closes the menu on its way to it.
+  const userWorktrees = useUserWorktrees(repoPath, open || cleanupOpen);
+  const activeNorm = normPath(repoPath);
+  const worktreeByBranch = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const w of userWorktrees.data ?? []) {
+      if (w.branch && normPath(w.path) !== activeNorm)
+        map.set(w.branch, w.path);
+    }
+    return map;
+  }, [userWorktrees.data, activeNorm]);
+  // Cross-worktree state (same fetch as the map above): the main workspace the
+  // banner links to, the count the Worktrees row shows, and whether you're
+  // currently in a linked (non-main) worktree — where a branch checkout lands
+  // here, not in main.
+  const worktreeList = userWorktrees.data ?? [];
+  const currentWorktree = worktreeList.find(
+    (w) => normPath(w.path) === activeNorm,
+  );
+  const mainWorktree = worktreeList.find((w) => w.isMain);
+  // Linked ones only: the main workspace isn't a "worktree" in user vocabulary,
+  // and this is the set the dialog's own empty state keys on.
+  const linkedWorktreeCount = worktreeList.filter((w) => !w.isMain).length;
+  const inLinkedWorktree = Boolean(currentWorktree && !currentWorktree.isMain);
+  // A worktree whose folder is being removed still lists (the removal outlives
+  // the dialog that started it), but nothing may act on it until it settles.
+  // Raw paths on both sides: these and the removals' come from listUserWorktrees.
+  const removals = useWorktreeRemovals(repoPath);
+  const removingPaths = new Set(removals.map((r) => r.path));
+  const currentWorktreeName = currentWorktree
+    ? baseName(currentWorktree.path)
+    : "";
+  // Default branch pinned on top, then the rest by most recently committed.
+  // Memoized: the compiler won't hoist the `.sort()` copy or the filter
+  // allocations, and these recompute on every filter keystroke otherwise.
+  const sortedBranches = useMemo(
+    () =>
+      [...allBranches].sort((a, b) => {
+        if (a.name === defaultName) return -1;
+        if (b.name === defaultName) return 1;
+        return b.lastCommitDate.localeCompare(a.lastCommitDate);
+      }),
+    [allBranches, defaultName],
+  );
+  // Row ORDER freezes while the list is open, so an update that moves a branch's
+  // commit date doesn't reorder rows under the pointer; row data stays live.
+  // Snapshotted IN the open transition, so the first open frame already paints
+  // it — `onOpenChange` and the show-branches hotkey are the only ways in.
+  const [frozenOrder, setFrozenOrder] = useState<string[] | null>(null);
+  const snapshotOrder = () => setFrozenOrder(sortedBranches.map((b) => b.name));
+  const orderedBranches = useMemo(
+    () => applyFrozenOrder(sortedBranches, frozenOrder),
+    [sortedBranches, frozenOrder],
+  );
+  const bq = branchFilter.trim().toLowerCase();
+  const visibleBranches = useMemo(
+    () =>
+      orderedBranches.filter(
+        (b) => !b.archived && (!bq || b.name.toLowerCase().includes(bq)),
+      ),
+    [orderedBranches, bq],
+  );
+  const archivedBranches = useMemo(
+    () =>
+      orderedBranches.filter(
+        (b) => b.archived && (!bq || b.name.toLowerCase().includes(bq)),
+      ),
+    [orderedBranches, bq],
+  );
+  // Both dialogs stay mounted, so the name-generation queries gate on one being
+  // open AND on AI being usable at all — otherwise a Hide-AI or unconfigured
+  // user pays for `git branch -r` plus two `git log` walks feeding a button that
+  // never renders.
+  const branchDialogOpen =
+    (createOpen || renameTarget !== null) && aiEnabled && aiConfigured;
+  // Remote-only branches, fetched while the menu is open or a branch dialog is
+  // (the dialog resolves the committed-work base off this list, and the palette
+  // can open it without the menu ever opening). Drop ones a local branch already
+  // represents (that row shows ahead/behind + PR) and gd/session/* branches;
+  // dedupe a branch on multiple remotes to one row.
+  const remoteBranchesQuery = useRemoteBranches(
+    repoPath,
+    open || branchDialogOpen,
+  );
+  // One prefetch per repo for the opens that skip the shell warm-up (notification
+  // and My work jumps), so the menu still opens with its Remote group. The hook
+  // stays open-gated; a fresh warmed entry makes this a no-op.
+  useEffect(() => {
+    if (!repoPath) return;
+    void queryClient.prefetchQuery({
+      ...remoteBranchesOptions(repoPath),
+      staleTime: REMOTE_BRANCHES_STALE_TIME,
+    });
+  }, [repoPath, queryClient]);
+  const localNames = useMemo(
+    () => new Set(allBranches.map((b) => b.name)),
+    [allBranches],
+  );
+  const remoteOnly = useMemo(() => {
+    const seen = new Set<string>();
+    return (remoteBranchesQuery.data ?? [])
+      .filter(
+        (b) =>
+          !b.name.startsWith("gd/session/") &&
+          !localNames.has(b.name) &&
+          (!bq || b.name.toLowerCase().includes(bq)),
+      )
+      .filter((b) => (seen.has(b.name) ? false : (seen.add(b.name), true)))
+      .sort((a, b) => b.lastCommitDate.localeCompare(a.lastCommitDate));
+  }, [remoteBranchesQuery.data, localNames, bq]);
+  // The ref being named, whose committed work the AI fallback describes: the
+  // rename target (which need NOT be checked out) or the checked-out branch for
+  // a create; null ⇒ both closed. Create names the BRANCH, not the literal
+  // "HEAD", so the comparison's cache key changes when you switch branches —
+  // keyed on "HEAD" a fast Generate would serve the previous branch's commits.
+  // A detached HEAD has no branch name to key on and keeps the literal.
+  const namedRef =
+    renameTarget ?? (createOpen ? (currentName ?? "HEAD") : null);
+  // The rename target's live upstream BRANCH, for the dialog's note: read off the
+  // merge ref (never the short upstream string), so a gone, local (`.`, which
+  // git reports as the remote name) or non-branch upstream gives no note.
+  const renameRow =
+    renameTarget === null
+      ? undefined
+      : branches.data?.find((b) => b.name === renameTarget);
+  const renameTargetUpstream =
+    renameRow &&
+    !renameRow.upstreamGone &&
+    renameRow.upstreamRemote &&
+    renameRow.upstreamRemote !== "." &&
+    renameRow.upstreamRemoteRef?.startsWith("refs/heads/")
+      ? {
+          remote: renameRow.upstreamRemote,
+          branch: renameRow.upstreamRemoteRef.slice("refs/heads/".length),
+        }
+      : null;
+  // The same ref in rev form: a branch by its full ref (a bare name resolves to a
+  // same-named tag first); the detached literal stays as it is.
+  const namedRev =
+    namedRef === null || namedRef === "HEAD"
+      ? namedRef
+      : `refs/heads/${namedRef}`;
+  // Until the remote list settles, a missing `origin/<default>` means "not
+  // loaded yet", not "absent" — falling back to the local default there is
+  // exactly the stale ref this base resolution exists to avoid.
+  const remoteBranchesSettled = !remoteBranchesQuery.isPending;
+  // The default branch names the comparison base, so its own lookup gates the
+  // fallback too: a null `defaultName` while it's still loading must not read as
+  // "this repo has no default branch".
+  const defaultBranchSettled = !defaultBranch.isPending;
+  // Base for the fallback. Prefer the remote-tracking ref: a stale local default
+  // skews the three-dot diff, and when origin/HEAD resolved the default name the
+  // local twin may not even exist. Null (⇒ no fallback) when neither side has it.
+  // The rev is the full ref (a bare `origin/<default>` or `<default>` resolves to a
+  // same-named tag first); the label is what the copy shows.
+  const committedBase = useMemo((): { rev: string; label: string } | null => {
+    // An errored remote list can't be trusted as a base either: no base ⇒ no
+    // fallback ⇒ the error state below renders instead of a silent local default.
+    if (
+      !branchDialogOpen ||
+      !defaultName ||
+      !remoteBranchesSettled ||
+      remoteBranchesQuery.isError
+    )
+      return null;
+    const onOrigin = (remoteBranchesQuery.data ?? []).some(
+      (b) => b.remote === "origin" && b.name === defaultName,
+    );
+    if (onOrigin)
+      return {
+        rev: `refs/remotes/origin/${defaultName}`,
+        label: `origin/${defaultName}`,
+      };
+    return localNames.has(defaultName)
+      ? { rev: `refs/heads/${defaultName}`, label: defaultName }
+      : null;
+  }, [
+    branchDialogOpen,
+    defaultName,
+    remoteBranchesSettled,
+    remoteBranchesQuery.isError,
+    remoteBranchesQuery.data,
+    localNames,
+  ]);
+  // Commits the named ref has that the default doesn't. A null base leaves the
+  // query disabled (both dialogs closed, or no resolvable default).
+  const committedCompare = useBranchAhead(
+    repoPath,
+    committedBase?.rev ?? null,
+    namedRev,
+  );
+  // Mirrors `useBranchAhead`'s own enabled condition — a query that never
+  // runs (base === compare: naming the local default with no `origin/<default>`)
+  // must not read as "still loading" forever.
+  const comparing =
+    committedBase !== null &&
+    namedRev !== null &&
+    committedBase.rev !== namedRev;
+  // Never let the affordance claim there's no committed work on evidence it
+  // doesn't have: while any input is in flight say so, and say so distinctly
+  // when the lookup failed outright.
+  const committedStatus: "ready" | "pending" | "error" = !branchDialogOpen
+    ? "ready"
+    : !defaultBranchSettled ||
+        (Boolean(defaultName) && !remoteBranchesSettled) ||
+        (comparing && committedCompare.isPending)
+      ? "pending"
+      : defaultBranch.isError ||
+          remoteBranchesQuery.isError ||
+          (comparing && committedCompare.isError)
+        ? "error"
+        : "ready";
+  const committedFallback = useMemo(() => {
+    const ahead = committedCompare.data ?? [];
+    if (!committedBase || !namedRev || ahead.length === 0) return null;
+    // `ahead` is newest-first (plain `git log base..<ref>`); cap the subjects.
+    return {
+      base: committedBase.label,
+      baseRev: committedBase.rev,
+      compare: namedRev,
+      subjects: ahead.slice(0, 30).map((c) => c.subject),
+    };
+  }, [committedBase, namedRev, committedCompare.data]);
+  // Only label rows with their remote when there's more than one to disambiguate.
+  const multipleRemotes = useMemo(
+    () =>
+      new Set((remoteBranchesQuery.data ?? []).map((b) => b.remote)).size > 1,
+    [remoteBranchesQuery.data],
+  );
+  // Arrow-key nav over the visible rows (+ archived/remote when expanded); Enter
+  // on the focused row checks out via the row button's native click.
+  const navBranches: { name: string }[] = [
+    ...visibleBranches,
+    ...(showArchived ? archivedBranches : []),
+    ...(showRemote ? remoteOnly : []),
+  ];
+  const onBranchKeyDown = listKeyboardNav({
+    items: navBranches,
+    activeIndex: navBranches.findIndex((b) => b.name === activeBranch),
+    onActivate: (b) => setActiveBranch(b.name),
+    rowKey: (b) => b.name,
+  });
+  // A row focused without the arrows (a context menu's close hands focus back to
+  // it, a click, Tab) becomes the arrows' cursor, so the next arrow moves from it.
+  const focusRow = (name: string) => {
+    if (activeBranch !== name) setActiveBranch(name);
+  };
+  const stashes = stashCount.data ?? 0;
+  const hasChanges = (status.data?.entries.length ?? 0) > 0;
+  // Which switch attempt is current. `switchTo` can suspend on the worktree
+  // lookup, and the popover reopens long before a stalled `git worktree list`
+  // returns — so a later attempt must be able to retire an earlier one rather
+  // than both acting.
+  const switchRequestRef = useRef(0);
+  // The live answer, readable AFTER an await — same pattern as `currentNameRef`.
+  // `switchTo` can resume on a worktree lookup that outlived the render it
+  // started in, and a tree that turned dirty meanwhile must still get the
+  // bring/stash choice instead of a silent checkout.
+  const hasChangesRef = useRef(hasChanges);
+  useEffect(() => {
+    hasChangesRef.current = hasChanges;
+  }, [hasChanges]);
+  // Rebase refuses only on dirty TRACKED files, so the proactive stash offer
+  // keys on this — an untracked-only tree rebases fine, and stashing it
+  // unasked would move those files into a stash on any replay conflict.
+  const hasTrackedChanges = (status.data?.entries ?? []).some(
+    (e) =>
+      e.staged !== null || (e.unstaged !== null && e.unstaged !== "untracked"),
+  );
+  // Naming a branch from changes needs a commit to diff against; an unborn HEAD
+  // (no commits) has nothing to compare the working tree to.
+  const headExists = Boolean(head?.oid);
+  // You can't amend across branches: amend mode targets a specific commit on
+  // this branch, so switching would strand the in-progress amend and leave its
+  // banner up. Lock the switcher until the user finishes or stops amending.
+  const amending = amendingHash !== null;
+  // The repo's configured remotes — ground truth for resolving a branch's
+  // upstream remote and for the per-remote Publish choices.
+  const remoteNames = remotes.data ?? [];
+
+  const onError = (e: unknown) => toastError(e);
+
+  // Awaited, not per-call callbacks: react-query drops those when the observer
+  // loses its listeners — a hidden `<Activity>` tab or an unmounted host — and
+  // the outcome would never reach the user. Every mutation below follows suit.
+  async function setArchived(name: string, archived: boolean) {
+    try {
+      await setBranchArchived.mutateAsync({ name, archived });
+      toast.success(archived ? `Archived ${name}` : `Unarchived ${name}`);
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  async function doUnlockWorktree(path: string) {
+    try {
+      await unlockWorktree.mutateAsync(path);
+      toast.success("Worktree unlocked");
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Dispatch the actual checkout — remote-only targets track a specific remote,
+  // local targets use plain switch. Both share the guards in `switchTo`. The
+  // failure handler stays per-CALLER: each one recovers differently.
+  async function runCheckout(
+    target: { name: string; remote: string | null },
+    opts?: { onError?: (e: unknown) => void },
+  ) {
+    // Read at fire time: the promote's claim never re-renders anything.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    try {
+      if (target.remote) {
+        await checkoutRemote.mutateAsync({
+          remote: target.remote,
+          name: target.name,
+        });
+      } else {
+        await checkout.mutateAsync(target.name);
+      }
+    } catch (e) {
+      opts?.onError?.(e);
+    }
+  }
+
+  // Now async: the worktree answer decides whether a row checks out or
+  // navigates, and it can still be in flight when the click lands.
+  async function switchTo(name: string, remote: string | null = null) {
+    if (amending) return; // guarded by the disabled trigger; belt-and-suspenders
+    // Claimed after the amending bail so a no-op click can't retire a real
+    // attempt that is still resolving.
+    const switchRequest = ++switchRequestRef.current;
+    setOpen(false);
+    // A branch checked out in another worktree can't be checked out here (git
+    // forbids it), so the row navigates there instead. No confirm on the badged
+    // path — the chip already says where the branch lives, and opening a folder
+    // is not a destructive act.
+    let wtPath = worktreeByBranch.get(name);
+    let resolvedHere: UserWorktree | undefined;
+    // The open-gated read hasn't answered yet, or is answering again — and only
+    // a NEGATIVE verdict is distrusted: a hit stays a hit (a listed worktree
+    // still exists, and mid-removal is `refuseWhileLeaving`'s job), but a miss
+    // is worthless from a list that is unanswered or in flight, because
+    // react-query serves the previous data through a refetch and every worktree
+    // mutation invalidates this key. (The header's always-on observer keeps the
+    // key warm under the hook's 30s staleTime, so a miss inside that window is
+    // trusted; git's own checkout refusal backstops it.) Routed through
+    // `fetchQuery` on that same key so a click during the refetch JOINS it
+    // instead of racing it with a second `git worktree list`. A failed lookup
+    // falls through to the ordinary checkout, where git refuses with its own
+    // message. Local rows only: a remote-only row's name has no local branch
+    // by construction, so no worktree can hold it and the lookup would only
+    // add a subprocess.
+    if (
+      remote === null &&
+      !wtPath &&
+      !userWorktrees.isError &&
+      (userWorktrees.data === undefined || userWorktrees.isFetching)
+    ) {
+      // A watermark, not a claim: the lookup usually ends in a plain checkout,
+      // and a claim here would retire a pending repo open on every cold click.
+      const noNewerOpen = repoOpenWatermark();
+      try {
+        // Shared options, not a second spelling: this key's `networkMode:
+        // "always"` is what keeps an offline read from PARKING forever, and a
+        // parked fetch would hang this await with the popover already closed —
+        // no navigation, no checkout, no toast. `retry: false` drops the
+        // client's one retry plus backoff when this call STARTS the fetch; a
+        // call that joins one already in flight inherits that fetch's options.
+        const wts = await queryClient.fetchQuery({
+          ...userWorktreesOptions(repoPath),
+          retry: false,
+        });
+        resolvedHere = wts.find(
+          (w) => w.branch === name && normPath(w.path) !== activeNorm,
+        );
+        wtPath = resolvedHere?.path;
+      } catch {
+        // fall through
+      }
+      // BELOW the try/catch, so every exit (resolved, rejected, found-nothing)
+      // re-takes each read that gates the global writes past here: the repo (else
+      // they hit the one the user left), the attempt (a later pick started its own
+      // switch), and amend mode (a checkout would strand it); `hasChangesRef` and
+      // the removal store read live. The reapply default stays the click render's
+      // value on purpose: it only seeds a checkbox the user then sees.
+      const live = useUiStore.getState();
+      if (
+        switchRequest !== switchRequestRef.current ||
+        live.amendingHash !== null ||
+        (wtPath !== undefined && !noNewerOpen())
+      )
+        return;
+      if (
+        refuseIfSwitched(
+          repoPath,
+          "no branch was checked out",
+          "before the switch started",
+        )
+      )
+        return;
+    }
+    if (wtPath) {
+      // Its folder is on its way out — opening it would land the app in a
+      // directory mid-deletion.
+      // Read at FIRE time, not from the render's Set: this line can run after
+      // the lookup's await, and a removal that started meanwhile would be
+      // invisible to a pre-await snapshot. `refuseWhileLeaving` already reads
+      // the promote half live; this is its removal twin.
+      if (
+        refuseWhileLeaving(
+          wtPath,
+          Boolean(
+            useWorktreeRemovalStore.getState().byRepo[repoPath]?.[wtPath],
+          ),
+        )
+      )
+        return;
+      // Awaited for its verdict: it resolves false both when the open failed
+      // (it toasts that itself) and, silently, when the user switched repos,
+      // navigated elsewhere, or started another open during its `validateRepo`
+      // and shell warm-up (useOpenWorktree's doc) — a success toast over any of
+      // those would claim a navigation that never happened.
+      // The attempt check rides INTO the open: those two awaits sit downstream
+      // of this function's guard, and a newer pick during them leaves the repo
+      // unchanged, so only the attempt identity can retire this one.
+      const navigated = await openWorktree(
+        wtPath,
+        () => switchRequest === switchRequestRef.current,
+      );
+      // Only when this call resolved the worktree itself: that state is exactly
+      // the one where the map was empty, so the row carried no chip and the whole
+      // app just changed folders with no prior signal. Say so after the fact.
+      if (navigated && resolvedHere)
+        toast.success(rowCheckoutCopy(resolvedHere.isMain).opened(wtPath));
+      return;
+    }
+    // with work in progress, let the user choose to bring or stash it
+    if (hasChangesRef.current) {
+      setSwitchHint(null);
+      setReapplyOnSwitch(settings.data?.reapplyStashOnSwitch ?? false);
+      reapplyTouchedRef.current = false;
+      setSwitchTarget({ name, remote, repo: repoPath });
+      return;
+    }
+    void runCheckout({ name, remote }, { onError });
+  }
+
+  function bringAndSwitch() {
+    if (!switchTarget) return;
+    if (refuseIfSwitched(switchTarget.repo, "no branch was checked out")) {
+      setSwitchTarget(null);
+      return;
+    }
+    // Ahead of closing the dialog, so a refusal keeps it; `runCheckout` re-checks.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    const target = switchTarget;
+    // Captured with the target: the refusal branch below runs after an await and
+    // must decide from the touched flag as it stood when THIS switch started — a
+    // dialog reopened mid-checkout owns the live values.
+    const touched = reapplyTouchedRef.current;
+    setSwitchTarget(null);
+    void runCheckout(target, {
+      onError: (e) => {
+        // git refused to carry the changes over rather than failing outright —
+        // re-open the choice with stashing pointed out, instead of a dead-end
+        // toast. Reapply is auto-ticked for this switch alone (session-only: the
+        // persist below stays gated on an explicit toggle) so the changes still
+        // come along — unless the user unticked it here, which stands.
+        if (isDirtyTreeRefusal(e)) {
+          // This lands after the checkout's await: a choice reopened in a repo
+          // the user has left could only refuse, so say what happened instead.
+          if (
+            refuseIfSwitched(
+              target.repo,
+              "no branch was checked out",
+              "before the checkout finished",
+            )
+          )
+            return;
+          if (!touched) setReapplyOnSwitch(true);
+          setSwitchHint(
+            "Bringing changes didn't work — git would overwrite them. Stash and switch instead.",
+          );
+          setSwitchTarget(target);
+          return;
+        }
+        onError(e);
+      },
+    });
+  }
+
+  // One compound (stash → switch → optionally pop) under a single repo lock,
+  // for both checkbox states — the unchecked path just skips the pop.
+  async function stashAndSwitch() {
+    if (!switchTarget) return;
+    if (refuseIfSwitched(switchTarget.repo, "no branch was checked out")) {
+      setSwitchTarget(null);
+      return;
+    }
+    // Ahead of every state write, so a refusal keeps the dialog and its choices.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    const target = switchTarget;
+    const reapply = reapplyOnSwitch;
+    setSwitchTarget(null);
+    if (
+      reapplyTouchedRef.current &&
+      settings.data &&
+      settings.data.reapplyStashOnSwitch !== reapply
+    ) {
+      // Fire-and-forget, and deliberately silent: a preference that didn't
+      // persist must neither delay the switch nor report over its outcome.
+      void saveSettings
+        .mutateAsync({ ...settings.data, reapplyStashOnSwitch: reapply })
+        .catch(() => undefined);
+    }
+    try {
+      const outcome = await switchAutostash.mutateAsync({
+        name: target.name,
+        remote: target.remote,
+        reapply,
+      });
+      reportAutostashOutcome(
+        outcome,
+        {
+          operation: "Switch",
+          reapplied: `Stashed, switched to ${target.name}, and reapplied your changes.`,
+          stashedOnly: `Stashed changes and switched to ${target.name} — "Pop latest stash" restores them`,
+          plain: `Switched to ${target.name}.`,
+          // Names the branch the switch failed to reach — more useful than the
+          // generic didn't-finish line.
+          stashKept: `Couldn't switch to ${target.name} — your changes are safely stashed; pop them when you're ready.`,
+        },
+        {
+          repoPath,
+          operationLabel: "switch",
+          detail: target.name,
+          detailPreposition: "to",
+        },
+      );
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // The dialog seeds its own form field on open; the switcher only flags which
+  // branch is being renamed.
+  function openRename(branch: string) {
+    setOpen(false);
+    // The two branch dialogs are mutually exclusive: their palette actions can
+    // fire while the other is open, and both feed the SAME committed-work
+    // lookup — leaving both open would name a new branch from the rename
+    // target's diff.
+    setCreateOpen(false);
+    setRenameTarget(branch);
+  }
+
+  async function doDelete() {
+    // Session-checked clears below an await: by the settle the confirm may have
+    // been reopened on another branch, or the same name in another repo.
+    const session = deleteSessionRef.current;
+    if (!deleteTarget || !session) return;
+    const deleteIn = session.repo;
+    const clearTarget = () => {
+      if (deleteSessionRef.current === session) closeDelete();
+    };
+    if (refuseIfSwitched(deleteIn, "nothing was deleted")) {
+      closeDelete();
+      return;
+    }
+    // The guard below reads not-blocked from the stand-in config while the rules
+    // are still loading, so it would pass vacuously — refuse instead of deleting
+    // a branch a settled rule protects.
+    if (rulesSettling) {
+      toast.error("Branch rules are still loading — try again in a moment");
+      closeDelete();
+      return;
+    }
+    // Belt-and-suspenders: the menu items are already disabled for protected
+    // branches, but guard here too in case a rule changed under an open dialog.
+    if (isDeletionBlocked(rulesConfig, deleteTarget)) {
+      toast.error(
+        `${deleteTarget} is protected from deletion by a branch rule`,
+      );
+      closeDelete();
+      return;
+    }
+    try {
+      // Between freeing its branch and checking it out, a promote leaves that
+      // branch in no checkout, so git would let it be deleted from under it.
+      if (promotionBlocksCheckout(repoPath)) {
+        toast.info(PROMOTION_BLOCKS_CHECKOUT);
+        return;
+      }
+      // git refuses to delete the checked-out branch: move off it first — onto a
+      // branch not already occupied by another worktree (that checkout fails too).
+      if (deleteTarget === currentName) {
+        // Fetch occupancy FRESH: `worktreeByBranch` only observes its query
+        // while the popover or cleanup dialog is open, and even a warm cache
+        // (the header keeps one now) can be stale for a guard this destructive.
+        let occupied: Set<string>;
+        try {
+          const wts = await listUserWorktrees(repoPath);
+          occupied = new Set(
+            wts
+              .filter(
+                (w) => w.branch && normPath(w.path) !== normPath(repoPath),
+              )
+              .map((w) => w.branch),
+          );
+        } catch {
+          occupied = new Set(worktreeByBranch.keys());
+        }
+        // A mutate past an await builds from the observer's CURRENT options, so
+        // the checkout and delete below would act on whichever repo is live now;
+        // a switch during the lookup refuses instead.
+        if (
+          refuseIfSwitched(
+            deleteIn,
+            "nothing was deleted",
+            "before the delete started",
+          )
+        )
+          return;
+        const free = (b: string | null | undefined): b is string =>
+          Boolean(b) && b !== deleteTarget && !occupied.has(b as string);
+        const fallback = free(defaultName)
+          ? defaultName
+          : otherBranches.find((b) => free(b.name))?.name;
+        if (!fallback) {
+          toast.error(
+            "Can't switch off this branch — every other branch is checked out in a worktree.",
+          );
+          clearTarget();
+          return;
+        }
+        // Below the occupancy await, so a promote that started meanwhile counts;
+        // nothing has been written yet, so the delete is refused whole.
+        if (promotionBlocksCheckout(repoPath)) {
+          toast.info(PROMOTION_BLOCKS_CHECKOUT);
+          return;
+        }
+        await checkout.mutateAsync(fallback);
+        // The same for the delete, which starts only after the checkout lands.
+        if (
+          refuseIfSwitched(
+            deleteIn,
+            `${fallback} is checked out and ${deleteTarget} was kept`,
+            `before ${deleteTarget} was deleted`,
+          )
+        )
+          return;
+      }
+      await deleteBranch.mutateAsync(deleteTarget);
+      toast.success(`Deleted ${deleteTarget}`);
+    } catch (e) {
+      onError(e);
+    } finally {
+      clearTarget();
+    }
+  }
+
+  async function doDeleteRemoteBranch() {
+    if (!remoteDeleteTarget) return;
+    const target = remoteDeleteTarget;
+    if (refuseIfSwitched(target.repo, "nothing was deleted")) {
+      setRemoteDeleteTarget(null);
+      return;
+    }
+    // The confirm can sit open across a disconnect, or from before a push started
+    // (a remote delete is a push, so it would queue behind it); refusing keeps it
+    // open.
+    if (refuseWhileOffline() || pushAlreadyActive()) return;
+    try {
+      await deleteRemoteBranch.mutateAsync({
+        remote: target.remote,
+        name: target.name,
+      });
+      toast.success(`Deleted ${target.name} on ${target.remote}`);
+    } catch (e) {
+      onError(e);
+    } finally {
+      // Functional, for the same reason as the local delete's clear: each open
+      // hands a fresh row object, so identity already marks the session.
+      setRemoteDeleteTarget((cur) => (cur === target ? null : cur));
+    }
+  }
+
+  async function doDiscardAll() {
+    try {
+      if (
+        !discardAllIn ||
+        refuseIfSwitched(discardAllIn, "nothing was discarded")
+      )
+        return;
+      await discardAll.mutateAsync(undefined);
+      toast.success("All changes discarded");
+    } catch (e) {
+      onError(e);
+    } finally {
+      setDiscardAllIn(null);
+    }
+  }
+
+  async function doStashAll() {
+    try {
+      if (!stashAllIn || refuseIfSwitched(stashAllIn, "nothing was stashed"))
+        return;
+      // A new stash buries the recorded backup, so its offer can only refuse.
+      useStashReapplyMarker.getState().clearFor(stashAllIn);
+      await stashAll.mutateAsync(undefined);
+      toast.success("Changes stashed");
+    } catch (e) {
+      onError(e);
+    } finally {
+      setStashAllIn(null);
+    }
+  }
+
+  async function doStashPop() {
+    try {
+      if (!stashPopIn || refuseIfSwitched(stashPopIn, "no stash was popped"))
+        return;
+      // A conflict here must not read as the recorded reapply's.
+      useStashReapplyMarker.getState().clearFor(stashPopIn);
+      await stashPop.mutateAsync(undefined);
+      toast.success("Stash restored");
+    } catch (e) {
+      onError(e);
+    } finally {
+      setStashPopIn(null);
+    }
+  }
+
+  // The picker dialog seeds its own branch + options on open; the switcher only
+  // flags which mode is active.
+  function openPicker(mode: PickerMode) {
+    setOpen(false);
+    setPicker({ mode, repo: repoPath });
+  }
+
+  // A merge into the current branch touches the working tree, so git refuses it
+  // outright when uncommitted changes are in the way — offer the stash → merge →
+  // reapply compound instead of a dead-end toast. `false` leaves the error to
+  // the caller.
+  function beginMergeRecovery(e: unknown, branch: string) {
+    return recovery.handleError(e, {
+      operationLabel: "merge",
+      detail: branch,
+      reappliedMessage: `Merged ${branch} and reapplied your changes.`,
+      plainMessage: `Merged ${branch}`,
+      run: { op: "merge", ref: branch },
+    });
+  }
+
+  // Rebase refuses on ANY dirty tracked file, not just one the replay would
+  // touch, so this dead-ends more often than the merge above — offer the same
+  // stash → rebase → reapply compound. `false` leaves the error to the caller.
+  function beginRebaseRecovery(e: unknown, branch: string) {
+    return recovery.handleError(e, {
+      operationLabel: "rebase",
+      detail: branch,
+      detailPreposition: "onto",
+      reappliedMessage: `Rebased onto ${branch} and reapplied your changes.`,
+      plainMessage: `Rebased onto ${branch}`,
+      run: { op: "rebase", ref: branch },
+    });
+  }
+
+  // The dialog collects the branch + options; the switcher owns the mutations
+  // (they feed `busy`) and dispatches them here after closing the picker.
+  async function runPicker(
+    mode: PickerMode,
+    branch: string,
+    options: MergeRunOptions,
+  ) {
+    const pickedIn = picker?.repo;
+    // A merge would queue on the network lock a running push holds, and a rebase
+    // would rewrite the current branch under its own push (the picker can predate
+    // the push). Refused before the picker closes, so the picked branch and
+    // options survive; a switched repo keeps its own refusal below.
+    if (pickedIn === repoPath) {
+      const refused =
+        mode === "rebase" ? refuseWhileCurrentPushes() : pushAlreadyActive();
+      if (refused) return;
+    }
+    setPicker(null);
+    const nothing =
+      mode === "rebase" ? "nothing was rebased" : "nothing was merged";
+    if (!pickedIn || refuseIfSwitched(pickedIn, nothing)) return;
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    if (mode === "rebase") {
+      try {
+        await rebaseBranch.mutateAsync(branch);
+        toast.success(`Rebased onto ${branch}`);
+      } catch (e) {
+        if (beginRebaseRecovery(e, branch)) return;
+        onError(e);
+      }
+    } else {
+      const squash = mode === "squash";
+      // Options apply to a regular merge only, not squash.
+      const noFf = mode === "merge" && options.noFf;
+      const strategy = mode === "merge" ? options.strategy : "none";
+      // The stash-and-retry compound runs a bare `merge --no-edit`, so it can
+      // only redo a merge that asked for nothing else — offering it for the
+      // others would quietly drop the option the user chose.
+      const plain = !squash && !noFf && strategy === "none";
+      try {
+        await mergeBranch.mutateAsync({ branch, squash, noFf, strategy });
+        toast.success(
+          squash
+            ? `Squashed ${branch} — changes are staged, review and commit`
+            : `Merged ${branch}`,
+        );
+      } catch (e) {
+        if (plain && beginMergeRecovery(e, branch)) return;
+        onError(e);
+      }
+    }
+  }
+
+  function openCreate() {
+    setOpen(false);
+    // Mutually exclusive with the rename dialog — see `openRename`.
+    setRenameTarget(null);
+    setCreateOpen(true);
+  }
+
+  function openRebaseOnto() {
+    setOpen(false);
+    setRebaseOntoIn(repoPath);
+  }
+
+  // The dialog collects the two branches; the switcher owns the mutation (it
+  // feeds `busy`). Conflicts leave the rebase in progress for the conflict
+  // banner, exactly like the plain rebase above.
+  //
+  // Proactive rather than error-triggered: the dialog already knows the tree is
+  // dirty, and git would refuse before touching anything, so offering the
+  // compound up front beats a round-trip that can only fail.
+  async function runRebaseOnto(newBase: string, oldBase: string) {
+    const pickedIn = rebaseOntoIn;
+    // Refused before the dialog closes, as the picker's run is.
+    if (pickedIn === repoPath && refuseWhileCurrentPushes()) return;
+    setRebaseOntoIn(null);
+    if (!pickedIn || refuseIfSwitched(pickedIn, "nothing was rebased")) return;
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    const request = {
+      operationLabel: "rebase",
+      detail: newBase,
+      detailPreposition: "onto",
+      reappliedMessage: `Rebased onto ${newBase} and reapplied your changes.`,
+      plainMessage: `Rebased onto ${newBase}`,
+      run: { op: "rebaseOnto", newBase, oldBase },
+    } as const;
+    if (hasTrackedChanges) {
+      recovery.begin(request);
+      return;
+    }
+    try {
+      await rebaseOnto.mutateAsync({ newBase, oldBase });
+      toast.success(`Rebased onto ${newBase}`);
+    } catch (e) {
+      // `hasTrackedChanges` is a query-state read that can trail the tree: a
+      // file saved between the check and the run still deserves the offer, so
+      // a dirty refusal routes back into the same recovery.
+      if (recovery.handleError(e, request)) return;
+      onError(e);
+    }
+  }
+
+  // A branch update only touches the working tree when it merges in place, i.e.
+  // when the updated branch IS the current one — the throwaway-worktree path is
+  // always clean. The branch check is belt-and-suspenders on top of the error
+  // classification; a mismatch falls through to the normal error toast.
+  function beginUpdateRecovery(e: unknown, branch: string, base: string) {
+    if (branch !== currentName) return false;
+    return recovery.handleError(e, {
+      operationLabel: "update",
+      detail: base,
+      reappliedMessage: `Updated from ${base} and reapplied your changes.`,
+      plainMessage: `Updated ${branch} from ${base}`,
+      run: { op: "merge", ref: base },
+    });
+  }
+
+  // Another checkout holds the branch and the update couldn't run there: the
+  // remedy is opening that checkout, so the refusal toasts with it as the action
+  // and any git output behind the first line rides Details in the cancel slot.
+  function toastBranchHeld(e: unknown) {
+    if (!isAppError(e) || e.kind !== "branchHeld") return false;
+    const holder = e.holder;
+    const holderEntry = (userWorktrees.data ?? []).find(
+      (w) => normPath(w.path) === normPath(holder),
+    );
+    const presentation = presentError(e);
+    toast.error(presentation.summary, {
+      duration: 8000,
+      // A session holder is a checkout the app keeps out of view (agent sessions,
+      // update husks), so only the user's own worktrees get the open remedy.
+      action:
+        e.reason === "session"
+          ? undefined
+          : {
+              label: rowCheckoutCopy(holderEntry?.isMain).open,
+              onClick: () => {
+                // Read at FIRE time: the toast outlives the render's removal
+                // snapshot, and a removal or promote may have started since.
+                if (
+                  refuseWhileLeaving(
+                    holder,
+                    Boolean(
+                      useWorktreeRemovalStore.getState().byRepo[repoPath]?.[
+                        holder
+                      ],
+                    ),
+                  )
+                )
+                  return;
+                setOpen(false);
+                void openWorktree(holder);
+              },
+            },
+      cancel: presentation.long ? errorToastAction(presentation) : undefined,
+    });
+    return true;
+  }
+
+  // The menu can outlive the state that disabled its update items, and a
+  // promote's claim never re-renders it. A worktree removal doesn't wait on the
+  // working-tree lock a holder update takes, so the two must never overlap.
+  function refuseUpdateWhileHolderLeaving(target: string) {
+    const holder = worktreeByBranch.get(target);
+    return (
+      holder !== undefined &&
+      refuseWhileLeaving(holder, removingPaths.has(holder))
+    );
+  }
+
+  // Pull the latest from the default branch into `target` without switching to
+  // it (unless it's already current): fast-forwards when possible, otherwise
+  // merges via a throwaway worktree so the working tree — and its watchers —
+  // stay put. A conflicting merge aborts and reports rather than switching.
+  async function doUpdateFromDefault(target: string) {
+    if (!defaultName || target === defaultName) return;
+    if (refuseUpdateWhilePushing(target)) return;
+    const base = defaultName;
+    // Only an in-place update can open the recovery dialog over the list; every
+    // other row updates with the popover open and refreshes in place.
+    if (target === currentName) setOpen(false);
+    // The guard below reads not-a-promotion from the stand-in config while the
+    // rules are still loading, so it would pass vacuously — refuse instead of
+    // inverting a flow a settled rule names as promotion.
+    if (rulesSettling) {
+      toast.error("Branch rules are still loading — try again in a moment");
+      return;
+    }
+    // The doors into this are already disabled for promotion branches, but a
+    // rule can change under an open menu — and this is the only refusal the
+    // hotkey path passes through.
+    if (isPromotionBranch(rulesConfig, target)) {
+      toast.error(
+        `${target} is a promotion branch — it takes changes through promotions, not updates from ${base}`,
+      );
+      return;
+    }
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    if (refuseUpdateWhileHolderLeaving(target)) return;
+    try {
+      const outcome = await updateBranchFrom.mutateAsync({
+        branch: target,
+        base,
+      });
+      toast.success(
+        outcome.outcome === "up-to-date"
+          ? `${target} is already up to date with ${base}`
+          : `Updated ${target} from ${base}`,
+      );
+    } catch (e) {
+      if (toastBranchHeld(e)) return;
+      if (!beginUpdateRecovery(e, target, base)) onError(e);
+    }
+  }
+
+  // An update moves `target`'s ref, which that branch's own push may be sending,
+  // and one of the CURRENT branch merges in place, on the network lock a push
+  // holds. Any other branch updates in a throwaway worktree, off that lock. Read at
+  // fire time, for a menu or shortcut pressed from before the push started.
+  function refuseUpdateWhilePushing(target: string): boolean {
+    if (branchPushing(target)) {
+      toast.info(BRANCH_PUSH_ACTIVE_MESSAGE);
+      return true;
+    }
+    return target === currentName && pushAlreadyActive();
+  }
+
+  // Pull `target`'s own upstream (e.g. `origin/master`) into it without checking
+  // it out — the "just merged a PR, bring master current before I switch back"
+  // flow. Merges in place when `target` is current, fast-forwards otherwise.
+  async function doUpdateFromUpstream(target: string, base: string) {
+    if (refuseUpdateWhilePushing(target)) return;
+    if (target === currentName) setOpen(false);
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    if (refuseUpdateWhileHolderLeaving(target)) return;
+    try {
+      const outcome = await updateBranchFrom.mutateAsync({
+        branch: target,
+        base,
+      });
+      toast.success(
+        outcome.outcome === "up-to-date"
+          ? `${target} is already up to date with ${base}`
+          : `Updated ${target} from ${base}`,
+      );
+    } catch (e) {
+      if (toastBranchHeld(e)) return;
+      if (!beginUpdateRecovery(e, target, base)) onError(e);
+    }
+  }
+
+  // The remedy for a branch whose upstream already carries its changes under
+  // other ids: point the branch back at that upstream instead of merging it in,
+  // which would duplicate them. `tip` is the sha the status was measured against,
+  // so a confirmed reset can only land where the copy said it would, and
+  // `localTip` the branch's own tip then, so a commit landed meanwhile refuses the
+  // reset in the backend instead of being dropped. The current branch takes the
+  // hard reset (its working tree moves too); every other branch is a ref move,
+  // which is why it works even from another checkout.
+  async function doResetToUpstream(
+    branch: Branch,
+    tip: string,
+    localTip: string,
+  ) {
+    const base = branch.upstream;
+    if (!base) return;
+    setOpen(false);
+    const treeNote = branch.isCurrent
+      ? ` Your files are rewritten to match, so commit or stash any uncommitted changes first.`
+      : "";
+    const n = branch.upstreamAhead;
+    const alreadyThere =
+      n === 1
+        ? `The only commit on ${branch.name} is already on ${base} under a different id`
+        : `All ${n} commits on ${branch.name} are already on ${base} under different ids`;
+    const resetIn = repoPath;
+    const ok = await useConfirm.getState().ask({
+      title: `Reset ${branch.name} to ${base}?`,
+      body: `${alreadyThere}, so no unique work is lost. ${branch.name} moves to ${base}'s tip.${treeNote}`,
+      confirmLabel: `Reset to ${base}`,
+      confirmVariant: "destructive",
+    });
+    if (!ok) return;
+    // Both resets build from the observer's CURRENT options once the prompt
+    // resolves, so they would act on whichever repo is live then: the hard
+    // reset's HEAD check below passes on a same-named branch there, and the ref
+    // move's `expectedTip` refuses only when that branch sits elsewhere. A switch
+    // under the prompt refuses instead.
+    if (refuseIfSwitched(resetIn, "nothing was reset")) return;
+    // Below the confirm: a promote can start while the prompt is open.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    try {
+      if (branch.isCurrent) {
+        // The confirmation above spans an await, and HEAD can move under it — an
+        // out-of-app `git switch`, or the app's own checkout. `reset --hard`
+        // names no branch, so a moved HEAD would rewrite whatever is checked out
+        // NOW to a tip measured for a branch the user is no longer on. The ref
+        // reads live; the captured name is the only branch the confirmation
+        // described. Says so rather than returning quietly: the user just
+        // confirmed a destructive action, and silence there reads as "it
+        // worked". Wording kept in step with the sync controls' twin.
+        if (currentNameRef.current !== branch.name) {
+          toast.info(
+            "HEAD moved while the dialog was open — nothing was reset.",
+          );
+          return;
+        }
+        await hardReset.mutateAsync({
+          hash: tip,
+          expectedHead: localTip,
+          expectedBranch: branch.name,
+        });
+      } else {
+        await resetToUpstream.mutateAsync({
+          branch: branch.name,
+          expectedTip: tip,
+          expectedLocalTip: localTip,
+        });
+      }
+      toast.success(`Reset ${branch.name} to ${base}`);
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Push a branch's ref without checking it out — the outbound counterpart of
+  // doUpdateFromUpstream. Whether this publishes (-u) or plain pushes is decided
+  // backend-side from the branch's tracking state. The publish arms pass an
+  // explicit `remote` (the chosen destination); a tracked push passes none and
+  // the backend resolves to the branch's own upstream remote. The list stays
+  // open: a push holds only the network lock, so the row shows its progress and
+  // the rest of the list stays usable.
+  function doPushBranch(branch: Branch, remote?: string) {
+    if (refuseWhileOffline() || pushAlreadyActive()) return;
+    if (branch.upstream && !branch.upstreamGone)
+      void runPushBranch(branch, remote);
+    else void beginPublishBranch(branch, remote);
+  }
+
+  // One push at a time, re-checked where each network-lock route fires: a menu
+  // can be stale under the pointer, and the backend would queue the route behind
+  // the push for up to a minute. The shared cache check, plus this switcher's
+  // own fork-PR detection, read live from its ref.
+  function pushAlreadyActive(): boolean {
+    if (publishDetectRef.current?.repo === repoPath) {
+      toast.info(BRANCH_PUSH_ACTIVE_MESSAGE);
+      return true;
+    }
+    return refuseWhilePushRuns(queryClient, repoPath);
+  }
+
+  // Publishing a branch that is really a local copy of a fork PR's head pushes a
+  // separate copy to this repo and leaves the PR untouched — check for that
+  // first, and let the guard offer the fork instead. Advisory: a detection
+  // failure is indistinguishable from no match and just publishes.
+  async function beginPublishBranch(branch: Branch, remote?: string) {
+    const publishIn = repoPath;
+    const mine: PublishDetect = {
+      branch: branch.name,
+      remote: remote ?? null,
+      repo: publishIn,
+    };
+    publishDetectRef.current = mine;
+    setPublishDetect(mine);
+    const match = await forgeDetectForkPrForBranch(repoPath, branch.name).catch(
+      () => null,
+    );
+    // Compare-and-clear, so a newer detection (in another repo) keeps its slot.
+    // Before any dispatch: the push's own guard must not see this detection.
+    if (publishDetectRef.current === mine) publishDetectRef.current = null;
+    setPublishDetect((cur) => (cur === mine ? null : cur));
+    // `push` builds from the live repo's options once the detection resolves,
+    // while the branch and the fork match belong to this one: a switch during
+    // the round-trip refuses rather than publish there.
+    const { live, away } = landedIn(publishIn);
+    if (!live) {
+      toast.info(
+        `Didn't publish ${branch.name}${away} — you switched repositories before the push started.`,
+      );
+      return;
+    }
+    if (match) {
+      // The guard dialog takes over from the list.
+      setOpen(false);
+      setForkGuard({ match, branch, remote, repo: publishIn });
+    } else void runPushBranch(branch, remote);
+  }
+
+  async function runPushBranch(branch: Branch, remote?: string) {
+    // The fork-PR guard's "Publish anyway" and the detection's fall-through land
+    // here without passing doPushBranch.
+    if (refuseWhileOffline() || pushAlreadyActive()) return;
+    const publishing = !branch.upstream || branch.upstreamGone;
+    try {
+      await push.mutateAsync({
+        setUpstream: false,
+        branch: branch.name,
+        remote,
+      });
+      toast.success(
+        publishing
+          ? `Published ${branch.name} to ${remote ?? "origin"}`
+          : `Pushed ${branch.name} to ${branch.upstream}`,
+      );
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Every in-flight branch update in this repo, branch → base, read from the
+  // mutation cache: the observer tracks only its latest call, and updates on
+  // different rows run in parallel.
+  const localWrites = usePendingLocalPrWrites(repoPath);
+  const updatingBase = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const w of localWrites)
+      if (w.kind === "update-from" && w.head !== null)
+        map.set(w.head, w.base ?? "");
+    return map;
+  }, [localWrites]);
+  // Stamped by the update and push items, read by the popup's click-capture
+  // handler.
+  const fallThroughGuardUntil = useRef(0);
+  // A push holds only the network lock, so it stays out of `busy`: its own row
+  // and the items that would queue on that lock hold on `pushActive` instead.
+  const busy =
+    checkout.isPending ||
+    checkoutRemote.isPending ||
+    mergeBranch.isPending ||
+    rebaseBranch.isPending ||
+    rebaseOnto.isPending ||
+    // Only an in-place update holds the surface; other rows update in parallel.
+    (currentName !== null && updatingBase.has(currentName)) ||
+    resetToUpstream.isPending ||
+    hardReset.isPending ||
+    switchAutostash.isPending ||
+    recovery.pending;
+
+  // Every push in flight in this repo, from the mutation cache, so a reopened
+  // list or a switch back still shows a push an earlier render started.
+  const pendingPushes = usePendingBranchPushes(repoPath);
+  const pendingPushIds = usePendingBranchPushIds();
+  // A HEAD push (the header's plain push) names no branch, so each is latched to
+  // the branch current when it first shows here: a checkout mid-push must not
+  // walk its spinner onto another row. State adjusted in render (never a ref:
+  // the compiler would skip the component), keyed on the mutation id so the
+  // adjust is idempotent. An id leaves only once it is pending in NO repo, so a
+  // switch away and back still finds it latched.
+  const [pushLatch, setPushLatch] = useState<Readonly<Record<number, string>>>(
+    {},
+  );
+  const nextLatch = nextPushLatch(
+    pushLatch,
+    pendingPushes,
+    pendingPushIds,
+    currentName,
+  );
+  if (nextLatch) setPushLatch(nextLatch);
+  /** The branch a pending push paints: its own, or the one its HEAD push
+   *  latched. */
+  const pushBranchOf = (p: BranchPushState): string | null =>
+    p.branch ??
+    (p.mutationId !== null && Object.hasOwn(pushLatch, p.mutationId)
+      ? pushLatch[p.mutationId]
+      : null);
+  // A detection of THIS repo counts as a push: the publish it decides is next.
+  const detectingBranch =
+    publishDetect !== null && publishDetect.repo === repoPath
+      ? publishDetect.branch
+      : null;
+  // "A push is running" in this repo — what one-push-at-a-time and the items
+  // that would queue on the network lock hold on.
+  const pushActive = pendingPushes.length > 0 || detectingBranch !== null;
+  // Feeds the parked-write copy: a push parked offline is waiting, not running.
+  const pushPaused = pendingPushes.some((p) => p.paused);
+  const pushOnBranch = (name: string) =>
+    pendingPushes.find((p) => pushBranchOf(p) === name);
+  const branchPushing = (name: string) =>
+    detectingBranch === name || pushOnBranch(name) !== undefined;
+  const currentRowPushing = currentName !== null && branchPushing(currentName);
+  const currentPushPaused =
+    currentName !== null && (pushOnBranch(currentName)?.paused ?? false);
+  // The current branch's own push holds the rebases that would rewrite it, with
+  // the pushing row's reset wording on the label.
+  const currentPushSuffix = currentRowPushing
+    ? ` (${currentPushPaused ? branchPushHoldItemReason(true) : "pushing…"})`
+    : "";
+
+  // Every "there is none" reason below derives from a query whose empty answer
+  // and whose UNANSWERED state are the same value — `?? null` for the names,
+  // `?? 0` for the counts. Asserting the absence on that value tells a user with
+  // a dirty tree on `master` that HEAD is detached and nothing is uncommitted,
+  // so no arm may assert an absence until its own read has actually answered.
+  // All four are unconditional, so `isPending` means no answer yet, including a
+  // refetch of a read that has only ever failed, which the sticky failure arm
+  // inside `unread` outranks. A failed first read leaves the SAME undefined
+  // value a pending one does, so it gets its own arm rather than the
+  // assertion — and it isn't even short-lived: the query client retries once,
+  // only `status` polls, so for branches/defaultBranch/stashCount the failure
+  // stands until a refocus or an invalidation. Each value below is null once
+  // its read has answered, and otherwise the honest reason it can't.
+  const unread = (
+    q: { isPending: boolean; errorUpdateCount: number; data: unknown },
+    checking: string,
+    failed: string,
+  ) => {
+    // Sticky and checked first: a never-loaded query that errored goes back to
+    // pending on every refetch, so `isPending` would flip it back to checking.
+    // An error over data that already landed is a failed REFRESH, not a missing
+    // answer: the row still has something true to say, so it says it.
+    if (q.data === undefined && q.errorUpdateCount > 0) return failed;
+    if (q.isPending) return checking;
+    return null;
+  };
+  const headUnread = unread(
+    status,
+    "Checking the current branch…",
+    `${STATUS_READ_FAILED_REASON}.`,
+  );
+  const changesUnread = unread(
+    status,
+    "Checking for uncommitted changes…",
+    `${STATUS_READ_FAILED_REASON}.`,
+  );
+  const defaultBranchUnread = unread(
+    defaultBranch,
+    "Checking the default branch…",
+    "Couldn't read the default branch.",
+  );
+  const branchesUnread = unread(
+    branches,
+    "Checking branches…",
+    "Couldn't read the branch list.",
+  );
+  const stashCountUnread = unread(
+    stashCount,
+    "Checking for stashes…",
+    "Couldn't read the stashes.",
+  );
+
+  // Why each multi-condition menu row is held, arms in the order that row's own
+  // `disabled` expression tests them. Null where the label already carries the
+  // reason — a row must not say it twice.
+  const renameCurrentBlockedReason = (() => {
+    switch (true) {
+      // A rename moves the ref the running push is sending.
+      case currentRowPushing:
+        return branchPushHoldReason(pushPaused);
+      case headUnread !== null:
+        return headUnread;
+      case currentName !== null && isSessionBranchName(currentName):
+        return "Agent-session branches can't be renamed — renaming one breaks the session's Resume.";
+      default:
+        return "HEAD is detached — there's no current branch to rename.";
+    }
+  })();
+  const deleteCurrentBlockedReason = (() => {
+    if (!currentName)
+      return (
+        headUnread ?? "HEAD is detached — there's no current branch to delete."
+      );
+    // Branch protection: the label already states it.
+    if (isDeletionBlocked(rulesConfig, currentName)) return null;
+    // A delete removes the ref the running push is sending.
+    if (currentRowPushing) return branchPushHoldReason(pushPaused);
+    return null;
+  })();
+  const updateFromDefaultBlockedReason = (() => {
+    if (!defaultName)
+      return defaultBranchUnread ?? "This repository has no default branch.";
+    if (!currentName)
+      return headUnread ?? "HEAD is detached — there's no branch to update.";
+    if (defaultName === currentName) return `You're already on ${defaultName}.`;
+    // An in-place update waits on the network lock a push holds.
+    if (pushActive) return branchPushHoldReason(pushPaused);
+    if (busy) return "Another git operation is running.";
+    // The remaining arm is the promotion rule, which the label already states.
+    return null;
+  })();
+  // The branch-count rows below share a shape: an unanswered branch list counts
+  // as zero, but a branch rule holds whether or not that list has landed — so an
+  // unanswered count yields to the rule arms rather than displacing them, and
+  // only a row with no rule against it reports that the list isn't in yet.
+  const mergeIntoCurrentBlockedReason = (() => {
+    if (otherBranches.length === 0) {
+      if (!branchesUnread) return "There are no other branches to merge from.";
+      if (canMergeIntoCurrent) return branchesUnread;
+    }
+    // A merge waits on the network lock a push holds.
+    if (pushActive) return branchPushHoldReason(pushPaused);
+    if (lockCurrent) return null; // the label says "(requires PR)"
+    if (!canMergeIntoCurrent)
+      return `A branch rule doesn't allow merge commits on ${currentName}.`;
+    return null;
+  })();
+  const squashIntoCurrentBlockedReason = (() => {
+    if (otherBranches.length === 0) {
+      if (!branchesUnread) return "There are no other branches to merge from.";
+      if (canSquashIntoCurrent) return branchesUnread;
+    }
+    if (pushActive) return branchPushHoldReason(pushPaused);
+    if (lockCurrent)
+      return `A branch rule requires a pull request to change ${currentName}.`;
+    if (!canSquashIntoCurrent)
+      return `A branch rule doesn't allow squash merges on ${currentName}.`;
+    return null;
+  })();
+  const rebaseCurrentBlockedReason = (() => {
+    if (otherBranches.length === 0) {
+      if (!branchesUnread) return "There are no other branches to rebase onto.";
+      if (!lockCurrent && !currentRowPushing) return branchesUnread;
+    }
+    if (lockCurrent)
+      return `A branch rule requires a pull request to change ${currentName}.`;
+    return null;
+  })();
+  const changeBaseBlockedReason = (() => {
+    if (!currentName)
+      return headUnread ?? "HEAD is detached — there's no branch to rebase.";
+    if (otherBranches.length < 2) {
+      if (!branchesUnread)
+        return "Changing the base needs at least two other branches.";
+      // `busy` and the push join the rule arms here: each is true right now,
+      // whatever the branch count turns out to be.
+      if (!lockCurrent && !busy && !currentRowPushing) return branchesUnread;
+    }
+    if (lockCurrent)
+      return `A branch rule requires a pull request to change ${currentName}.`;
+    if (busy) return "Another git operation is running.";
+    return null;
+  })();
+  const noChangesBlockedReason =
+    changesUnread ?? "There are no uncommitted changes.";
+  const popStashBlockedReason =
+    stashCountUnread ?? "There are no stashes to pop.";
+  const viewStashesBlockedReason = stashCountUnread ?? "There are no stashes.";
+
+  // Hotkey handlers reuse the menu's own flows, so every gate (clean tree,
+  // stash count, picker availability) and confirm dialog applies equally.
+  useHotkeyAction(
+    "show-branches",
+    () => {
+      if (!open) snapshotOrder();
+      setOpen(true);
+    },
+    !amending,
+  );
+  // Push-to-origin: ONE open-aware handler drives both shapes, because the popup
+  // is non-modal — a two-handler split lets a focus-outside press act on the
+  // wrong branch. The action is ORIGIN-scoped everywhere (label, help text,
+  // name), so it must never push somewhere unpredictable; enabled whenever the
+  // repo has an origin AND a target resolves (open list, or a current branch),
+  // and a non-actionable invocation gives an honest info toast rather than
+  // silence.
+  const currentBranch = branches.data?.find((b) => b.isCurrent);
+  // Held while either push-to-origin route confirms its branch: a second press
+  // during the read would otherwise start a second read and push twice. It guards
+  // only that read: an operation started meanwhile runs alongside the push, which
+  // names its branch explicitly.
+  const pushHotkeyChecking = useRef(false);
+  function refuseWhileListCatchesUp(pushIn: string) {
+    toast.info("The branch list is catching up — try again in a moment.");
+    void queryClient.invalidateQueries({
+      queryKey: repoKeys.branches(pushIn),
+    });
+  }
+  // The branch list refreshes on focus and after in-app actions, never on the
+  // status poll, so its current row can lag a checkout or tracking change made
+  // outside the app; a fresh status read confirms HEAD before this route acts.
+  async function pushCurrentBranchToOrigin(listed: Branch) {
+    if (pushHotkeyChecking.current) return;
+    // Every value the continuation acts on, pinned before the read: the repo, and
+    // the listed row whose name and destination facts decide the push. The fresh
+    // read confirms both, since the backend re-reads tracking when it pushes.
+    const pushIn = repoPath;
+    pushHotkeyChecking.current = true;
+    let fresh: BranchHead;
+    try {
+      // The factory's queryFn straight, never fetchQuery: that joins an
+      // in-flight poll, which may have been spawned before the press.
+      fresh = (await repoStatusOptions(pushIn).queryFn()).branch;
+    } catch {
+      toast.info("Couldn't confirm the current branch — nothing was pushed.");
+      return;
+    } finally {
+      pushHotkeyChecking.current = false;
+    }
+    // `push` follows the live repo, so a switch during the read refuses.
+    if (
+      refuseIfSwitched(pushIn, "nothing was pushed", "before the push started")
+    )
+      return;
+    // Structural sharing keeps an unchanged row's identity across refetches, so a
+    // different live row means the list moved under the decision during the read.
+    const liveRow = queryClient
+      .getQueryData<Branch[]>(repoKeys.branches(pushIn))
+      ?.find((b) => b.isCurrent);
+    if (
+      fresh.name !== listed.name ||
+      liveRow !== listed ||
+      !headTrackingMatchesRow(fresh, listed)
+    ) {
+      refuseWhileListCatchesUp(pushIn);
+      return;
+    }
+    pushBranchToOrigin(listed, false);
+  }
+  // Opening the list doesn't refetch it, so the highlighted row's tracking can
+  // be just as stale; a fresh branch-list read confirms it before this route acts.
+  async function pushListedBranchToOrigin(row: Branch) {
+    if (pushHotkeyChecking.current) return;
+    const pushIn = repoPath;
+    pushHotkeyChecking.current = true;
+    let freshRows: Branch[];
+    try {
+      // The api read straight, never fetchQuery: that can join a refetch spawned
+      // before the press.
+      freshRows = await gitBranches(pushIn);
+    } catch {
+      toast.info("Couldn't confirm the branch — nothing was pushed.");
+      return;
+    } finally {
+      pushHotkeyChecking.current = false;
+    }
+    if (
+      refuseIfSwitched(pushIn, "nothing was pushed", "before the push started")
+    )
+      return;
+    const freshRow = freshRows.find((b) => b.name === row.name);
+    if (!freshRow || !rowTrackingMatches(freshRow, row)) {
+      refuseWhileListCatchesUp(pushIn);
+      return;
+    }
+    pushBranchToOrigin(row, true);
+  }
+  // `fromRow`: the highlighted row of the open list, rather than the current
+  // branch; it picks where the different-name toast sends the user.
+  function pushBranchToOrigin(branch: Branch, fromRow: boolean) {
+    const tracksOrigin =
+      branch.upstreamRemote === "origin" && !branch.upstreamGone;
+    const tracksOtherKnownRemote =
+      !!branch.upstream &&
+      !branch.upstreamGone &&
+      !!branch.upstreamRemote &&
+      branch.upstreamRemote !== "origin" &&
+      remoteNames.includes(branch.upstreamRemote);
+    // The upstream's exact branch name, from its merge ref: the short upstream
+    // string can't be split (remote names may contain `/`), and a non-branch
+    // upstream (`refs/pull/N/head`) is no cross-name push.
+    const upstreamBranch = branch.upstreamRemoteRef?.startsWith("refs/heads/")
+      ? branch.upstreamRemoteRef.slice("refs/heads/".length)
+      : null;
+    if (
+      tracksOrigin &&
+      upstreamBranch !== null &&
+      upstreamBranch !== branch.name
+    ) {
+      // An origin push of this branch would land on a differently-named
+      // branch, which this origin-scoped shortcut never decides for the user.
+      toast.info(
+        fromRow
+          ? `${branch.name} tracks ${branch.upstream}, which has a different name — push it from its context menu`
+          : `${branch.name} tracks ${branch.upstream}, which has a different name — use the sync bar's Push instead`,
+      );
+    } else if (
+      tracksOrigin &&
+      branch.upstreamAhead > 0 &&
+      branch.upstreamBehind === 0
+    ) {
+      doPushBranch(branch);
+    } else if (!branch.upstream || branch.upstreamGone) {
+      // `enabled` guarantees origin exists, so this publish destination is safe.
+      doPushBranch(branch, "origin");
+    } else if (
+      tracksOrigin &&
+      branch.upstreamAhead > 0 &&
+      branch.upstreamBehind > 0
+    ) {
+      // Genuinely diverged: commits on BOTH sides. Behind-only is not
+      // divergence — it gets its own arm below.
+      toast.info(
+        `${branch.name} has diverged — update it from its upstream first`,
+      );
+    } else if (tracksOrigin && branch.upstreamBehind > 0) {
+      // Behind only: nothing local to push; the remedy is a pull, so say so.
+      toast.info(`${branch.name} is behind ${branch.upstream} — pull first`);
+    } else if (tracksOrigin) {
+      toast.info(`${branch.name} has nothing to push`);
+    } else if (branch.upstream && !branch.upstreamRemote) {
+      // Tracks a LOCAL branch (`git branch --track x main`):
+      // `%(upstream:remotename)` is empty → null upstreamRemote. There's
+      // nothing remote-related to say — and the context menu is the same
+      // authority (it offers neither Push nor Publish for these).
+      toast.info(
+        `${branch.name} tracks a local branch (${branch.upstream}), not a remote`,
+      );
+    } else if (tracksOtherKnownRemote) {
+      toast.info(
+        `${branch.name} tracks ${branch.upstreamRemote} — push it from its context menu`,
+      );
+    } else {
+      // Tracked, but the upstream's remote is no longer configured.
+      toast.info(`${branch.name} tracks a remote that's no longer configured`);
+    }
+  }
+  useHotkeyAction(
+    "push-to-origin",
+    () => {
+      // Target: the highlighted row when the list is open, else the current
+      // branch. An open list with a highlight that resolves to no local branch
+      // (a remote-only row) is a real miss, not a fallback.
+      if (open && activeBranch) {
+        const row = branches.data?.find((b) => b.name === activeBranch);
+        if (!row) {
+          toast.info("Only local branches can be pushed from here");
+          return;
+        }
+        void pushListedBranchToOrigin(row);
+        return;
+      }
+      if (!currentBranch) {
+        toast.info("No branch to push");
+        return;
+      }
+      void pushCurrentBranchToOrigin(currentBranch);
+    },
+    !busy &&
+      !offlineHold &&
+      remoteNames.includes("origin") &&
+      (open || !!currentBranch),
+  );
+
+  useHotkeyAction("new-branch", openCreate);
+  // The hotkeys a push holds stay live and refuse with the toast, so a press
+  // never goes silent; their menu rows hold with a reason instead. The rename,
+  // delete and rebase twins wait on the CURRENT branch's push: each moves or
+  // removes the ref it is sending.
+  function refuseWhileCurrentPushes(): boolean {
+    if (!currentRowPushing) return false;
+    toast.info(BRANCH_PUSH_ACTIVE_MESSAGE);
+    return true;
+  }
+  useHotkeyAction(
+    "rename-branch",
+    () => {
+      if (refuseWhileCurrentPushes()) return;
+      if (currentName) openRename(currentName);
+    },
+    Boolean(currentName) && !isSessionBranchName(currentName ?? ""),
+  );
+  useHotkeyAction(
+    "delete-branch",
+    () => {
+      if (refuseWhileCurrentPushes()) return;
+      setOpen(false);
+      if (currentName) openDelete(currentName);
+    },
+    Boolean(currentName && !isDeletionBlocked(rulesConfig, currentName)),
+  );
+  // Cleanup deletes and archives branches, the pushing one included.
+  useHotkeyAction("cleanup-branches", () => {
+    if (pushAlreadyActive()) return;
+    setOpen(false);
+    setCleanupOpen(true);
+  });
+  useHotkeyAction(
+    "update-from-default",
+    () => {
+      if (currentName) void doUpdateFromDefault(currentName);
+    },
+    Boolean(
+      defaultName &&
+        defaultName !== currentName &&
+        !busy &&
+        currentName &&
+        !currentPromotion,
+    ),
+  );
+  const defaultBranchRow = allBranches.find((b) => b.name === defaultName);
+  // The palette's own route to the same merge the row menu offers — so it needs
+  // the same refusal. There is no row rendered here to hang the probe's hook on,
+  // so it runs ON INVOCATION against the hook's own cached options: a diverged
+  // default pays one probe (usually a cache hit), and every other default spawns
+  // nothing at all.
+  async function updateDefaultFromUpstream() {
+    const row = defaultBranchRow;
+    if (!row?.upstream || row.upstreamGone) return;
+    if (row.upstreamAhead > 0 && row.upstreamBehind > 0) {
+      const updateIn = repoPath;
+      const status = await queryClient
+        .fetchQuery(branchRewriteStatusOptions(repoPath, row.name))
+        .catch(() => null);
+      // The update builds from the live repo's options once the probe resolves,
+      // while the row belongs to this one: a switch during it refuses instead.
+      if (
+        refuseIfSwitched(
+          updateIn,
+          `${row.name} wasn't updated`,
+          "before the update started",
+        )
+      )
+        return;
+      // `patchEqual > 0` is strong evidence, not proof — two sides can apply the
+      // same patch independently. It only WITHHOLDS the merge, so a false read
+      // costs an explained no-op, never a duplicated history.
+      if (status?.remoteRewritten === true && status.patchEqual > 0) {
+        // The remedy has to match what the row actually offers: only the
+        // nothing-unique case gets a reset item there. With local-only commits
+        // the row shows a disabled update and no reset, so point at the pull that
+        // keeps them.
+        const remedy =
+          status.localOnly === 0
+            ? `Open the branch menu and use the ${row.name} row's reset instead.`
+            : `Switch to ${row.name} and use Pull with rebase — it keeps the ${status.localOnly} commit${status.localOnly === 1 ? "" : "s"} only ${row.name} has.`;
+        toast.warning(
+          `${row.upstream} already carries ${row.name}'s changes under different ids — merging it in would duplicate them.`,
+          { description: remedy, duration: 10000 },
+        );
+        return;
+      }
+    }
+    void doUpdateFromUpstream(row.name, row.upstream);
+  }
+  useHotkeyAction(
+    "update-default-from-upstream",
+    () => {
+      // An update would move the ref the default's own push is sending; only an
+      // update of the CURRENT branch runs in place, on the network lock. Refused
+      // before the rewrite probe runs.
+      if (defaultBranchRow && refuseUpdateWhilePushing(defaultBranchRow.name))
+        return;
+      void updateDefaultFromUpstream();
+    },
+    Boolean(defaultBranchRow?.upstream) &&
+      !defaultBranchRow?.upstreamGone &&
+      !busy &&
+      // `busy` holds only the current branch's update; this one holds on the
+      // same per-branch read the row items use.
+      !(defaultBranchRow && updatingBase.has(defaultBranchRow.name)),
+  );
+  useHotkeyAction(
+    "merge-into-current",
+    () => {
+      if (!pushAlreadyActive()) openPicker("merge");
+    },
+    otherBranches.length > 0 && canMergeIntoCurrent,
+  );
+  useHotkeyAction(
+    "squash-merge-into-current",
+    () => {
+      if (!pushAlreadyActive()) openPicker("squash");
+    },
+    otherBranches.length > 0 && canSquashIntoCurrent,
+  );
+  useHotkeyAction(
+    "rebase-current",
+    () => {
+      if (!refuseWhileCurrentPushes()) openPicker("rebase");
+    },
+    otherBranches.length > 0 && !lockCurrent,
+  );
+  useHotkeyAction(
+    "rebase-onto-new-base",
+    () => {
+      if (!refuseWhileCurrentPushes()) openRebaseOnto();
+    },
+    Boolean(currentName) && otherBranches.length >= 2 && !lockCurrent && !busy,
+  );
+  useHotkeyAction("stash-all", () => setStashAllIn(repoPath), hasChanges);
+  useHotkeyAction("pop-stash", () => setStashPopIn(repoPath), stashes > 0);
+  useHotkeyAction(
+    "view-stashes",
+    () => {
+      setStashesView("stashes");
+      setStashesOpen(true);
+    },
+    stashes > 0,
+  );
+  // Always enabled — orphaned work commonly exists even with zero live stashes.
+  useHotkeyAction("recover-lost-work", () => {
+    setStashesView("recoverable");
+    setStashesOpen(true);
+  });
+  useHotkeyAction("operation-history", () => setOpHistoryOpen(true));
+  useHotkeyAction("discard-all", () => setDiscardAllIn(repoPath), hasChanges);
+  // Cross-worktree navigation (palette-only). They can fire while the popover is
+  // closed, so they fetch the worktree list fresh rather than read the open-gated
+  // `userWorktrees` cache, then re-check the live repo before acting: after a
+  // repo switch the answer would navigate to (or offer to promote) a worktree of
+  // the repo the user just left. `useOpenWorktree`'s own guard can't see this
+  // window — it captures the live repo when CALLED, already after this await.
+  useHotkeyAction("open-main-workspace", async () => {
+    setOpen(false);
+    // A watermark, not a claim: the lookup may end without an open.
+    const noNewerOpen = repoOpenWatermark();
+    try {
+      const wts = await listUserWorktrees(repoPath);
+      if (useUiStore.getState().repoPath !== repoPath || !noNewerOpen()) return;
+      const main = wts.find((w) => w.isMain);
+      if (!main) {
+        toast.error("Couldn't find the main workspace for this repository.");
+        return;
+      }
+      if (normPath(main.path) === normPath(repoPath)) {
+        toast.info("Already in the main workspace.");
+        return;
+      }
+      void openWorktree(main.path);
+    } catch (e) {
+      toastError(e);
+    }
+  });
+  useHotkeyAction("promote-worktree-to-main", async () => {
+    setOpen(false);
+    try {
+      const wts = await listUserWorktrees(repoPath);
+      if (useUiStore.getState().repoPath !== repoPath) return;
+      const here = wts.find((w) => normPath(w.path) === normPath(repoPath));
+      if (!here || here.isMain) {
+        toast.info(
+          "Open a linked worktree to promote its branch to the main workspace.",
+        );
+        return;
+      }
+      if (here.isDetached || !here.branch) {
+        toast.info("This worktree has no branch to promote.");
+        return;
+      }
+      if (here.isLocked) {
+        toast.info("This worktree is locked — unlock it before promoting.");
+        return;
+      }
+      // Only a promote can have claimed the worktree you're standing in: no
+      // surface offers to delete the active checkout, and a promote marks its
+      // removal under the main workspace's key, never this one's.
+      if (isWorktreePromoting(here.path)) {
+        toast.info(WORKTREE_PROMOTING_MESSAGE);
+        return;
+      }
+      setPromoteTarget(here);
+    } catch (e) {
+      toastError(e);
+    }
+  });
+
+  // Shared by the visible list and the Archived section.
+  const renderBranchRow = (branch: Branch) => {
+    const div = divByName.get(branch.name);
+    const canUpdate = Boolean(defaultName) && branch.name !== defaultName;
+    const deletionBlocked = isDeletionBlocked(rulesConfig, branch.name);
+    // A promotion branch takes its changes through promotions, so the one-click
+    // update from the default branch is withheld.
+    const rowPromotion = isPromotionBranch(rulesConfig, branch.name);
+    // An update in flight on THIS row holds only its own update items.
+    const rowUpdateBase = updatingBase.get(branch.name);
+    const rowUpdating = rowUpdateBase !== undefined;
+    // A push (or its fork check) in flight on THIS row holds the items that
+    // move or remove its ref; other rows hold only what would queue behind it.
+    const rowDetecting = detectingBranch === branch.name;
+    const rowPush = pushOnBranch(branch.name);
+    const rowPushing = rowDetecting || rowPush !== undefined;
+    // The push item's own hold: its parked copy says the push waits offline.
+    const rowPushReason = pendingItemReason(
+      rowPush?.paused ?? false,
+      "pushing…",
+    );
+    // Every other item it holds: a parked push is what waits, never that item.
+    const rowPushHeldReason = rowPush?.paused
+      ? branchPushHoldItemReason(true)
+      : "pushing…";
+    const pushRunningReason = branchPushHoldItemReason(pushPaused);
+    const rowSpinnerLabel = (() => {
+      switch (true) {
+        case rowUpdating:
+          return `Updating from ${rowUpdateBase}`;
+        case rowDetecting:
+          return branchPublishLabel(publishDetect?.remote ?? null);
+        case rowPush !== undefined:
+          return branchPushLabel(rowPush, branch);
+        default:
+          return null;
+      }
+    })();
+    // Archiving hides a branch from the branch surfaces, so it's refused for a
+    // branch that is somewhere in use: the one you're on, the default, and one
+    // another worktree has checked out. Unarchiving is never refused — an
+    // archived branch can be checked out, and this is its only way back.
+    const archiveLabel = branch.archived ? "Unarchive" : "Archive";
+    // The worktree (other than the active checkout) this branch occupies, when
+    // any — the row's whole worktree menu group hangs off it, and it narrows the
+    // object those items act on.
+    const rowWorktree = (userWorktrees.data ?? []).find(
+      (w) => w.path === worktreeByBranch.get(branch.name),
+    );
+    const inWorktree = rowWorktree !== undefined;
+    // `worktreeByBranch` admits the main workspace (it's a worktree to git, and
+    // any checkout other than the active one qualifies), so the strings that NAME
+    // this row's holding checkout come from the record instead of saying
+    // "worktree" flat.
+    const rowCopy = rowCheckoutCopy(rowWorktree?.isMain);
+    // A natively-disabled menu item swallows its tooltip, so the items `busy`
+    // alone holds carry the reason in the label. A structural reason always
+    // wins — this arm shows only where nothing else explains the dimming.
+    const busySuffix = busy ? " (operation in progress)" : "";
+    // Push and Publish: one push at a time, never while this row updates.
+    const pushItemSuffix = (() => {
+      switch (true) {
+        case rowPushing:
+          return ` (${rowPushReason})`;
+        case rowUpdating:
+          return " (updating…)";
+        case pushActive:
+          return ` (${pushRunningReason})`;
+        default:
+          return busySuffix || offlineSuffix;
+      }
+    })();
+    const pushItemDisabled =
+      rowPushing || rowUpdating || pushActive || busy || !!offlineHold;
+    // The update items hold on their own row's update and push, and on the
+    // CURRENT row also on `busy` and any push: an in-place merge must not start
+    // under another HEAD-moving op, and it waits on a push's network lock. Other
+    // rows update in a throwaway worktree, in parallel and off that lock.
+    const rowUpdateHeld =
+      rowUpdating || rowPushing || (branch.isCurrent && (busy || pushActive));
+    const updateHeldReason = (() => {
+      if (rowUpdating) return "updating…";
+      if (rowPushing) return rowPushHeldReason;
+      if (branch.isCurrent && busy) return "operation in progress";
+      if (branch.isCurrent && pushActive) return pushRunningReason;
+      return undefined;
+    })();
+    const rowWorktreeRemoving = Boolean(
+      rowWorktree && removingPaths.has(rowWorktree.path),
+    );
+    const wtLabel = (label: string, otherReason?: string) =>
+      worktreeItemLabel(label, rowWorktreeRemoving, otherReason);
+    const renameWorktreeBlockedReason = (() => {
+      if (rowWorktree?.isMain) return rowCopy.noun;
+      if (rowWorktree?.isLocked) return "locked";
+      if (rowUpdating) return "updating…";
+      return undefined;
+    })();
+    const deleteWorktreeBlockedReason = (() => {
+      if (rowWorktree?.isMain) return rowCopy.noun;
+      if (rowUpdating) return "updating…";
+      return undefined;
+    })();
+    // A promote also removes this worktree, so it races an in-flight update the
+    // same way a removal does.
+    const promoteBlockedReason = (() => {
+      if (rowWorktree?.isLocked) return "locked";
+      if (rowUpdating) return "updating…";
+      return undefined;
+    })();
+    // Best-effort by design: a null `defaultName` (still loading, or unresolvable)
+    // drops the default-branch guard rather than disabling Archive everywhere.
+    // The worktree guard is HELD rather than dropped while its read is in
+    // flight — the map is empty until it lands, which would offer Archive on a
+    // branch the answer excludes. A FAILED read falls through to best-effort:
+    // no answer is coming, and holding the item forever helps no one.
+    // A branch whose worktree is being removed is the one exception, and it
+    // reads the removal store, not the worktree list: git goes on listing a
+    // worktree until its removal finishes, and this query is gated on the menu
+    // or the cleanup dialog being open, so `inWorktree` refuses on an answer
+    // that is either still true or already stale. Promote entries are excluded
+    // by `promotePhase`: a promote removes the worktree to CHECK THAT BRANCH
+    // OUT here, so archiving it mid-flight would hide the branch you land on.
+    const archiveBlockedReason = (() => {
+      if (branch.archived) return null;
+      if (branch.isCurrent) return "current branch";
+      if (branch.name === defaultName) return "default branch";
+      // Ahead of the removal arm, whose null would leave the item enabled.
+      if (rowPushing) return rowPushHeldReason;
+      if (removals.some((r) => r.branch === branch.name && !r.promotePhase))
+        return null;
+      if (userWorktrees.data === undefined && !userWorktrees.isError)
+        return "checking worktrees…";
+      if (inWorktree) return rowCopy.blocked;
+      return null;
+    })();
+    // Outbound sync gating. `pushable` = tracked on a KNOWN remote and ahead →
+    // offer a plain push to that remote (disabled with "(diverged)" when also
+    // behind); the backend resolves to the branch's own upstream remote.
+    // `publishable` = untracked or gone AND at least one remote exists → offer
+    // Publish (one item per remote on a multi-remote repo). Hidden (not disabled)
+    // when in-sync, or tracked on a remote that no longer exists.
+    const upstreamRemote =
+      branch.upstream &&
+      !branch.upstreamGone &&
+      branch.upstreamRemote &&
+      remoteNames.includes(branch.upstreamRemote)
+        ? branch.upstreamRemote
+        : null;
+    const pushable = Boolean(upstreamRemote) && branch.upstreamAhead > 0;
+    const publishable =
+      (!branch.upstream || branch.upstreamGone) && remoteNames.length > 0;
+    // Publish destinations: origin first, then the rest alphabetical.
+    const publishRemotes = publishable
+      ? [...remoteNames].sort((a, b) =>
+          a === "origin" ? -1 : b === "origin" ? 1 : a.localeCompare(b),
+        )
+      : [];
+    // Upstream classification, for this row only while ITS menu is open. An
+    // upstream that already carries this branch's changes under other ids makes
+    // "Update from <upstream>" harmful: merging it back in duplicates them, and
+    // in a throwaway worktree it can't even run against a branch checked out
+    // elsewhere.
+    const rowDiverged = branch.upstreamAhead > 0 && branch.upstreamBehind > 0;
+    const rowProbeOpen = rowDiverged && rewriteProbe === branch.name;
+    // `isFetching` matters as much as the name match: a repo-wide invalidation
+    // leaves the previous answer served while the refetch is in flight, and that
+    // answer is the evidence a destructive confirm would quote.
+    const rowRewrite =
+      rowProbeOpen && !rewrite.isFetching ? rewrite.data : undefined;
+    // The verdict for the OPEN menu hasn't landed. This slot must never hold an
+    // ENABLED item that changes meaning underneath a pointer already aimed at it:
+    // the probe resolves a beat after the menu paints, and a merge silently
+    // becoming a destructive reset at the same coordinates is the context-menu
+    // TOCTOU class. So the slot waits, disabled, and only ever becomes enabled
+    // wearing its FINAL identity. An ERRORED probe is not pending — it falls
+    // through to the ordinary item, the same fail-safe an unprovable status takes.
+    const rowProbePending =
+      rowProbeOpen &&
+      !rewrite.isError &&
+      (rewrite.isFetching || rewrite.data === undefined);
+    // The pair, never the reflog verdict alone: offering a reset while unique
+    // local work exists would destroy it. Both measured shas ride the item, the
+    // upstream tip it lands on and the local tip the backend pins.
+    const resetTip =
+      rowRewrite?.remoteRewritten === true &&
+      rowRewrite.localOnly === 0 &&
+      rowRewrite.upstreamTip &&
+      rowRewrite.localTip
+        ? { tip: rowRewrite.upstreamTip, localTip: rowRewrite.localTip }
+        : null;
+    // Patch twins upstream AND commits without one: a reset would destroy the
+    // latter, and a merge would bring the twinned changes back in beside the
+    // copies already there. `patchEqual > 0` is strong evidence, not proof — two
+    // sides can apply the same patch independently, or cherry-pick both ways,
+    // with no rewrite involved. That is why this arm only WITHHOLDS an action:
+    // its failure direction is inaction, which the row's other items cover.
+    const rowMixedRewrite =
+      rowRewrite?.remoteRewritten === true &&
+      rowRewrite.localOnly > 0 &&
+      rowRewrite.patchEqual > 0;
+    return (
+      <ContextMenu
+        key={branch.name}
+        onOpenChange={(menuOpen) => {
+          if (menuOpen) setRewriteProbe(rowDiverged ? branch.name : null);
+          // Functional, not a captured read: right-clicking a second row closes
+          // this menu in the SAME tick the other one opens, and a batched
+          // comparison against the pre-update value would clear the new row's
+          // probe on the way out.
+          else setRewriteProbe((cur) => (cur === branch.name ? null : cur));
+        }}
+      >
+        <ContextMenuTrigger
+          render={
+            <button
+              type="button"
+              data-row={branch.name}
+              className="flex w-full flex-col gap-y-0.5 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+              onFocus={() => focusRow(branch.name)}
+              onClick={() => {
+                if (!branch.isCurrent) void switchTo(branch.name);
+              }}
+            >
+              <span className="flex w-full items-center gap-2">
+                <span
+                  className="min-w-0 flex-1 truncate"
+                  onMouseEnter={clipTitle(branch.name)}
+                >
+                  {branch.name}
+                  {branch.name === defaultName && (
+                    <span className="ml-1.5 text-[10px] text-muted-foreground">
+                      default
+                    </span>
+                  )}
+                </span>
+                {branch.isCurrent && (
+                  <CheckIcon className="size-3.5 shrink-0" />
+                )}
+              </span>
+              <span className="flex w-full items-center gap-2">
+                {(() => {
+                  const pr = prByBranch.get(branch.name);
+                  if (!pr) return null;
+                  const isLocal = pr.select.kind === "local";
+                  return (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      title={
+                        isLocal
+                          ? `${PR_STATE_LABEL[pr.state]} local pull request — open in Pull Requests`
+                          : `${PR_STATE_LABEL[pr.state]} pull request ${pr.label} — open in Pull Requests`
+                      }
+                      className={cn(
+                        "flex shrink-0 cursor-pointer items-center gap-0.5 text-[11px] tabular-nums hover:underline",
+                        PR_AUDIT_TONE[pr.state],
+                      )}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openPrChip(pr.select);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          openPrChip(pr.select);
+                        }
+                      }}
+                    >
+                      <GitPullRequestIcon className="size-3" weight="bold" />
+                      {pr.label}
+                    </span>
+                  );
+                })()}
+                {rowWorktree && (
+                  <span
+                    className="flex shrink-0 items-center gap-0.5 text-[11px] text-muted-foreground"
+                    title={rowCopy.title(rowWorktree.path)}
+                  >
+                    <TreeStructureIcon className="size-3" weight="bold" />
+                    {rowCopy.noun}
+                  </span>
+                )}
+                {/* Two distinct indicators: the sync indicator shows the
+                    branch's OWN upstream state in ARROW vocabulary (matching
+                    the header's Push/Pull counts); the divergence indicator
+                    shows drift from the DEFAULT branch as `+N −M {default}`
+                    TEXT so it can't be mistaken for unpushed work. Sync is
+                    skipped on a remoteless repo. */}
+                {remoteNames.length > 0 &&
+                  (() => {
+                    // A branch tracking a REMOVED remote offers neither Push
+                    // nor Publish, so arrows would imply an action the menu
+                    // can't honor — muted marker with a no-action title
+                    // instead. The `branch.upstreamRemote &&` conjunct keeps a
+                    // LOCAL-upstream branch (git's `%(upstream:remotename)` is
+                    // empty → null) out of this case so its truthful arrows
+                    // still show below.
+                    if (
+                      branch.upstream &&
+                      !branch.upstreamGone &&
+                      branch.upstreamRemote &&
+                      !remoteNames.includes(branch.upstreamRemote)
+                    ) {
+                      const label = `Tracks ${branch.upstream}, but that remote is no longer configured.`;
+                      return (
+                        <span
+                          role="img"
+                          aria-label={label}
+                          className="flex shrink-0 items-center text-muted-foreground"
+                          title={label}
+                        >
+                          <CloudSlashIcon className="size-3" />
+                        </span>
+                      );
+                    }
+                    if (branch.upstream && !branch.upstreamGone) {
+                      if (
+                        branch.upstreamAhead === 0 &&
+                        branch.upstreamBehind === 0
+                      ) {
+                        // In sync with the upstream — silence means synced.
+                        return null;
+                      }
+                      const parts: string[] = [];
+                      if (branch.upstreamAhead > 0)
+                        parts.push(`${branch.upstreamAhead} to push`);
+                      if (branch.upstreamBehind > 0)
+                        parts.push(`${branch.upstreamBehind} to pull`);
+                      const label = `${parts.join(", ")} — vs ${branch.upstream}`;
+                      return (
+                        <span
+                          // No text color: inherits the row foreground (a step
+                          // stronger than the muted divergence) and follows the
+                          // hover accent-foreground automatically. The arrow SVGs are
+                          // aria-hidden, so the span carries the name for readers —
+                          // role="img" because aria-label is not valid (nor reliably
+                          // announced) on a generic span.
+                          role="img"
+                          aria-label={label}
+                          className="flex shrink-0 items-center gap-1 text-[11px] tabular-nums"
+                          title={label}
+                        >
+                          {branch.upstreamAhead > 0 && (
+                            <span className="flex items-center gap-0.5">
+                              <ArrowUpIcon className="size-3" weight="bold" />
+                              {branch.upstreamAhead}
+                            </span>
+                          )}
+                          {branch.upstreamBehind > 0 && (
+                            <span className="flex items-center gap-0.5">
+                              <ArrowDownIcon className="size-3" weight="bold" />
+                              {branch.upstreamBehind}
+                            </span>
+                          )}
+                        </span>
+                      );
+                    }
+                    if (branch.upstreamGone) {
+                      const label = `Upstream ${branch.upstream} was deleted on the remote — likely merged. ${secondaryClickCapitalized} to publish again or delete.`;
+                      return (
+                        <span
+                          role="img"
+                          aria-label={label}
+                          className="flex shrink-0 items-center text-muted-foreground"
+                          title={label}
+                        >
+                          <CloudXIcon className="size-3" />
+                        </span>
+                      );
+                    }
+                    // !branch.upstream
+                    const publishHint = `Local only — never published. ${secondaryClickCapitalized} to publish.`;
+                    return (
+                      <span
+                        role="img"
+                        aria-label={publishHint}
+                        className="flex shrink-0 items-center text-muted-foreground"
+                        title={publishHint}
+                      >
+                        <CloudSlashIcon className="size-3" />
+                      </span>
+                    );
+                  })()}
+                {div &&
+                  (div.ahead > 0 || div.behind > 0) &&
+                  (() => {
+                    const parts: string[] = [];
+                    if (div.ahead > 0)
+                      parts.push(
+                        `${div.ahead} commit${div.ahead === 1 ? "" : "s"} ahead of ${defaultName}`,
+                      );
+                    if (div.behind > 0)
+                      // Behind-only must still name the base: role="img" hides the
+                      // visible {defaultName} child from AT, so the label is all
+                      // a reader gets. Skipped when the ahead part named it already.
+                      parts.push(
+                        `${div.behind} commit${div.behind === 1 ? "" : "s"} behind${div.ahead > 0 ? "" : ` ${defaultName}`}`,
+                      );
+                    const label = parts.join(", ");
+                    return (
+                      <span
+                        role="img"
+                        aria-label={label}
+                        className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground tabular-nums"
+                        title={label}
+                      >
+                        {div.ahead > 0 && <span>+{div.ahead}</span>}
+                        {div.behind > 0 && <span>{`−${div.behind}`}</span>}
+                        <span>{defaultName}</span>
+                      </span>
+                    );
+                  })()}
+                {/* The spinner takes the date's auto margin so the two sit
+                    together in the row's right cluster. One slot: an update
+                    in flight wins over a push. */}
+                {rowSpinnerLabel !== null && (
+                  <span
+                    role="img"
+                    aria-label={rowSpinnerLabel}
+                    className="ml-auto flex shrink-0 items-center text-muted-foreground"
+                    title={rowSpinnerLabel}
+                  >
+                    <CircleNotchIcon className="size-3 animate-spin" />
+                  </span>
+                )}
+                {branch.lastCommitDate && (
+                  <span
+                    className={cn(
+                      "shrink-0 text-[11px] text-muted-foreground",
+                      rowSpinnerLabel === null && "ml-auto",
+                    )}
+                  >
+                    <RelativeTime date={branch.lastCommitDate} />
+                  </span>
+                )}
+              </span>
+            </button>
+          }
+        />
+        <ContextMenuContent className="min-w-48">
+          {(canUpdate ||
+            (branch.upstream && branch.upstreamBehind > 0) ||
+            pushable ||
+            publishable) && (
+            <>
+              {canUpdate && (
+                <ContextMenuItem
+                  className={MENU_HELD_ROW_CLASS}
+                  disabled={
+                    rowUpdateHeld || rowPromotion || rowWorktreeRemoving
+                  }
+                  onClick={() => {
+                    fallThroughGuardUntil.current = Date.now() + 300;
+                    void doUpdateFromDefault(branch.name);
+                  }}
+                >
+                  {rowPromotion
+                    ? `Update from ${defaultName} (promotion branch)`
+                    : wtLabel(`Update from ${defaultName}`, updateHeldReason)}
+                </ContextMenuItem>
+              )}
+              {/* Pull the branch's own upstream in without switching — the star
+                  use case is the default branch after a PR merged upstream. An
+                  upstream that already carries this branch's changes under other
+                  ids replaces it: merging there duplicates them rather than
+                  syncing. The waiting arm comes FIRST so the slot can never be
+                  enabled while its identity is still in flight. */}
+              {branch.upstream &&
+                branch.upstreamBehind > 0 &&
+                (() => {
+                  const base = branch.upstream;
+                  // No onClick at all, not merely `disabled`: a pointer already
+                  // aimed here when the menu painted must be a hard no-op.
+                  if (rowProbePending) {
+                    return (
+                      <ContextMenuItem disabled>
+                        Update from {base} (checking the remote…)
+                      </ContextMenuItem>
+                    );
+                  }
+                  if (resetTip) {
+                    const holder = worktreeByBranch.get(branch.name);
+                    // A reset rewrites the ref a running push is sending.
+                    const resetSuffix = (() => {
+                      switch (true) {
+                        case inWorktree:
+                          return ` (checked out in ${holder})`;
+                        case rowPushing:
+                          return ` (${rowPushHeldReason})`;
+                        default:
+                          return busySuffix;
+                      }
+                    })();
+                    return (
+                      <ContextMenuItem
+                        className={MENU_HELD_ROW_CLASS}
+                        disabled={busy || inWorktree || rowPushing}
+                        onClick={() =>
+                          void doResetToUpstream(
+                            branch,
+                            resetTip.tip,
+                            resetTip.localTip,
+                          )
+                        }
+                      >
+                        Reset to {base}…{resetSuffix}
+                      </ContextMenuItem>
+                    );
+                  }
+                  if (rowMixedRewrite) {
+                    return (
+                      <ContextMenuItem disabled>
+                        Update from {base} ({base} already carries these changes
+                        under different ids — a merge would duplicate them)
+                      </ContextMenuItem>
+                    );
+                  }
+                  return (
+                    <ContextMenuItem
+                      className={MENU_HELD_ROW_CLASS}
+                      disabled={rowUpdateHeld || rowWorktreeRemoving}
+                      onClick={() => {
+                        fallThroughGuardUntil.current = Date.now() + 300;
+                        void doUpdateFromUpstream(branch.name, base);
+                      }}
+                    >
+                      {wtLabel(`Update from ${base}`, updateHeldReason)}
+                    </ContextMenuItem>
+                  );
+                })()}
+              {/* Sync-out below sync-in. Push a branch's ref to origin without
+                  checking it out — works even when the branch is checked out in
+                  another worktree, since a push touches refs, never a working
+                  tree (hence deliberately NO inWorktree gate). Diverged branches
+                  push disabled with the reason in the label; the "Update from"
+                  item above is their remedy. */}
+              {pushable && (
+                <ContextMenuItem
+                  className={MENU_HELD_ROW_CLASS}
+                  disabled={pushItemDisabled || branch.upstreamBehind > 0}
+                  onClick={() => {
+                    // The list stays open under the closing menu.
+                    fallThroughGuardUntil.current = Date.now() + 300;
+                    doPushBranch(branch);
+                  }}
+                >
+                  {branch.upstreamBehind > 0
+                    ? `Push to ${branch.upstream} (diverged)`
+                    : `Push to ${branch.upstream}${pushItemSuffix}`}
+                </ContextMenuItem>
+              )}
+              {/* Publish an unpushed / upstream-deleted branch: one remote → a
+                  single item ("Publish branch" for origin), multiple → one flat
+                  item per remote (origin first), each passing its explicit
+                  destination. */}
+              {publishRemotes.length === 1 ? (
+                <ContextMenuItem
+                  className={MENU_HELD_ROW_CLASS}
+                  disabled={pushItemDisabled}
+                  onClick={() => {
+                    fallThroughGuardUntil.current = Date.now() + 300;
+                    doPushBranch(branch, publishRemotes[0]);
+                  }}
+                >
+                  {publishRemotes[0] === "origin"
+                    ? `Publish branch${pushItemSuffix}`
+                    : `Publish to ${publishRemotes[0]}${pushItemSuffix}`}
+                </ContextMenuItem>
+              ) : (
+                publishRemotes.map((r) => (
+                  <ContextMenuItem
+                    key={r}
+                    className={MENU_HELD_ROW_CLASS}
+                    disabled={pushItemDisabled}
+                    onClick={() => {
+                      fallThroughGuardUntil.current = Date.now() + 300;
+                      doPushBranch(branch, r);
+                    }}
+                  >
+                    Publish to {r}
+                    {pushItemSuffix}
+                  </ContextMenuItem>
+                ))
+              )}
+              <ContextMenuSeparator />
+            </>
+          )}
+          <ContextMenuItem
+            className={MENU_HELD_ROW_CLASS}
+            disabled={rowUpdating || rowPushing}
+            onClick={() => openRename(branch.name)}
+          >
+            Rename branch…
+            {(() => {
+              switch (true) {
+                case rowUpdating:
+                  return " (updating…)";
+                case rowPushing:
+                  return ` (${rowPushHeldReason})`;
+                default:
+                  return "";
+              }
+            })()}
+          </ContextMenuItem>
+          <ContextMenuItem
+            onClick={() => copyText(branch.name, "Branch name copied")}
+          >
+            Copy branch name
+          </ContextMenuItem>
+          <ContextMenuItem
+            className={MENU_HELD_ROW_CLASS}
+            disabled={archiveBlockedReason !== null}
+            onClick={() => void setArchived(branch.name, !branch.archived)}
+          >
+            {archiveBlockedReason === null
+              ? archiveLabel
+              : `${archiveLabel} (${archiveBlockedReason})`}
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          {rowWorktree && (
+            <>
+              <ContextMenuItem
+                disabled={rowWorktreeRemoving}
+                onClick={() => {
+                  if (refuseWhileLeaving(rowWorktree.path, rowWorktreeRemoving))
+                    return;
+                  setOpen(false);
+                  void openWorktree(rowWorktree.path);
+                }}
+              >
+                {wtLabel(rowCopy.open)}
+              </ContextMenuItem>
+              {/* Copying a path acts on nothing, so a removal doesn't block it. */}
+              <ContextMenuItem
+                onClick={() => copyText(rowWorktree.path, "Path copied")}
+              >
+                Copy path
+              </ContextMenuItem>
+              <ContextMenuItem
+                // git worktree move refuses the main worktree and a locked one;
+                // it doesn't wait on an update running inside, so that holds too.
+                disabled={
+                  rowWorktree.isMain ||
+                  rowWorktree.isLocked ||
+                  rowWorktreeRemoving ||
+                  rowUpdating
+                }
+                onClick={() => {
+                  setOpen(false);
+                  setRenameWorktreeTarget(rowWorktree);
+                }}
+              >
+                {wtLabel("Rename worktree…", renameWorktreeBlockedReason)}
+              </ContextMenuItem>
+              {!rowWorktree.isMain &&
+                (rowWorktree.isLocked ? (
+                  <ContextMenuItem
+                    // In-place state change: the list refreshes via the
+                    // mutation's invalidation, so the popover stays open.
+                    disabled={rowWorktreeRemoving}
+                    onClick={() => {
+                      // The menu can outlive the state that disabled this item,
+                      // and a promote's claim never re-renders it.
+                      if (
+                        refuseWhileLeaving(
+                          rowWorktree.path,
+                          rowWorktreeRemoving,
+                        )
+                      )
+                        return;
+                      void doUnlockWorktree(rowWorktree.path);
+                    }}
+                  >
+                    {wtLabel("Unlock")}
+                  </ContextMenuItem>
+                ) : (
+                  <ContextMenuItem
+                    disabled={rowWorktreeRemoving}
+                    onClick={() => {
+                      setOpen(false);
+                      setLockWorktreeTarget(rowWorktree);
+                    }}
+                  >
+                    {wtLabel("Lock…")}
+                  </ContextMenuItem>
+                ))}
+              {/* Promote moves this worktree's branch into the main workspace,
+                  so it needs a linked worktree with a branch. */}
+              {!rowWorktree.isMain && !rowWorktree.isDetached && (
+                <ContextMenuItem
+                  disabled={
+                    rowWorktree.isLocked || rowWorktreeRemoving || rowUpdating
+                  }
+                  onClick={() => {
+                    setOpen(false);
+                    setPromoteTarget(rowWorktree);
+                  }}
+                >
+                  {wtLabel("Promote to main workspace…", promoteBlockedReason)}
+                </ContextMenuItem>
+              )}
+              <ContextMenuItem
+                // A removal mid-update races it: removal doesn't wait on the update's lock.
+                disabled={
+                  rowWorktree.isMain || rowWorktreeRemoving || rowUpdating
+                }
+                onClick={() => {
+                  setOpen(false);
+                  setRemoveWorktreeTarget(rowWorktree);
+                }}
+              >
+                {wtLabel("Delete worktree…", deleteWorktreeBlockedReason)}
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+            </>
+          )}
+          <ContextMenuItem
+            className={MENU_HELD_ROW_CLASS}
+            disabled={deletionBlocked || inWorktree || rowPushing}
+            onClick={() => {
+              setOpen(false);
+              openDelete(branch.name);
+            }}
+          >
+            {(() => {
+              switch (true) {
+                case deletionBlocked:
+                  return "Delete branch… (protected)";
+                case inWorktree:
+                  return `Delete branch… (${rowCopy.held})`;
+                case rowPushing:
+                  return `Delete branch… (${rowPushHeldReason})`;
+                default:
+                  return "Delete branch…";
+              }
+            })()}
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+    );
+  };
+
+  // A remote-only branch: lighter than a local row (muted, a leading "bring it
+  // down" glyph). Clicking checks it out, which `git switch` turns into a local
+  // tracking branch — routed through `switchTo` so in-progress changes are handled.
+  const renderRemoteRow = (branch: RemoteBranch) => {
+    // A protected name is protected on the remote too — reuse the local rule.
+    const deletionBlocked = isDeletionBlocked(rulesConfig, branch.name);
+    return (
+      <ContextMenu key={`remote/${branch.remote}/${branch.name}`}>
+        <ContextMenuTrigger
+          render={
+            <button
+              type="button"
+              data-row={branch.name}
+              title={`Check out ${branch.name} — creates a local branch tracking ${branch.remote}/${branch.name}`}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+              onFocus={() => focusRow(branch.name)}
+              onClick={() => void switchTo(branch.name, branch.remote)}
+            >
+              <CloudArrowDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate">{branch.name}</span>
+              {multipleRemotes && (
+                <span className="shrink-0 text-[11px] text-muted-foreground">
+                  {branch.remote}
+                </span>
+              )}
+              {branch.lastCommitDate && (
+                <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
+                  <RelativeTime date={branch.lastCommitDate} />
+                </span>
+              )}
+            </button>
+          }
+        />
+        <ContextMenuContent className="min-w-48">
+          <ContextMenuItem
+            onClick={() => void switchTo(branch.name, branch.remote)}
+          >
+            Check out
+          </ContextMenuItem>
+          <ContextMenuItem
+            onClick={() => copyText(branch.name, "Branch name copied")}
+          >
+            Copy branch name
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          {/* The Remote section dedupes a name across remotes to one row, so
+              this targets THIS row's remote; after invalidation a same-name row
+              from another remote may reappear. That's expected. */}
+          {/* Held here and at the confirm; the handler still re-checks, since
+              the connection can drop between render and press. */}
+          <ContextMenuItem
+            className={MENU_HELD_ROW_CLASS}
+            // A remote delete is a push, so it would queue on the network lock.
+            disabled={deletionBlocked || pushActive || !!offlineHold}
+            onClick={() => {
+              setOpen(false);
+              setRemoteDeleteTarget({
+                remote: branch.remote,
+                name: branch.name,
+                repo: repoPath,
+              });
+            }}
+          >
+            {(() => {
+              switch (true) {
+                case deletionBlocked:
+                  return `Delete on ${branch.remote}… (protected)`;
+                case pushActive:
+                  return `Delete on ${branch.remote}… (${branchPushHoldItemReason(pushPaused)})`;
+                default:
+                  return `Delete on ${branch.remote}…${offlineSuffix}`;
+              }
+            })()}
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+    );
+  };
+
+  // Sticky, never `isError`: a never-loaded query that errored goes back to
+  // pending on every refetch, which would flip the trigger back to its skeleton.
+  const failedRead = statusReadFailed(status);
+
+  return (
+    <>
+      <Popover.Root
+        open={open}
+        onOpenChange={(o) => {
+          if (o && !open) snapshotOrder();
+          setOpen(o);
+          if (!o) {
+            setBranchFilter("");
+            setActiveBranch(null);
+            setFrozenOrder(null);
+          }
+        }}
+      >
+        <Popover.Trigger
+          render={
+            <DisabledReasonButton
+              variant="ghost"
+              size="sm"
+              // The wrapper is the header's flex item, so it owns the cascade
+              // weight; shrink is weighted by width. In a wide header the badges
+              // (shrink-20) shrink at five times this label's rate (shrink-4)
+              // until their icon-wide floor; in a compact one they are
+              // icon-only and this label shrinks at 20 times the repo name's
+              // rate down to an 8-character floor, in the text-xs `ch` the
+              // button renders. A label of 9 characters or fewer never shrinks,
+              // so the floor can't pad it wider than its text.
+              wrapperClassName={
+                currentLabel.length > 9
+                  ? "min-w-[calc(9ch+3.125rem)] shrink-20 text-xs @4xl/repo-header:shrink-4"
+                  : "shrink-0"
+              }
+              disabled={busy || amending}
+              reason={(() => {
+                switch (true) {
+                  case amending:
+                    return "Finish or stop amending to switch branches";
+                  case busy:
+                    return "Another git operation is running.";
+                  default:
+                    return undefined;
+                }
+              })()}
+              // Mouse-only by nature; the sr-only text and the popover's
+              // notice carry the same reason to keyboard, touch and AT.
+              title={failedRead ? STATUS_READ_FAILED_REASON : undefined}
+              // overflow-hidden clips the box the shrink cascade squeezes; the
+              // shrink undoes the vendored Button's own shrink-0, or nothing
+              // truncates — without either, the icons spill out both sides
+              // into the separator and the repository menu on a narrow header.
+              className="min-w-0 shrink overflow-hidden"
+            >
+              {/* A failed read swaps the glyph, so the dash below reads as a
+                  failure by shape and never as an empty value. */}
+              {failedRead ? (
+                <WarningIcon data-icon="inline-start" />
+              ) : (
+                <GitBranchIcon data-icon="inline-start" />
+              )}
+              {(() => {
+                switch (true) {
+                  case status.data !== undefined:
+                    return (
+                      <span
+                        className="min-w-0 truncate"
+                        // Sits under the wrapper's conditional title — a static
+                        // or blanked title here would suppress that tooltip.
+                        onMouseEnter={clipTitle(currentLabel)}
+                      >
+                        {currentLabel}
+                      </span>
+                    );
+                  // A failed read holds still until the poll heals it, in the
+                  // skeleton's width so the caret doesn't move between them.
+                  case failedRead:
+                    return (
+                      <>
+                        <span
+                          aria-hidden
+                          className="inline-block w-[9ch] shrink-0 text-muted-foreground"
+                        >
+                          —
+                        </span>
+                        <span className="sr-only">
+                          {STATUS_READ_FAILED_REASON}
+                        </span>
+                      </>
+                    );
+                  // The bar holds the label floor's width, so the settled name
+                  // moves the header less. A span wearing the house Skeleton's
+                  // classes: the vendored Skeleton is a div, which a button's
+                  // phrasing content can't hold.
+                  default:
+                    return (
+                      <>
+                        <span
+                          aria-hidden
+                          className="inline-block h-3 w-[9ch] shrink-0 animate-pulse rounded-none bg-muted"
+                        />
+                        <span className="sr-only">{STATUS_PENDING_REASON}</span>
+                      </>
+                    );
+                }
+              })()}
+              {/* The compact header drops the badge rather than budget it in
+                  the label floor: the label already reads "detached @", and
+                  a shrink-0 badge there would squeeze the label to nothing. */}
+              {head?.detached && (
+                <Badge
+                  variant="secondary"
+                  className="ml-1 shrink-0 @max-4xl/repo-header:hidden"
+                >
+                  detached
+                </Badge>
+              )}
+              <CaretDownIcon data-icon="inline-end" />
+            </DisabledReasonButton>
+          }
+        />
+        <Popover.Portal>
+          <Popover.Positioner
+            align="start"
+            sideOffset={4}
+            className="isolate z-50"
+          >
+            <Popover.Popup
+              className="w-108 rounded-none bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10"
+              // Arrow keys move through the branch rows whether focus is on the
+              // filter input, a row, or the popup itself (Esc/Tab pass through).
+              onKeyDown={onBranchKeyDown}
+              // The closing context menu ignores pointer events for its ~100ms fade,
+              // so a click meant for an item that leaves the list open (update,
+              // push, publish) lands on popup content beneath it; 300ms of capture
+              // swallows it. DOM descendants only: the portaled menu is a React
+              // child here too.
+              onClickCapture={(e) => {
+                if (
+                  Date.now() < fallThroughGuardUntil.current &&
+                  e.currentTarget.contains(e.target as Node)
+                ) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
+              }}
+            >
+              {/* The trigger's title is mouse-only; this is where keyboard
+                  and touch users meet the reason. */}
+              {failedRead && (
+                <div className="flex items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px]">
+                  <span className="min-w-0 flex-1 text-muted-foreground">
+                    {STATUS_READ_FAILED_REASON}.
+                  </span>
+                </div>
+              )}
+              {inLinkedWorktree && (
+                <div className="flex items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px]">
+                  <TreeStructureIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 text-muted-foreground">
+                    In worktree{" "}
+                    <span className="font-medium text-foreground">
+                      {currentWorktreeName}
+                    </span>{" "}
+                    — a checkout lands here
+                  </span>
+                  {mainWorktree && (
+                    <button
+                      type="button"
+                      className="shrink-0 cursor-pointer font-medium text-primary hover:underline"
+                      onClick={() => {
+                        setOpen(false);
+                        void openWorktree(mainWorktree.path);
+                      }}
+                    >
+                      Open main workspace
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="border-b p-2">
+                <Input
+                  value={branchFilter}
+                  onChange={(e) => setBranchFilter(e.target.value)}
+                  placeholder="Filter branches"
+                  className="h-7"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="max-h-60 overflow-y-auto">
+                {visibleBranches.length === 0 &&
+                  archivedBranches.length === 0 &&
+                  remoteOnly.length === 0 && (
+                    <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+                      {branchFilter.trim()
+                        ? `No branches match "${branchFilter.trim()}"`
+                        : "No branches"}
+                    </p>
+                  )}
+                {visibleBranches.map(renderBranchRow)}
+                {archivedBranches.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      onClick={() => setShowArchived((v) => !v)}
+                    >
+                      <CaretDownIcon
+                        className={`size-3 transition-transform ${
+                          showArchived ? "" : "-rotate-90"
+                        }`}
+                        weight="bold"
+                      />
+                      Archived ({archivedBranches.length})
+                    </button>
+                    {showArchived && archivedBranches.map(renderBranchRow)}
+                  </>
+                )}
+                {remoteOnly.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      onClick={() => setShowRemote((v) => !v)}
+                      title="Branches on your remotes you haven't checked out yet"
+                    >
+                      <CaretDownIcon
+                        className={`size-3 transition-transform ${
+                          showRemote ? "" : "-rotate-90"
+                        }`}
+                        weight="bold"
+                      />
+                      Remote ({remoteOnly.length})
+                    </button>
+                    {showRemote && remoteOnly.map(renderRemoteRow)}
+                  </>
+                )}
+              </div>
+              <div className="border-t py-1">
+                <MenuRow onClick={openCreate}>New branch…</MenuRow>
+                <MenuRow
+                  disabled={
+                    currentRowPushing ||
+                    !currentName ||
+                    isSessionBranchName(currentName)
+                  }
+                  reason={renameCurrentBlockedReason}
+                  onClick={() => {
+                    if (!currentName || isSessionBranchName(currentName))
+                      return;
+                    openRename(currentName);
+                  }}
+                >
+                  Rename current branch…
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    !currentName ||
+                    isDeletionBlocked(rulesConfig, currentName) ||
+                    currentRowPushing
+                  }
+                  reason={deleteCurrentBlockedReason}
+                  onClick={() => {
+                    if (!currentName) return;
+                    setOpen(false);
+                    openDelete(currentName);
+                  }}
+                >
+                  {currentName && isDeletionBlocked(rulesConfig, currentName)
+                    ? "Delete current branch… (protected)"
+                    : "Delete current branch…"}
+                </MenuRow>
+                <MenuRow
+                  disabled={pushActive}
+                  reason={branchPushHoldReason(pushPaused)}
+                  onClick={() => {
+                    setOpen(false);
+                    setCleanupOpen(true);
+                  }}
+                >
+                  Clean up branches…
+                </MenuRow>
+                {/* Dispatched, not owned: RepositoryMenu holds the one
+                    WorktreesDialog instance and the one "worktrees" handler, so
+                    a second mount here would stack a duplicate dialog on top of
+                    it, and a second registration would shadow the ⋮ menu's
+                    handler (dispatch runs the newest enabled one). Direct call
+                    in the same tick, as RepoSwitcher's rows do — the palette's
+                    setTimeout exists for closing a MODAL, which a popover
+                    isn't. */}
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    if (!dispatchAction("worktrees"))
+                      toast.error("Couldn't open the worktree manager.");
+                  }}
+                >
+                  Worktrees
+                  {linkedWorktreeCount > 0 ? ` (${linkedWorktreeCount})` : ""}…
+                </MenuRow>
+              </div>
+              <div className="border-t py-1">
+                <MenuRow
+                  disabled={!hasChanges}
+                  reason={noChangesBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setDiscardAllIn(repoPath);
+                  }}
+                >
+                  Discard all changes…
+                </MenuRow>
+                <MenuRow
+                  disabled={!hasChanges}
+                  reason={noChangesBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setStashAllIn(repoPath);
+                  }}
+                >
+                  Stash all changes…
+                </MenuRow>
+                <MenuRow
+                  disabled={stashes === 0}
+                  reason={popStashBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setStashPopIn(repoPath);
+                  }}
+                >
+                  Pop latest stash{stashes > 0 ? ` (${stashes})` : ""}…
+                </MenuRow>
+                <MenuRow
+                  disabled={stashes === 0}
+                  reason={viewStashesBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setStashesView("stashes");
+                    setStashesOpen(true);
+                  }}
+                >
+                  View stashes{stashes > 0 ? ` (${stashes})` : ""}…
+                </MenuRow>
+                {/* Not gated on stash count — orphaned work commonly exists
+                    with zero live stashes. */}
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    setStashesView("recoverable");
+                    setStashesOpen(true);
+                  }}
+                >
+                  Recover lost work…
+                </MenuRow>
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    setOpHistoryOpen(true);
+                  }}
+                >
+                  Operation history…
+                </MenuRow>
+              </div>
+              <div className="border-t py-1">
+                <MenuRow
+                  disabled={
+                    !defaultName ||
+                    !currentName ||
+                    defaultName === currentName ||
+                    pushActive ||
+                    busy ||
+                    currentPromotion
+                  }
+                  reason={updateFromDefaultBlockedReason}
+                  onClick={() => {
+                    if (currentName) void doUpdateFromDefault(currentName);
+                  }}
+                >
+                  Update from {defaultName ?? "default branch"}
+                  {currentPromotion ? " (promotion branch)" : ""}
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    otherBranches.length === 0 ||
+                    pushActive ||
+                    !canMergeIntoCurrent
+                  }
+                  reason={mergeIntoCurrentBlockedReason}
+                  onClick={() => openPicker("merge")}
+                >
+                  {lockCurrent
+                    ? "Merge into current branch… (requires PR)"
+                    : "Merge into current branch…"}
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    otherBranches.length === 0 ||
+                    pushActive ||
+                    !canSquashIntoCurrent
+                  }
+                  reason={squashIntoCurrentBlockedReason}
+                  onClick={() => openPicker("squash")}
+                >
+                  Squash and merge into current branch…
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    otherBranches.length === 0 ||
+                    lockCurrent ||
+                    currentRowPushing
+                  }
+                  reason={rebaseCurrentBlockedReason}
+                  onClick={() => openPicker("rebase")}
+                >
+                  Rebase current branch…{currentPushSuffix}
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    !currentName ||
+                    otherBranches.length < 2 ||
+                    lockCurrent ||
+                    busy ||
+                    currentRowPushing
+                  }
+                  reason={changeBaseBlockedReason}
+                  onClick={openRebaseOnto}
+                >
+                  Change base…{currentPushSuffix}
+                </MenuRow>
+              </div>
+            </Popover.Popup>
+          </Popover.Positioner>
+        </Popover.Portal>
+      </Popover.Root>
+
+      <CreateBranchDialog
+        repoPath={repoPath}
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        rulesConfig={rulesConfig}
+        aiEnabled={aiEnabled}
+        aiConfigured={aiConfigured}
+        hasChanges={hasChanges}
+        headExists={headExists}
+        entries={status.data?.entries ?? []}
+        allBranchNames={allBranches.map((b) => b.name)}
+        committedFallback={committedFallback}
+        committedStatus={committedStatus}
+        currentName={currentName}
+        defaultName={defaultName}
+        onOpenSettings={openSettings}
+      />
+
+      <RenameBranchDialog
+        repoPath={repoPath}
+        target={renameTarget}
+        targetUpstream={renameTargetUpstream}
+        currentName={currentName}
+        onClose={() => setRenameTarget(null)}
+        aiEnabled={aiEnabled}
+        aiConfigured={aiConfigured}
+        hasChanges={hasChanges}
+        headExists={headExists}
+        entries={status.data?.entries ?? []}
+        allBranchNames={allBranches.map((b) => b.name)}
+        committedFallback={committedFallback}
+        committedStatus={committedStatus}
+        onOpenSettings={openSettings}
+      />
+
+      <CleanupBranchesDialog
+        repoPath={repoPath}
+        open={cleanupOpen}
+        onClose={() => setCleanupOpen(false)}
+        branches={allBranches}
+        defaultBranch={defaultName}
+        currentBranch={currentName}
+        isProtected={(name) => isDeletionBlocked(rulesConfig, name)}
+        // Until both rules scopes land, `isProtected` excludes nothing, so the
+        // dialog holds its list rather than offering a branch a rule refuses.
+        rulesSettling={rulesSettling}
+        isInWorktree={(name) => worktreeByBranch.has(name)}
+        // From the removal store, not the worktree read: `isInWorktree` still
+        // matches a worktree git lists until its removal finishes, and that
+        // read is gated on this menu or the dialog being open, so it can lag —
+        // either way the exclusion holds a branch already on its way out. A
+        // promote's removal (`promotePhase`) doesn't count: it frees the branch
+        // to check it out here, and archiving would hide what you land on.
+        isWorktreeRemoving={(name) =>
+          removals.some((r) => r.branch === name && !r.promotePhase)
+        }
+        // The map is empty until the read lands and stays empty if it fails, so
+        // the dialog is told which, and holds its list rather than acting on an
+        // exclusion that isn't answering yet.
+        worktreeCheckState={worktreeCheckStateFrom(userWorktrees)}
+        prMergedByBranch={mergedPrByBranch}
+        // Only the closed list carries merged PRs, and `canGh` is what says the
+        // query runs at all — so the dialog is told which of the four it got,
+        // never-ran included.
+        prCheckState={prCheckStateFrom(canGh, closedPrs)}
+        // react-query's own signal for "offline": networkMode "online" parks the
+        // fetch, which is otherwise indistinguishable from one in flight.
+        prCheckPaused={closedPrs.fetchStatus === "paused"}
+      />
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onCancel={closeDelete}
+        title="Delete branch?"
+        body={
+          <>
+            Deletes {shownDeleteTarget} locally, including commits that exist
+            only on it.
+            {shownDeleteTarget === currentName &&
+              " You'll be switched to another branch first."}
+          </>
+        }
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        pending={deleteBranch.isPending || checkout.isPending}
+        onConfirm={doDelete}
+      />
+
+      <ConfirmDialog
+        open={remoteDeleteTarget !== null}
+        onCancel={() => setRemoteDeleteTarget(null)}
+        title={
+          shownRemoteDeleteTarget
+            ? `Delete branch on ${shownRemoteDeleteTarget.remote}?`
+            : "Delete branch on remote?"
+        }
+        body={
+          shownRemoteDeleteTarget ? (
+            <>
+              Deletes{" "}
+              <span className="font-mono">{shownRemoteDeleteTarget.name}</span>{" "}
+              from{" "}
+              <span className="font-mono">
+                {shownRemoteDeleteTarget.remote}
+              </span>{" "}
+              for everyone using that remote. This is a server-side delete and
+              can't be undone from the app.
+            </>
+          ) : null
+        }
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        pending={deleteRemoteBranch.isPending}
+        // A remote delete is a push: it waits out a running one, as an offline
+        // hold would (the handler re-checks at the press).
+        heldReason={pushActive ? branchPushHoldReason(pushPaused) : offlineHold}
+        onConfirm={doDeleteRemoteBranch}
+      />
+
+      <DeleteWorktreeDialog
+        key={removeWorktreeTarget?.path ?? "no-remove"}
+        repoPath={repoPath}
+        worktree={removeWorktreeTarget}
+        onClose={() => setRemoveWorktreeTarget(null)}
+      />
+
+      <StashesDialog
+        repoPath={repoPath}
+        open={stashesOpen}
+        onOpenChange={setStashesOpen}
+        initialView={stashesView}
+      />
+
+      <OperationHistoryDialog
+        repoPath={repoPath}
+        open={opHistoryOpen}
+        onOpenChange={setOpHistoryOpen}
+      />
+
+      <ConfirmDialog
+        open={discardAllIn !== null}
+        onCancel={() => setDiscardAllIn(null)}
+        title="Discard all changes?"
+        body="All uncommitted changes are discarded: tracked files reset to the last commit, untracked files move to the recycle bin."
+        confirmLabel="Discard all"
+        confirmVariant="destructive"
+        pending={discardAll.isPending}
+        onConfirm={doDiscardAll}
+      />
+
+      <ConfirmDialog
+        open={stashAllIn !== null}
+        onCancel={() => setStashAllIn(null)}
+        title="Stash all changes?"
+        body={
+          'Sets your working tree back to the last commit and saves all uncommitted changes — including untracked files — to the stash. "Pop latest stash" restores them.'
+        }
+        confirmLabel="Stash changes"
+        pending={stashAll.isPending}
+        onConfirm={doStashAll}
+      />
+
+      <ConfirmDialog
+        open={stashPopIn !== null}
+        onCancel={() => setStashPopIn(null)}
+        title="Pop latest stash?"
+        body="Applies the most recent stash to your working tree and removes it from the stash list. If applying conflicts, the stash is kept."
+        confirmLabel="Pop stash"
+        pending={stashPop.isPending}
+        onConfirm={doStashPop}
+      />
+
+      <BranchMergePickerDialog
+        repoPath={repoPath}
+        mode={picker?.mode ?? null}
+        onClose={() => setPicker(null)}
+        onRun={runPicker}
+        otherBranches={otherBranches}
+        currentLabel={currentLabel}
+      />
+
+      <RebaseOntoDialog
+        repoPath={repoPath}
+        open={rebaseOntoIn !== null}
+        onClose={() => setRebaseOntoIn(null)}
+        onRun={runRebaseOnto}
+        otherBranches={otherBranches}
+        currentLabel={currentLabel}
+        defaultBranch={defaultName}
+        isPushed={Boolean(head?.upstream) && !head?.upstreamGone}
+      />
+
+      <ForkPrPublishGuard
+        // The repo the match was detected in, which its fork push targets.
+        repoPath={forkGuard?.repo ?? repoPath}
+        match={forkGuard?.match ?? null}
+        branch={forkGuard?.branch.name ?? ""}
+        destination={forkGuard?.remote ?? "origin"}
+        onClose={() => setForkGuard(null)}
+        onPublishAnyway={() => {
+          // Refused before the dialog closes, so it stays to retry from.
+          if (forkGuard?.repo === repoPath && pushAlreadyActive()) return;
+          setForkGuard(null);
+          if (
+            forkGuard &&
+            !refuseIfSwitched(forkGuard.repo, "nothing was published")
+          )
+            void runPushBranch(forkGuard.branch, forkGuard.remote);
+        }}
+      />
+
+      <SwitchWithChangesDialog
+        target={switchTarget}
+        currentLabel={currentLabel}
+        hint={switchHint}
+        reapply={reapplyOnSwitch}
+        onReapplyChange={(v) => {
+          reapplyTouchedRef.current = true;
+          setReapplyOnSwitch(v);
+        }}
+        onCancel={() => setSwitchTarget(null)}
+        onBringChanges={bringAndSwitch}
+        onStashAndSwitch={stashAndSwitch}
+      />
+
+      {recovery.dialog}
+
+      <PromoteWorktreeDialog
+        key={promoteTarget?.path ?? "no-promote"}
+        repoPath={repoPath}
+        worktree={promoteTarget}
+        onClose={() => setPromoteTarget(null)}
+      />
+
+      <RenameWorktreeDialog
+        key={renameWorktreeTarget?.path ?? "no-rename"}
+        repoPath={repoPath}
+        worktree={renameWorktreeTarget}
+        onClose={() => setRenameWorktreeTarget(null)}
+      />
+
+      <LockWorktreeDialog
+        key={lockWorktreeTarget?.path ?? "no-lock"}
+        repoPath={repoPath}
+        worktree={lockWorktreeTarget}
+        onClose={() => setLockWorktreeTarget(null)}
+      />
+    </>
+  );
+}

@@ -1,0 +1,616 @@
+import { ArrowSquareOutIcon } from "@phosphor-icons/react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { LabeledGroup } from "@/components/form/labeled-group";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  useApplySecurity,
+  useDeleteDependabot,
+  useDependabotConfig,
+  useRepoSettings,
+  useSecurity,
+  useSetDependabot,
+} from "@/lib/git/queries";
+import type { SecurityFeature, SecurityStatus } from "@/lib/git/types";
+import {
+  NO_CHANGES_REASON,
+  NO_CHANGES_TO_DISCARD_REASON,
+  SAVING_LAST_CHANGE_REASON,
+} from "@/lib/offline-writes";
+import { toastError } from "@/lib/toast";
+import { useOnline } from "@/lib/use-online";
+import { useSeedOnOpen } from "@/lib/use-seed-on-open";
+import {
+  ACT_PENDING_REASON,
+  HeldSwitch,
+  heldSwitchReason,
+  InlineConfirm,
+  OFFLINE_WRITE_REASON,
+  RemoteFormSection,
+  useConfirmSwapFocus,
+} from "./parts";
+import {
+  type PendingSent,
+  reconcileTouched,
+  stampSent,
+  type TouchedEdit,
+} from "./touched-draft";
+
+/** Dependabot / dependency-graph options GitHub exposes to NO repo-level API —
+ *  they're web-UI-only. (Version updates is handled by the dependabot.yml
+ *  scaffold below — a real action, not a link.) */
+const WEB_ONLY_SECURITY = [
+  "Dependency graph",
+  "Grouped security updates",
+  "Dependabot on self-hosted runners",
+];
+
+/** Common Dependabot package ecosystems for the version-updates scaffold. */
+const ECOSYSTEMS = [
+  { value: "npm", label: "npm / Yarn / pnpm" },
+  { value: "github-actions", label: "GitHub Actions" },
+  { value: "pip", label: "pip / Poetry" },
+  { value: "cargo", label: "Cargo (Rust)" },
+  { value: "gomod", label: "Go modules" },
+  { value: "bundler", label: "Bundler (Ruby)" },
+  { value: "composer", label: "Composer (PHP)" },
+  { value: "maven", label: "Maven" },
+  { value: "gradle", label: "Gradle" },
+  { value: "nuget", label: "NuGet (.NET)" },
+  { value: "docker", label: "Docker" },
+];
+const INTERVALS = ["daily", "weekly", "monthly"];
+
+function generateDependabot(ecosystems: string[], interval: string): string {
+  const entries = ecosystems
+    .map(
+      (e) =>
+        `  - package-ecosystem: "${e}"\n    directory: "/"\n    schedule:\n      interval: "${interval}"`,
+    )
+    .join("\n");
+  return `version: 2\nupdates:\n${entries}\n`;
+}
+
+/** The toggles, in dependency-safe APPLY order (parents before children) — the
+ *  save sends changes in this order so a parent is enabled before its child. */
+const FEATURES: {
+  key: SecurityFeature;
+  field: keyof SecurityStatus;
+  label: string;
+  desc: string;
+  dependsOn?: SecurityFeature;
+  privateOnly?: boolean;
+}[] = [
+  {
+    key: "advanced_security",
+    field: "advancedSecurity",
+    label: "GitHub Advanced Security",
+    desc: "Required for secret and code scanning on a private repo (uses a seat).",
+    privateOnly: true,
+  },
+  {
+    key: "secret_scanning",
+    field: "secretScanning",
+    label: "Secret scanning",
+    desc: "Detect secrets pushed to the repository.",
+  },
+  {
+    key: "secret_scanning_push_protection",
+    field: "secretScanningPushProtection",
+    label: "Push protection",
+    desc: "Block pushes that contain a detected secret.",
+    dependsOn: "secret_scanning",
+  },
+  {
+    key: "secret_scanning_ai_detection",
+    field: "secretScanningAiDetection",
+    label: "Secret scanning — AI detection",
+    desc: "Use AI to surface generic passwords and other non-pattern secrets.",
+    dependsOn: "secret_scanning",
+  },
+  {
+    key: "secret_scanning_non_provider_patterns",
+    field: "secretScanningNonProviderPatterns",
+    label: "Secret scanning — non-provider patterns",
+    desc: "Scan for generic, non-provider-specific secret patterns.",
+    dependsOn: "secret_scanning",
+  },
+  {
+    key: "dependabot_alerts",
+    field: "dependabotAlerts",
+    label: "Dependabot alerts",
+    desc: "Get alerted to vulnerable dependencies.",
+  },
+  {
+    key: "dependabot_security_updates",
+    field: "dependabotSecurityUpdates",
+    label: "Dependabot security updates",
+    desc: "Open pull requests to fix vulnerable dependencies.",
+    dependsOn: "dependabot_alerts",
+  },
+  {
+    key: "code_scanning",
+    field: "codeScanning",
+    label: "Code scanning (default setup)",
+    desc: "Run CodeQL analysis on pushes and pull requests.",
+  },
+  {
+    key: "private_vulnerability_reporting",
+    field: "privateVulnerabilityReporting",
+    label: "Private vulnerability reporting",
+    desc: "Let people privately report security issues to you.",
+  },
+];
+
+type Draft = Record<SecurityFeature, boolean>;
+
+function toDraft(status: SecurityStatus): Draft {
+  const d = {} as Draft;
+  for (const f of FEATURES) d[f.key] = status[f.field] === true;
+  return d;
+}
+
+export function SecuritySection({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const security = useSecurity(repoPath, open);
+
+  return (
+    <RemoteFormSection
+      query={security}
+      noun="security settings"
+      skeleton={
+        <div className="min-w-0 space-y-3">
+          <Skeleton className="h-12 w-full" />
+          <Skeleton className="h-12 w-full" />
+          <Skeleton className="h-12 w-full" />
+        </div>
+      }
+      errorTitle="Couldn't load security."
+      errorHint="If this is a permissions error, these settings need repo-admin access."
+    >
+      {(status) => (
+        <div className="min-w-0 space-y-4">
+          <SecurityForm
+            key={repoPath}
+            repoPath={repoPath}
+            status={status}
+            dataUpdatedAt={security.dataUpdatedAt}
+            isError={security.isError}
+          />
+          <DependabotVersionUpdates repoPath={repoPath} open={open} />
+          <MoreOnGitHub repoPath={repoPath} open={open} />
+        </div>
+      )}
+    </RemoteFormSection>
+  );
+}
+
+/** Dependabot version updates — no API, so we scaffold `.github/dependabot.yml`
+ *  (a local file the user commits). We only create or remove it, never
+ *  regenerate over an existing one, so a customized config isn't clobbered. */
+function DependabotVersionUpdates({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const config = useDependabotConfig(repoPath, open);
+  const set = useSetDependabot(repoPath);
+  const del = useDeleteDependabot(repoPath);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const swapFocus = useConfirmSwapFocus();
+  const swapRemove = swapFocus();
+  // A create swaps "Set up…" for Remove while the dialog is still open, so the
+  // close resolves its focus return to whichever trigger is mounted by then.
+  const removeRef = useRef<HTMLButtonElement | null>(null);
+  const setUpRef = useRef<HTMLButtonElement | null>(null);
+  // Stable, so React never detaches and reattaches the swap ref between renders.
+  const removeTriggerRef = useCallback(
+    (node: HTMLButtonElement | null) => {
+      removeRef.current = node;
+      const cleanup = swapRemove(node);
+      return () => {
+        removeRef.current = null;
+        cleanup?.();
+      };
+    },
+    [swapRemove],
+  );
+
+  // Awaited, not per-call callbacks: react-query drops those when this subtree
+  // unmounts mid-flight — closing the dialog or switching the rail's section —
+  // so the outcome would never reach the user.
+  async function handleRemove() {
+    try {
+      await del.mutateAsync(undefined);
+      toast.success("Removed .github/dependabot.yml — commit it");
+      setConfirmingRemove(false);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  async function handleCreate(content: string) {
+    try {
+      await set.mutateAsync(content);
+      toast.success("Wrote .github/dependabot.yml — commit it to enable");
+      setDialogOpen(false);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  if (config.isPending) return null;
+  const exists = config.data != null;
+
+  // Its own confirm-swap section: removing the file swaps the confirm for
+  // "Set up…", which is where focus lands.
+  return (
+    <div data-confirm-section className="border-t pt-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs font-medium">Dependabot version updates</p>
+          <p className="text-[11px] text-muted-foreground">
+            {exists
+              ? "Configured in .github/dependabot.yml."
+              : "Open scheduled PRs to keep dependencies current (writes .github/dependabot.yml)."}
+          </p>
+        </div>
+        {exists ? (
+          confirmingRemove ? (
+            <div className="flex shrink-0 items-center gap-2">
+              <InlineConfirm
+                actLabel="Remove"
+                pending={del.isPending}
+                swapFocusRef={swapFocus()}
+                onCancel={() => setConfirmingRemove(false)}
+                onAct={handleRemove}
+              />
+            </div>
+          ) : (
+            <Button
+              ref={removeTriggerRef}
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => setConfirmingRemove(true)}
+              aria-label="Remove Dependabot version updates"
+            >
+              Remove
+            </Button>
+          )
+        ) : (
+          <Button
+            ref={setUpRef}
+            data-confirm-fallback
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => setDialogOpen(true)}
+          >
+            Set up…
+          </Button>
+        )}
+      </div>
+      <DependabotDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        pending={set.isPending}
+        onCreate={handleCreate}
+        finalFocus={() => removeRef.current ?? setUpRef.current}
+      />
+    </div>
+  );
+}
+
+function DependabotDialog({
+  open,
+  onOpenChange,
+  pending,
+  onCreate,
+  finalFocus,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  pending: boolean;
+  onCreate: (content: string) => void;
+  /** Where focus returns on close, resolved then; `null` keeps Base UI's own. */
+  finalFocus: () => HTMLElement | null;
+}) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [interval, setInterval] = useState("weekly");
+  useSeedOnOpen(open, () => {
+    setSelected(new Set());
+    setInterval("weekly");
+  });
+  const createHeldReason = (() => {
+    switch (true) {
+      case pending:
+        return ACT_PENDING_REASON;
+      case selected.size === 0:
+        return "Select at least one ecosystem";
+      default:
+        return undefined;
+    }
+  })();
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent finalFocus={finalFocus}>
+        <DialogHeader>
+          <DialogTitle>Set up version updates</DialogTitle>
+          <DialogDescription>
+            Pick the package ecosystems to keep up to date. This writes
+            <span className="font-mono"> .github/dependabot.yml</span> to your
+            working tree for you to commit.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid grid-cols-2 gap-2">
+          {ECOSYSTEMS.map((e) => (
+            <label
+              key={e.value}
+              className="flex cursor-pointer items-center gap-2 text-xs"
+            >
+              <Checkbox
+                checked={selected.has(e.value)}
+                onCheckedChange={(c) =>
+                  setSelected((s) => {
+                    const next = new Set(s);
+                    if (c === true) next.add(e.value);
+                    else next.delete(e.value);
+                    return next;
+                  })
+                }
+              />
+              {e.label}
+            </label>
+          ))}
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="dependabot-interval" className="text-xs">
+            Check for updates
+          </Label>
+          <Select value={interval} onValueChange={(v) => v && setInterval(v)}>
+            <SelectTrigger id="dependabot-interval" className="w-40">
+              <SelectValue className="capitalize" />
+            </SelectTrigger>
+            <SelectContent>
+              {INTERVALS.map((i) => (
+                <SelectItem key={i} value={i} className="capitalize">
+                  {i}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          {/* No offline rung: dependabot.yml is a local working-tree write. */}
+          <DisabledReasonButton
+            disabled={createHeldReason !== undefined}
+            reason={createHeldReason}
+            onClick={() =>
+              onCreate(generateDependabot([...selected], interval))
+            }
+          >
+            {pending && <Spinner data-icon="inline-start" />}
+            Create dependabot.yml
+          </DisabledReasonButton>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** The Dependabot / dependency-graph options with no API → "manage on GitHub". */
+function MoreOnGitHub({ repoPath, open }: { repoPath: string; open: boolean }) {
+  const settings = useRepoSettings(repoPath, open);
+  const url = settings.data?.htmlUrl;
+  if (!url) return null;
+  return (
+    <LabeledGroup label="Only on GitHub" className="space-y-2 border-t pt-3">
+      <p className="text-[11px] text-muted-foreground">
+        GitHub exposes no API for these — manage them in your browser.
+      </p>
+      <ul className="space-y-1">
+        {WEB_ONLY_SECURITY.map((label) => (
+          <li key={label}>
+            <button
+              type="button"
+              className="flex cursor-pointer items-center gap-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground hover:underline"
+              onClick={() => openUrl(`${url}/settings/security_analysis`)}
+            >
+              {label}
+              <ArrowSquareOutIcon className="size-3 shrink-0" />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </LabeledGroup>
+  );
+}
+
+function SecurityForm({
+  repoPath,
+  status,
+  dataUpdatedAt,
+  isError,
+}: {
+  repoPath: string;
+  status: SecurityStatus;
+  /** When `status` last loaded; a failed refetch doesn't advance it. */
+  dataUpdatedAt: number;
+  /** The read's last fetch failed; stays set through a refetch until one lands. */
+  isError: boolean;
+}) {
+  const apply = useApplySecurity(repoPath);
+  const online = useOnline();
+  const seed = useMemo(() => toDraft(status), [status]);
+  // Touched toggles only, retired per `reconcileTouched` — never on the save
+  // itself, so a save whose refetch failed keeps its values on screen.
+  const [edit, setEdit] = useState<TouchedEdit<
+    SecurityFeature,
+    boolean
+  > | null>(null);
+  const [pending, setPending] = useState<PendingSent<
+    SecurityFeature,
+    boolean
+  > | null>(null);
+  const reconciled = reconcileTouched({
+    edit,
+    server: seed,
+    pending,
+    dataUpdatedAt,
+    isError,
+  });
+  if (reconciled.edit !== edit) setEdit(reconciled.edit);
+  if (reconciled.pending !== pending) setPending(reconciled.pending);
+  const draft: Draft = { ...seed, ...edit };
+  const dirty = edit !== null;
+  // Both stay mounted, held by reason, so a save or discard that settles the
+  // form clean keeps focus on the button pressed.
+  const saveHeldReason = (() => {
+    switch (true) {
+      case !online:
+        return OFFLINE_WRITE_REASON;
+      case apply.isPending:
+        return ACT_PENDING_REASON;
+      case !dirty:
+        return NO_CHANGES_REASON;
+      default:
+        return undefined;
+    }
+  })();
+  const discardHeldReason = (() => {
+    switch (true) {
+      case apply.isPending:
+        return SAVING_LAST_CHANGE_REASON;
+      case !dirty:
+        return NO_CHANGES_TO_DISCARD_REASON;
+      default:
+        return undefined;
+    }
+  })();
+
+  function set(key: SecurityFeature, value: boolean) {
+    setEdit((e) => {
+      const next = { ...e, [key]: value };
+      // Turning a parent off turns its dependents off too.
+      if (!value) {
+        for (const f of FEATURES) if (f.dependsOn === key) next[f.key] = false;
+      }
+      return next;
+    });
+  }
+
+  async function save() {
+    // FEATURES order is the dependency-safe apply order.
+    const changes = FEATURES.filter(
+      (f) => edit !== null && f.key in edit && draft[f.key] !== seed[f.key],
+    ).map((f) => ({ feature: f.key, enabled: draft[f.key] }));
+    const at = dataUpdatedAt;
+    try {
+      await apply.mutateAsync(changes);
+      const sent: TouchedEdit<SecurityFeature, boolean> = Object.fromEntries(
+        changes.map((c) => [c.feature, c.enabled]),
+      );
+      setPending((p) => stampSent(p, at, sent));
+      toast.success("Security settings saved");
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="min-w-0 space-y-2">
+      {FEATURES.map((f) => {
+        if (f.privateOnly && !status.isPrivate) return null;
+        const parent = FEATURES.find((p) => p.key === f.dependsOn);
+        const blocked = parent !== undefined && !draft[parent.key];
+        const blockedReason = blocked
+          ? `Available once ${parent.label} is on.`
+          : undefined;
+        return (
+          <label
+            key={f.key}
+            className={`flex items-start justify-between gap-3 rounded-md border p-3 ${
+              blocked ? "opacity-60" : "cursor-pointer"
+            }`}
+            title={heldSwitchReason(blockedReason, apply.isPending)}
+          >
+            <div className="min-w-0">
+              <p className="text-xs font-medium">{f.label}</p>
+              <p className="text-[11px] text-muted-foreground">{f.desc}</p>
+            </div>
+            <HeldSwitch
+              checked={draft[f.key]}
+              heldReason={blockedReason}
+              saving={apply.isPending}
+              inLabel
+              onCheckedChange={(next) => set(f.key, next)}
+            />
+          </label>
+        );
+      })}
+
+      {status.isPrivate && (
+        <p className="pt-1 text-[11px] text-muted-foreground">
+          On private repositories, secret and code scanning require GitHub
+          Advanced Security (and may use paid seats). Dependabot alerts,
+          security updates, and private vulnerability reporting are free.
+        </p>
+      )}
+
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <DisabledReasonButton
+          variant="outline"
+          size="sm"
+          onClick={() => setEdit(null)}
+          disabled={discardHeldReason !== undefined}
+          reason={discardHeldReason}
+        >
+          Discard
+        </DisabledReasonButton>
+        <DisabledReasonButton
+          size="sm"
+          onClick={save}
+          disabled={saveHeldReason !== undefined}
+          reason={saveHeldReason}
+        >
+          {apply.isPending && <Spinner data-icon="inline-start" />}
+          Save changes
+        </DisabledReasonButton>
+      </div>
+    </div>
+  );
+}

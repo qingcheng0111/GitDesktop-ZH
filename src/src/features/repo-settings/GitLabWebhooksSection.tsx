@@ -1,0 +1,583 @@
+import {
+  ArrowClockwiseIcon,
+  CaretLeftIcon,
+  ClockCounterClockwiseIcon,
+  PencilSimpleIcon,
+  PlusIcon,
+  TrashIcon,
+} from "@phosphor-icons/react";
+import { useState } from "react";
+import { toast } from "sonner";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { RelativeTime } from "@/components/relative-time";
+import { StatusDetailChip } from "@/components/status-detail-chip";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import {
+  useGlCreateHook,
+  useGlDeleteHook,
+  useGlHookEvents,
+  useGlHooks,
+  useGlResendHookEvent,
+  useGlTestHook,
+  useGlUpdateHook,
+} from "@/lib/git/queries";
+import type { GitLabHook, GitLabHookDelivery } from "@/lib/git/types";
+import { SAVING_LAST_CHANGE_REASON } from "@/lib/offline-writes";
+import { parseableDate } from "@/lib/time";
+import { toastError } from "@/lib/toast";
+import { useOnline } from "@/lib/use-online";
+import {
+  ACT_PENDING_REASON,
+  DeliveryPayload,
+  formExitSwapKey,
+  InlineConfirm,
+  NEW_FORM_SWAP_KEY,
+  OFFLINE_WRITE_REASON,
+  RemoteListSection,
+  rowFormSwapKey,
+  type SwapFocusRef,
+  useConfirmSwapFocus,
+} from "./parts";
+
+/** GitLab's per-hook event flags, in display order (no "send everything" —
+ *  GitLab models events as independent booleans). */
+const GL_EVENTS: { id: string; label: string }[] = [
+  { id: "push_events", label: "Push" },
+  { id: "tag_push_events", label: "Tag push" },
+  { id: "issues_events", label: "Issues" },
+  { id: "merge_requests_events", label: "Merge requests" },
+  { id: "note_events", label: "Comments" },
+  { id: "pipeline_events", label: "Pipelines" },
+  { id: "job_events", label: "Jobs" },
+  { id: "wiki_page_events", label: "Wiki pages" },
+  { id: "releases_events", label: "Releases" },
+  { id: "deployment_events", label: "Deployments" },
+];
+
+function eventsSummary(events: string[]): string {
+  if (events.length === 0) return "No events";
+  const labels = events.map(
+    (e) => GL_EVENTS.find((c) => c.id === e)?.label ?? e,
+  );
+  if (labels.length <= 3) return labels.join(", ");
+  return `${labels.slice(0, 3).join(", ")} +${labels.length - 3}`;
+}
+
+/** The GitLab counterpart of the GitHub Webhooks section: hook CRUD, a test
+ *  fire, and the delivery log with payloads + per-event resend. */
+export function GitLabWebhooksSection({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const hooks = useGlHooks(repoPath, open);
+  const deleteHook = useGlDeleteHook(repoPath);
+  const testHook = useGlTestHook(repoPath);
+  const online = useOnline();
+  // null = list; "new" = create form; a hook = edit form.
+  const [editing, setEditing] = useState<GitLabHook | "new" | null>(null);
+  const [viewingEvents, setViewingEvents] = useState<GitLabHook | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const swapFocus = useConfirmSwapFocus();
+
+  // Awaited, not per-call callbacks: this subtree unmounts when the dialog
+  // closes or the rail crossfades to another section, and react-query drops
+  // per-call callbacks on unmount — the outcome would never reach the user.
+  async function handleDelete(hookId: string) {
+    try {
+      await deleteHook.mutateAsync(hookId);
+      toast.success("Webhook deleted");
+      setConfirming(null);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  // One `testHook` mutation serves every row, so the hook id it sent names the
+  // row whose own write is in flight.
+  const testHeld = (hookId: string) => {
+    switch (true) {
+      case !online:
+        return OFFLINE_WRITE_REASON;
+      case testHook.isPending && testHook.variables?.hookId === hookId:
+        return ACT_PENDING_REASON;
+      case testHook.isPending:
+        return SAVING_LAST_CHANGE_REASON;
+      default:
+        return undefined;
+    }
+  };
+
+  async function handleTest(hookId: string) {
+    try {
+      await testHook.mutateAsync({ hookId, trigger: "push_events" });
+      toast.success("Test event sent");
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  const listed = (hookId: string) =>
+    hooks.data?.some((h) => h.id === hookId) ?? false;
+
+  if (viewingEvents) {
+    return (
+      <HookDeliveries
+        repoPath={repoPath}
+        hook={viewingEvents}
+        swapFocusRef={swapFocus(
+          formExitSwapKey(
+            rowFormSwapKey("deliveries", viewingEvents.id),
+            listed(viewingEvents.id),
+          ),
+        )}
+        onBack={() => setViewingEvents(null)}
+      />
+    );
+  }
+
+  if (editing) {
+    return (
+      <HookForm
+        repoPath={repoPath}
+        hook={editing === "new" ? null : editing}
+        swapFocusRef={swapFocus(
+          editing === "new"
+            ? NEW_FORM_SWAP_KEY
+            : formExitSwapKey(
+                rowFormSwapKey("edit", editing.id),
+                listed(editing.id),
+              ),
+        )}
+        onDone={() => setEditing(null)}
+      />
+    );
+  }
+
+  return (
+    <div data-confirm-section className="min-w-0 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-muted-foreground">
+          Webhooks GitLab fires for this project's events.
+        </p>
+        <Button
+          ref={swapFocus(NEW_FORM_SWAP_KEY)}
+          data-confirm-fallback
+          size="sm"
+          onClick={() => setEditing("new")}
+        >
+          <PlusIcon data-icon="inline-start" />
+          Add webhook
+        </Button>
+      </div>
+
+      <RemoteListSection
+        query={hooks}
+        rowCount={hooks.data?.length ?? 0}
+        noun="webhooks"
+        loadFailed="Couldn't load webhooks."
+        emptyLabel="No webhooks yet."
+        skeletonClassName="h-14 w-full"
+        errorTitle="Couldn't load webhooks."
+        errorHint="If this is a permissions error, managing webhooks needs the Maintainer role."
+      >
+        {hooks.data?.map((h) => (
+          <div
+            key={h.id}
+            data-confirm-row
+            className="rounded-md border p-2 text-xs"
+          >
+            <div className="flex items-center gap-2">
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-mono font-medium" title={h.url}>
+                  {h.url}
+                </p>
+                <p className="mt-0.5 text-muted-foreground">
+                  {eventsSummary(h.events)}
+                  {parseableDate(h.createdAt) && (
+                    <>
+                      {" · added "}
+                      <RelativeTime date={h.createdAt} />
+                    </>
+                  )}
+                </p>
+              </div>
+              {h.alertStatus !== "executable" && (
+                <StatusDetailChip
+                  variant="destructive"
+                  label="disabled"
+                  detail="GitLab disabled this hook after repeated failures — check the deliveries, then save it again to re-enable."
+                />
+              )}
+              {confirming === h.id ? (
+                <InlineConfirm
+                  prompt="Delete?"
+                  actLabel="Delete"
+                  pending={deleteHook.isPending}
+                  heldReason={online ? undefined : OFFLINE_WRITE_REASON}
+                  swapFocusRef={swapFocus(h.id)}
+                  onCancel={() => setConfirming(null)}
+                  onAct={() => handleDelete(h.id)}
+                />
+              ) : (
+                <>
+                  <DisabledReasonButton
+                    size="sm"
+                    variant="ghost"
+                    title="Send a test push event"
+                    disabled={testHeld(h.id) !== undefined}
+                    reason={testHeld(h.id)}
+                    onClick={() => handleTest(h.id)}
+                  >
+                    <ArrowClockwiseIcon />
+                  </DisabledReasonButton>
+                  <Button
+                    ref={swapFocus(rowFormSwapKey("deliveries", h.id))}
+                    size="sm"
+                    variant="ghost"
+                    title="Recent deliveries"
+                    onClick={() => setViewingEvents(h)}
+                  >
+                    <ClockCounterClockwiseIcon />
+                  </Button>
+                  <Button
+                    ref={swapFocus(rowFormSwapKey("edit", h.id))}
+                    size="sm"
+                    variant="ghost"
+                    title="Edit"
+                    onClick={() => setEditing(h)}
+                  >
+                    <PencilSimpleIcon />
+                  </Button>
+                  <Button
+                    ref={swapFocus(h.id)}
+                    size="sm"
+                    variant="ghost"
+                    className="text-muted-foreground hover:text-destructive"
+                    title="Delete"
+                    aria-label={`Delete webhook ${h.url}`}
+                    onClick={() => setConfirming(h.id)}
+                  >
+                    <TrashIcon />
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+      </RemoteListSection>
+    </div>
+  );
+}
+
+function HookForm({
+  repoPath,
+  hook,
+  swapFocusRef,
+  onDone,
+}: {
+  repoPath: string;
+  hook: GitLabHook | null;
+  /** Hands focus back to the control that opened this form when it closes. */
+  swapFocusRef: SwapFocusRef;
+  onDone: () => void;
+}) {
+  const create = useGlCreateHook(repoPath);
+  const update = useGlUpdateHook(repoPath);
+  const [url, setUrl] = useState(hook?.url ?? "");
+  const [token, setToken] = useState("");
+  const [sslVerify, setSslVerify] = useState(
+    hook?.enableSslVerification ?? true,
+  );
+  const [events, setEvents] = useState<string[]>(
+    hook?.events ?? ["push_events"],
+  );
+
+  const pending = create.isPending || update.isPending;
+  const online = useOnline();
+  const urlValid =
+    url.trim().startsWith("https://") || url.trim().startsWith("http://");
+  const warning = !url.trim()
+    ? null
+    : !urlValid
+      ? "The payload URL must start with http:// or https://."
+      : events.length === 0
+        ? "Select at least one event."
+        : null;
+  const saveHeldReason = (() => {
+    switch (true) {
+      case !online:
+        return OFFLINE_WRITE_REASON;
+      case pending:
+        return ACT_PENDING_REASON;
+      case !url.trim():
+        return "Enter a valid http(s) URL";
+      case warning !== null:
+        return warning;
+      default:
+        return undefined;
+    }
+  })();
+
+  function toggleEvent(id: string, on: boolean) {
+    setEvents((prev) => (on ? [...prev, id] : prev.filter((e) => e !== id)));
+  }
+
+  async function save() {
+    const input = {
+      url: url.trim(),
+      // Blank leaves an existing secret unchanged (GitLab never returns it).
+      token: token.trim() ? token.trim() : null,
+      enableSslVerification: sslVerify,
+      events,
+    };
+    try {
+      if (hook) await update.mutateAsync({ hookId: hook.id, input });
+      else await create.mutateAsync(input);
+      toast.success(hook ? "Webhook updated" : "Webhook created");
+      onDone();
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="min-w-0 space-y-3">
+      <Button ref={swapFocusRef} size="sm" variant="ghost" onClick={onDone}>
+        <CaretLeftIcon data-icon="inline-start" />
+        Back to webhooks
+      </Button>
+      <div className="space-y-3 rounded-md border p-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="gl-hook-url">Payload URL</Label>
+          <Input
+            id="gl-hook-url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com/hook"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-mono"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="gl-hook-token">Secret token</Label>
+          <Input
+            id="gl-hook-token"
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder={hook ? "(unchanged)" : "(optional)"}
+            autoComplete="off"
+          />
+          <p className="text-[11px] text-muted-foreground">
+            Sent as the X-Gitlab-Token header so the endpoint can verify the
+            sender.
+          </p>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="gl-hook-ssl" className="text-xs">
+            Verify the endpoint's SSL certificate
+          </Label>
+          <Switch
+            id="gl-hook-ssl"
+            checked={sslVerify}
+            onCheckedChange={setSslVerify}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <p className="text-xs font-medium">Trigger events</p>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+            {GL_EVENTS.map((e) => (
+              <Label
+                key={e.id}
+                className="flex items-center gap-1.5 text-xs font-normal"
+              >
+                <Checkbox
+                  checked={events.includes(e.id)}
+                  onCheckedChange={(v) => toggleEvent(e.id, v === true)}
+                />
+                {e.label}
+              </Label>
+            ))}
+          </div>
+        </div>
+        {warning && <p className="text-[11px] text-warning">{warning}</p>}
+        <div className="flex items-center justify-end gap-2 border-t pt-3">
+          <Button
+            ref={swapFocusRef}
+            variant="outline"
+            size="sm"
+            onClick={onDone}
+          >
+            Cancel
+          </Button>
+          <DisabledReasonButton
+            ref={swapFocusRef}
+            size="sm"
+            disabled={saveHeldReason !== undefined}
+            reason={saveHeldReason}
+            onClick={save}
+          >
+            {pending && <Spinner data-icon="inline-start" />}
+            {hook ? "Save changes" : "Create webhook"}
+          </DisabledReasonButton>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HookDeliveries({
+  repoPath,
+  hook,
+  swapFocusRef,
+  onBack,
+}: {
+  repoPath: string;
+  hook: GitLabHook;
+  /** Hands focus back to the row's deliveries control on Back. */
+  swapFocusRef: SwapFocusRef;
+  onBack: () => void;
+}) {
+  const events = useGlHookEvents(repoPath, hook.id);
+  const resend = useGlResendHookEvent(repoPath, hook.id);
+  const online = useOnline();
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  // One `resend` mutation serves every row, so the event id it sent names the
+  // row whose own write is in flight.
+  const resendHeld = (eventId: string) => {
+    switch (true) {
+      case !online:
+        return OFFLINE_WRITE_REASON;
+      case resend.isPending && resend.variables === eventId:
+        return ACT_PENDING_REASON;
+      case resend.isPending:
+        return SAVING_LAST_CHANGE_REASON;
+      default:
+        return undefined;
+    }
+  };
+
+  async function handleResend(eventId: string) {
+    try {
+      await resend.mutateAsync(eventId);
+      toast.success("Delivery re-sent");
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="min-w-0 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <Button ref={swapFocusRef} size="sm" variant="ghost" onClick={onBack}>
+          <CaretLeftIcon data-icon="inline-start" />
+          Back to webhooks
+        </Button>
+        <p
+          className="min-w-0 truncate font-mono text-[11px] text-muted-foreground"
+          title={hook.url}
+        >
+          {hook.url}
+        </p>
+      </div>
+
+      <RemoteListSection
+        query={events}
+        rowCount={events.data?.length ?? 0}
+        noun="deliveries"
+        loadFailed="Couldn't load the delivery log."
+        emptyLabel="No deliveries recorded yet — send a test event."
+        skeletonClassName="h-10 w-full"
+        errorTitle="Couldn't load the delivery log."
+      >
+        {events.data?.map((d) => (
+          <DeliveryRow
+            key={d.id}
+            delivery={d}
+            expanded={expanded === d.id}
+            onToggle={() => setExpanded(expanded === d.id ? null : d.id)}
+            resendHeld={resendHeld(d.id)}
+            onResend={() => handleResend(d.id)}
+          />
+        ))}
+      </RemoteListSection>
+    </div>
+  );
+}
+
+function DeliveryRow({
+  delivery,
+  expanded,
+  onToggle,
+  resendHeld,
+  onResend,
+}: {
+  delivery: GitLabHookDelivery;
+  expanded: boolean;
+  onToggle: () => void;
+  /** Why Re-send is held. */
+  resendHeld?: string;
+  onResend: () => void;
+}) {
+  const ok =
+    delivery.responseStatus.startsWith("2") ||
+    delivery.responseStatus.startsWith("3");
+  const showDeliveryTime =
+    !!delivery.createdAt && parseableDate(delivery.createdAt);
+  return (
+    <div className="rounded-md border text-xs">
+      <div className="flex items-center gap-2 p-2">
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+          onClick={onToggle}
+          aria-expanded={expanded}
+        >
+          <Badge variant={ok ? "secondary" : "destructive"}>
+            {delivery.responseStatus || "—"}
+          </Badge>
+          <span className="truncate font-mono">{delivery.trigger}</span>
+          <span className="ml-auto shrink-0 text-muted-foreground">
+            {/* The "·" belongs to the pair, not to the duration — it renders
+                only when both sides do, so neither one alone leaves it hanging. */}
+            {delivery.duration > 0 ? `${delivery.duration.toFixed(2)}s` : ""}
+            {delivery.duration > 0 && showDeliveryTime ? " · " : ""}
+            {showDeliveryTime ? (
+              <RelativeTime date={delivery.createdAt} />
+            ) : null}
+          </span>
+        </button>
+        <DisabledReasonButton
+          size="sm"
+          variant="ghost"
+          title="Re-send this delivery"
+          disabled={resendHeld !== undefined}
+          reason={resendHeld}
+          onClick={onResend}
+        >
+          <ArrowClockwiseIcon />
+        </DisabledReasonButton>
+      </div>
+      {expanded && (
+        <div className="space-y-2 border-t p-2">
+          <DeliveryPayload
+            label="Request payload"
+            body={delivery.requestPayload}
+          />
+          <DeliveryPayload label="Response" body={delivery.responsePayload} />
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,1028 @@
+---
+name: gd-conventions
+description: GitDesktop repo playbook — hard safety rules, frontend and Rust/Tauri conventions, verification commands, and hard-won gotchas that are NOT in CLAUDE.md. Consult this before writing, refactoring, or reviewing ANY code in this repo, even for small changes. Preloaded into the implementer, spec-reviewer and spec-writer subagents; the main conversation should read it before direct implementation work too.
+---
+
+# GitDesktop conventions & gotchas
+
+You are working in the user's real repository. CLAUDE.md covers the project
+brief and docs-sync; this file adds what past sessions learned the hard way.
+Where this file and generic best practice disagree, this file wins.
+
+## Hard rules (violations have destroyed user state before)
+
+1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /
+   show` and `git branch --list`, each optionally prefixed with `-C <path>` to
+   address a task worktree. Everything else — commit, add/stage, checkout,
+   reset, stash, rm, clean, push, pull, fetch, merge, rebase, tag, branch
+   create/delete, worktree, remote, config — is forbidden, even "just to test".
+   The user commits their own work, possibly in parallel with your session; a
+   past subagent's stray commit wiped `.gitignore` and broke the app.
+2. **No stray files.** Create only what your task calls for. Scratch files go
+   in the session scratchpad or `C:/temp`, never the repo; destructive
+   experiments happen in a throwaway repo under `C:/temp`. (One exception, for
+   runs that may create files: the LF-copy gate's `__cigate__<name>` sibling,
+   deleted after the check — reviewers never create it: the LF copy is a file.)
+3. **Don't edit `src/components/ui/`** — vendored shadcn/Base UI primitives.
+   Fix at the feature/call-site level. That folder's `README.md` inventories
+   the sanctioned local modifications (a re-vendor silently reverts them);
+   any future sanctioned edit updates it in the same change.
+4. **Never repo-wide `cargo fmt`** in `src-tauri` (~35 files of collateral).
+   New files only: `rustfmt --edition 2021 <that file>` — and never on a
+   `mod.rs`: rustfmt follows its `mod` declarations into every child file
+   (measured: 6-file collateral). Verify an edit's formatting with
+   `rustfmt --edition 2021 --check --config skip_children=true` and compare
+   flagged hunks to your lines.
+5. **Report from evidence.** Verification claims come from command output in
+   this session, never memory. Quote failures verbatim.
+
+## Verification commands (allowlisted — run, don't ask)
+
+```sh
+pnpm build                             # tsc + bundle — the frontend gate
+pnpm exec tsc -b --noEmit              # typecheck alone — plain `tsc --noEmit` is a NO-OP here (project refs); only -b checks
+pnpm exec biome check ./src/           # lint/format CHECK (no mutation)
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+cd site && pnpm build                  # when the marketing site changed
+pnpm run checks                        # guard scripts + self-tests — CI quality.yml guards job
+```
+
+Frontend changes run the first pair; Rust changes add the cargo pair. Not
+"done" until green.
+
+⚠ **`pnpm lint` is a rewrite, not a check** — it runs `biome check --write
+./src/ ./site/`, mutating every file under `src/` AND `site/` including
+the user's parallel work. Implementers fix only their own files via the
+targeted `pnpm exec biome check --write <files in scope>`; reviewers never
+run any `--write` form.
+
+⚠ **`biome check` false-fails on CRLF (this Windows worktree).** autocrlf checks
+files out CRLF, and `biome check` (formatter included) flags a CR on **unedited**
+files as an error — a red result that isn't yours. The one trustworthy local
+gate is the CI form over LF-normalized copies: copy each edited file to a
+`__cigate__<name>` sibling (CRLF→LF), run `pnpm exec biome ci` on the copies,
+delete them after. `biome lint` is NOT a gate — it skips the formatter and
+assist layers `biome ci` enforces (a measured false clean, three CI reds).
+Never "fix" a red by converting line endings.
+
+## Frontend conventions
+
+**React best practices.** Before writing or refactoring any React component or
+hook, invoke the `vercel-react-best-practices` skill (Vercel's 70-rule
+performance + correctness playbook) and apply it as you write — it does not
+auto-load, so pull it in yourself; don't defer it to an after-the-fact review pass.
+
+**Design tokens.** Mono + dark + one mint accent; semantic state tokens in
+`src/App.css`: `--success`, `--warning`, `--info`, `--merged`; danger is
+`--destructive`. No hardcoded green/amber/red classes in new code (a few
+*intentional* pre-existing hardcodes exist, e.g. file-list status colors —
+leave them, don't re-flag them). Never convey meaning by color alone (WCAG AA).
+
+**Keyboard-first.** Every new selectable list gets arrow-key navigation in
+the same change (`listKeyboardNav` in `src/lib/list-keyboard-nav.ts`) — an
+invariant, not polish. A list container that co-hosts a text editor (inline
+edit field, reply box) passes `ignoreTextEntry` so arrows keep moving the
+caret; leave it off where arrows deliberately drive nav from a filter input.
+Palette-style pickers (the command palette, the task picker) derive their
+cursor through `clampHighlight`/`stepHighlight`
+(`src/features/shortcuts/palette-highlight.ts`), so the marker, Enter and the
+scroll read one clamped index; `scripts/palette-highlight.test.mjs` pins every
+picker in its `CALL_SITES`.
+Destructive paths stay behind confirmation via the
+shared `useConfirm`/`ConfirmDialogHost` primitive (`src/lib/stores/confirm.ts`,
+host in `src/components/confirm-dialog-host.tsx`) — never a bespoke confirm
+dialog. A prompt is repo-scoped by default: switching or closing the repository
+while it is open cancels it (the caller gets `false`, an info toast names what
+didn't happen). Prompts that act outside the open repository (quit/update,
+recents, Settings, Explore, task deletion) pass `scope: "app"`. Commit-level
+destructive prompts (checkout, revert, cherry-pick, undo) share their wording
+through `src/features/history/commit-confirms.ts`: a new route to one of those
+ops imports the existing prompt, never re-spells it.
+Staging-over-conflict-markers prompts likewise live in
+`src/features/repository/conflict-confirms.ts`: the generic stage gate and
+Mark resolved both build theirs there.
+
+**Command palette.** Any new tab/surface/action needs an ACTIONS entry in
+`src/lib/hotkeys/registry.ts` + `useHotkeyAction` wiring in the same change
+(`defaultBinding: null` = palette-only). Missed twice before. Labels use the
+words the user reads on screen. Action-text search lives in
+`src/lib/hotkeys/search.ts` (`queryTokens` + `matchesActionText`), shared by the
+palette and Settings → Keyboard so a query can't hit in one and miss in the
+other — a new surface searching ACTIONS imports it rather than re-spelling the
+match. It AND-s the query's whitespace-separated tokens over label + category
+with hyphens stripped from both sides, so word order, gaps, and hyphenation cost
+nothing ("cancel pipeline" finds "Cancel workflow run/pipeline", "rerun" finds
+"Re-run…", and #255's "ai excluded" against a tab labeled "AI excluded" would
+match today). Each token still has to be a literal substring of what remains, so
+a label built from different words than the surface shows stays unfindable.
+Keyboard's binding arms deliberately stay literal — key text means its
+separators.
+
+**Mod-key display.** Shortcut hints render via `isMac` / `formatBinding` from
+`@/lib/hotkeys/binding` — never a literal ⌘ or "Ctrl+"; only labels branch.
+
+**Key-dispatch guards are shared, never re-derived:** `hasModifier`,
+`isTypeaheadTarget`, `isTypeaheadKey`, and `isEditableTarget` / `firesInEditable`
+all live in `src/lib/hotkeys/binding.ts`. Any path that compares
+`eventToBinding(e)` against a user binding and then `preventDefault`s applies the
+same three-predicate clause the global listener does — `isEditableTarget`,
+`isTypeaheadTarget`, `isTypeaheadKey` — because bindings are rebindable down
+to a single key, a dispatcher missing any of them either steals keystrokes from
+a text field or typeahead list, or withholds a named key that should still fire.
+Inner-clause drift between two dispatchers is the regression this prevents; the
+`unguarded-binding-dispatcher` guard in `pnpm run checks` is the ratchet.
+
+**Patterns the user has ruled on:**
+- No hover-revealed per-row buttons — contextual actions are always-visible,
+  or live in keyboard/context-menu/toolbar.
+- Truncated user/repo content gets a `title` tooltip, added
+  only-when-actually-clipped via `clipTitle`/`clipTitleFromText`
+  (`src/lib/clip-title.ts`) — never inline: blanking with `title=""`
+  suppresses a titled ancestor's tooltip, and the `inline-clip-title` guard
+  in `pnpm run checks` fails on rewrites. Base UI Select popup rows route
+  through `SelectClipText` (`src/components/select-clip-text.tsx`), which
+  must be the row's SOLE child. A bare truncate child never engages there and
+  an item-level handler is dead once the row span self-bounds (the
+  `select-item-clip-title` guard fails on both); the closed field takes
+  `onMouseEnter={clipTitleFromText}` on its `SelectValue`.
+- File/directory paths middle-truncate through `PathText`
+  (`src/components/path-text.tsx`) — head context and the filename both
+  survive. It owns its only-when-clipped tooltip (allowlisted in
+  `inline-clip-title`: the outer span it titles never overflows itself). A
+  new path display hand-rolling `truncate` re-mints the inconsistency this
+  fixed. Label composites (`Saved to <PathText/>`) space via `gap-*` on the
+  flex row, never a trailing space in the label — flex line boxes trim it.
+  Non-flex-item text is exempt: the absolutely-positioned `sr-only` badge
+  spans keep their trailing announcement space.
+- A `SelectControl`/`SelectField` `items` Record silently reorders integer-like
+  keys to the front (JS object semantics) — any picker whose option values are
+  user-supplied identifiers that can be all-digits (logins, slugs) must pass
+  the `order` prop with the sequence it means (exactly the keys of `items`).
+- Per-file `+added -deleted` counts render through `DiffStat`
+  (`src/components/diff-stat.tsx`) — plain numbers in, optional `isBinary`
+  (a muted `bin`) and `format` (Insights abbreviates via `fmt`); never
+  hand-rolled, and the `hand-rolled-diff-stat` guard in `pnpm run checks`
+  fails on a new pair. A file-list row whose counts load after the row (the
+  Changes list, the commit dialog) renders `DiffStatSlot` from the same module
+  on EVERY row, stat or not: it reserves the cell's width, so late counts don't
+  reflow the names. The `list-row-diff-stat-slot` guard fails on any
+  conditionally rendered `<DiffStat>` in a feature `.tsx` (`&&`, `||`, `??`,
+  either ternary branch); a non-row total hidden on purpose takes an
+  allowlist entry with its rationale. DiffStat itself keeps no width.
+- Icon-only copy buttons are `CopyIconButton`
+  (`src/components/CopyIconButton.tsx`), never a raw button around `CopyIcon`;
+  it always stops click propagation, and the `raw-copy-icon-button` guard in
+  `pnpm run checks` fails on a new one.
+- Disabled actions explain why via `DisabledReasonButton`
+  (`src/components/disabled-reason-button.tsx`) — reason as tooltip + AT
+  announcement; menu/popover trigger sites take the render arm with `disabled`
+  on the BUTTON, never the Trigger — a disabled Trigger leaves the tab order,
+  so its reason would reach hover only. The exact composition to copy is
+  `<Trigger render={<DisabledReasonButton disabled reason/>}>`; the full
+  contract sits in the primitive's doc comment. A disabled submit may instead
+  explain via the field's `warning` hint. Raw-`<button>` sites the vendored
+  Button can't size (reaction chips, the discussion upvote chip) take the SAME
+  contract from the shared `useDisabledReason` hook + `ARIA_DISABLED_CLASS`
+  (`src/lib/use-disabled-reason.ts`) — never hand-rolled. A vendored Button the
+  render composition can't reach because a form component wraps it
+  (`form.SubmitButton`, which forwards props but isn't itself a Trigger) takes
+  the same hook directly: `focusableWhenDisabled`/`aria-describedby`/
+  `wrapperTitle` passed straight through, plus its own sr-only reason span
+  alongside (`src/features/welcome/CloneRepoDialog.tsx` is the reference).
+- A status badge or chip whose explanation isn't visible text is a
+  `StatusDetailChip` (`src/components/status-detail-chip.tsx`) — a click popover
+  keyboard, touch, and AT all reach, and a plain Badge when there's no detail. A
+  `title` alone is mouse-only; the `titled-badge` guard bans it on Badge.
+- ICON-LED informational strips (InfoIcon + one line of muted text above a pane
+  body: a hint, a disclosure, a capability note) are `InfoNote`
+  (`src/components/info-note.tsx`) — never a hand-rolled InfoIcon +
+  `border-b bg-muted/40` row; a plain div, not a live region, with a trailing
+  `action` slot for a dismiss control. Icon-less `border-b bg-muted/40` rows
+  (action strips, section headers) are a different class and stay as they are.
+  One known icon-led exception: ProjectsBoardPanel's `SelectionHintStrip`, whose
+  `reserve` mode (an invisible, `aria-hidden` placeholder) and `mb-2` need an
+  InfoNote reserve arm before it can move.
+- A conversation surface's own actions sit before the submit button via
+  `CommentComposer`'s `leadingActions` slot when submit is the row's last
+  action (the issue views); a surface whose right-slot action is itself a
+  primary (Approve / Review… on the PR views) keeps it in `actions`, which
+  renders after submit — the caller owns the row layout up to that boundary,
+  spacers included.
+- The AI-generate chord in a dialog goes through `useGenerateChord`
+  (`src/lib/hotkeys/useGenerateChord.ts`) — never a hand-rolled handler. Its
+  invariants: effective-binding read (null = fully inert), `eventToBinding`
+  match, `preventDefault` before `enabled` on any surface WITH a generator,
+  run only under the visible button's gate, swallow-don't-cancel while
+  generating, handler mounted on `DialogContent` (the X close is a form
+  sibling). The hook returns the `hint` string so buttons can't forget it.
+  Recorded exception: surfaces with several per-row generators and no
+  focused-row concept (Edit history's reword buttons) carry no chord.
+- A generator dialog that stays mounted across its own close rides
+  `useFinishAndSurface` (`src/features/conversations/useAiStream.ts`) — closing
+  never cancels the run; a settle while closed latches skip-seed (the reopen
+  shows the whole draft) and toasts it with a "View" reopen. The
+  `generator-dialog-finish-and-surface` guard in `pnpm run checks` is the
+  ratchet; the deliberate abort-on-close surfaces (the PR edit dialogs, branch /
+  rename / task dialogs) are exempt by hook choice or by having no
+  `useSeedOnOpen`. A generation belongs to the repo it started in: the hook takes
+  `repoPath` plus the dialog's own `cancel` and `close`, and a switch aborts the
+  run and closes an open dialog — `<RepositoryView>` is a single instance across
+  repo switches, so dialog state outlives the repo. A settled-unseen latch is
+  STAMPED with its run's repo and survives navigation; the first open releases
+  it, this repo's showing the draft and a foreign one destroying latch and toast
+  with the form its seed resets, while the toast's View re-checks the live repo
+  and names the origin on mismatch. Two contracts the types can't enforce: the
+  seed guard is `surface.shouldSkipSeed(generating)`, never a caller-owned
+  `generating ||` arm (a cancelled run keeps that flag true through its context
+  fetch; `consumeSkipSeed` is only for a caller discarding the waiting draft on
+  purpose — an identity axis that moved on, or an explicit draft request that
+  outranks it), and the repo-description store delivers only while the dialog
+  reports General active, stashing otherwise. While a dialog's own form submits,
+  its Generate holds with a reason (`CREATE_PENDING_GENERATE_REASON` from
+  useAiStream.ts for creates) and its chord's `enabled` carries `!isSubmitting`:
+  the draft is already sent and the settle closes the dialog holding it (the
+  `generate-held-while-submitting` guard in `pnpm run checks` is the ratchet). A
+  dialog a settle may close without a generation stamp carries an open-session
+  token (`{}`) minted in its open handler, its `useSeedOnOpen` seed, or the open
+  branch of a latched seed effect (re-minted when a reseed replaces the draft),
+  captured at submit, dropped on every close and compared after the await. When
+  the settle CLOSES the dialog it is never minted in an `[open]` effect whose
+  cleanup clears it: an `<Activity>` hide runs that cleanup, so a create
+  settling while hidden would leave its dialog open. A settle that only
+  navigates may (`RunWorkflowDialog`): a cleared token lands its safe arm.
+- Worktree actions gate on in-flight removal/promote state: menu items disable
+  with the parenthetical reason riding the label (a disabled menu item can't
+  carry a tooltip), and mutation choke points re-check at fire time —
+  `useIsRemovingWorktree`/`useWorktreeRemovals` for render,
+  `refuseWhileLeaving` (WorktreesDialog.tsx) plus `isWorktreePromoting`
+  (worktree-removal store; fire-time only, deliberately non-reactive) for the
+  refusal toast.
+- Per-variant copy/labels/glyphs are `Record` lookups, never ternary chains:
+  an exact union discriminant gets a total `Record` (compiler
+  exhaustiveness); a wide wire string gets `Partial<Record>` + explicit
+  fallback; genuinely mixed-predicate chains stay ternaries (precedents:
+  `PICKER_COPY`, `OP_LABELS`, `KIND_GLYPH`).
+- API-impossible features get an explicit "… on GitHub/GitLab" link item,
+  not a silent gap.
+- Never degrade a surface to dodge machinery: no plain `<pre>` where the app
+  highlights, no spinner where skeletons exist.
+- Caught errors surface via `toastError` (`src/lib/toast.ts`), or `errorMessage`
+  (`src/lib/tauri/invoke.ts`) where a toast is wrong (a terminal buffer) — never
+  `String(e)`: `invoke` rejects a PLAIN AppError, stringified "[object Object]".
+- A caption over a GROUP of controls rides `LabeledGroup`
+  (`src/components/form/labeled-group.tsx`), which ties the group to it via
+  `role="group"` + `aria-labelledby` — a `<Label>` that associates with nothing
+  names nothing for assistive tech, however it is styled; the `bare-group-label`
+  guard in `pnpm run checks` fails on any `<Label>` carrying neither `htmlFor`
+  nor `id`. Existing idioms that already do their own aria wiring stay as they
+  are: the CreatePrDialog / CreateIssueDialog field-group wrappers and
+  McpServersSection's `role="group"` scope groups.
+- A lazy panel's `Suspense` fallback is `LazyPanelFallback`
+  (`src/components/lazy-panel-fallback.tsx`) — never `fallback={null}`: a blank
+  region has no aria-busy and announces nothing to assistive tech. The
+  carve-out: a boot-path boundary over a panel with a settled resting state
+  renders that state as its fallback (`DiffRestingFallback`, sharing its
+  message with DiffViewer through `diff-resting-message.ts`), with an aria-busy
+  region and its sr-only status beside it rather than inside it, so the first
+  frame already shows the panel's own resting message; still never
+  `fallback={null}`.
+- Loading placeholders for a bordered row list are `ListRowSkeletons`
+  (`src/components/list-row-skeleton.tsx`), with `lines` matching the real row's
+  line count and `name` naming the content ("Loading pull requests…") — flush
+  `border-b px-3 py-2` rows, never a padded stack of fixed-height bars, so a
+  cold load doesn't shift the list as rows arrive. It carries the group's
+  `aria-busy` + sr-only status; `ListRowSkeleton` is the single row it wraps,
+  not a call-site component.
+- A panel with a probe arm and a list arm paints the SAME skeleton row count in
+  both (one shared constant or prop), so a load whose probe hasn't failed
+  never grows at the probe→list flip; while a probe has failed with nothing
+  loaded, its retries may pin 1 row.
+- The Changes pane swaps files through a two-slot hold: `FileSlot` in
+  `src/features/diff/DiffViewer.tsx` is the reference implementation, with its
+  transitions in `diff-pane-slots.ts` and the `DiffPaneHold` context
+  (`diff-pane-hold.tsx`) carrying `interactive` and the settle reports down to
+  the surfaces. The held view (the last settled one) stays in flow and
+  `inert`; a held FILE slot is also dimmed (`PLACEHOLDER_FADE` +
+  `opacity-80` + `delay-100`), while a held placeholder stays undimmed. The
+  target prepares out of sight at full size, clipped over the held view (how
+  the slot hides, and what the guard enforces: the preparing-slot rule below).
+  It is promoted on its first settled report or a 400 ms bound. A slot
+  reports both edges of its settle, so a shown file that is not settled right
+  now (one the bound promoted, or one loading again after Raw to Preview or a
+  rebuild) is replaced outright on the next click, never held; it is held
+  again once it settles. `aria-busy` sits on the non-inert pane root while
+  holding, since an inert subtree is out of the accessibility tree. A slot
+  counts as settled once it has at least one reporting gate and every gate
+  that HAS reported is settled, so a render-null arm that never reports lets
+  the slot promote early onto blank content: every such arm under a slot calls
+  `useReportPaneSettled` before its early return. Entity detail views (PR,
+  issue, workflow run) hold through `useEntityHold`
+  (`src/lib/use-entity-hold.ts`; pure transitions in the import-free
+  `src/lib/entity-hold.ts`, pinned by `scripts/entity-hold.test.mjs`) and
+  `HeldFrame` (`src/components/held-frame.tsx`: the same dim, `inert`, and a
+  sibling focus sink; its non-inert parent spreads `heldParentProps` for
+  `aria-busy`). A single-instance host paints its held item from reads keyed
+  on the hold's `shownKey`, while the selection's own reads decide `settled`
+  (the PR and issue views read details on both keys), so no part of the new
+  item lands inside the held one; `canHold` means the same repo and lens over
+  a settled shown item, never "the target is a placeholder" (a hover-prefetched
+  target has none). The 400 ms bound runs from the hold's START, so a fast run
+  through a list holds the item it left once, never per step (the diff pane
+  re-arms per target). Phase `loading` (bound expired, target unanswered)
+  paints the target's loading frame, never a placeholder, which react-query
+  keeps serving as the item the hold left; phase `offline` (the target's read
+  paused) never holds and keeps the undimmed "showing the last opened …"
+  notice; a move made while the tab is hidden shows directly. A keyed two-slot
+  host renders `entityHoldSlots` (held, preparing, shown) over the same
+  transitions. Runs use `RunSlots` (`src/features/actions/run-slots.tsx`): one
+  keyed slot per run, promoted on `useReportRunSettled`, which the run view
+  calls before any early return so a render-null arm still reports.
+  The PR, issue and workflow-run views paint `loading` as a slot-shaped
+  frame (`PrLoadingFrame`, `IssueLoadingFrame`, and the run view's shared
+  `RunHeader` over `RunLoadingFrame` for its jobs slot), never generic bars; the
+  PR view reserves its strip line and waits for its feed (`feedReady`), the
+  issue view's late sections reserve their minimum loaded height with an error
+  arm (`SectionReadLine`), and the run frame's jobs slot fills downward under a
+  header seeded from a cached row and latched for the frame (a late forge-status
+  answer, or a stale row when the run's detail lands, can still re-lay it).
+  Each frame mirrors the loaded header's rows, titled from the cached list row
+  of the LIVE selection (the view's own number lags a reveal), latched when the
+  frame starts so a row that lands later never re-lays it. `RepositoryView`
+  feeds detail views `deferred ?? live`, never an empty state over a selection.
+  Every host computes `active` and its reveal frame through `useRevealGuard`
+  (same module), never a deferred tab flag: a navigator that reveals the tab
+  and moves the selection in one update leaves the deferred selection behind
+  the reveal, so while `revealing` the host paints its loading frame, never
+  the stale item, and `active` stays false until a visible commit painted the
+  view's item, so that move shows the new item directly instead of holding
+  one the user never saw on screen. The History file rail and Compare don't
+  hold yet; they are follow-ups that would adopt one of these. A placeholder
+  across a key whose response can't prove identity may drive RENDERING only,
+  with every interactive or forge consumer gated on `!isPlaceholderData`
+  (commit-on-remote is the example); the Changes diff takes none, since
+  `FileDiff` echoes only the path and a same-path staged/unstaged placeholder
+  would put live buttons on the other side's hunks. `inert` covers pointer,
+  focus and AT but NOT global hotkeys (gate `useHotkeyAction` on `interactive`)
+  or portals: gate dialogs' `open`; a menu or popover open when the hold starts
+  stays live, so it closes then (key it on the identity, or pass `held`) or its
+  handlers refuse, and per-item dialog state resets on both edges of the hold.
+  The held paint keeps its look: render gates read only the rendered item's
+  placeholder, while the hold and the deferred selection's one-render lag feed
+  interaction gates (handlers, hotkeys, palette); a render gate that reads the
+  lag flickers before the hold starts.
+- The preparing-slot rule: every two-slot host's preparing slot (the Changes
+  pane's `FileSlot`, the Actions tab's `RunSlots`, and any host that adopts the
+  pattern) hides only by a full clip (`[clip-path:inset(50%)]`) plus `inert`,
+  set as the `preparing` entry of the host's role-keyed class map, written as a
+  plain class string (a literal, a literal-only `+` chain or interpolation-free
+  template, or a same-file const of one) whose only clip-path token is the
+  clip. Never `invisible` or `collapse`: the vendored Button's `transition-all`
+  transitions the inherited visibility, so its buttons paint a frame late when
+  the slot shows. Never an opacity below full: the slot would fade in instead
+  of showing at once (both hosts' frames carry `PLACEHOLDER_FADE`). Never
+  `hidden` or `sr-only`: the slot must lay out at full size before it shows.
+  The `preparing-slot-hide` guard in `pnpm run checks` reads slot-host files and
+  slot-shaped class maps (a `preparing` key beside `held` or `shown`; outside a
+  host, a class-valued one), and fails on those utilities in any preparing-slot
+  class it reads (role-keyed entries, role guards, role branches), on class code
+  it cannot read there, and on a slot host whose slot maps' `preparing` entries
+  aren't plain clipped class strings, or that keeps no slot map; its message
+  names the spellings it does not read yet.
+- A file rail's header content (a count, a filter summary) rides `DetailRail`'s
+  `header` prop (`src/components/detail-rail.tsx`), which places it in the h-7
+  caret strip — never a first-child band inside `children`: the strip is already
+  a bordered row, so a band under it stacks a second border and spends vertical
+  space the list wants. Keep that content to one short line; the strip's h-7 is
+  what pins the caret at the same height in both branches, so it must not grow.
+- Avatars: vendored `Avatar`/`AvatarImage`/`AvatarFallback` (canonical:
+  `AuthorAvatar` in `src/features/conversations/Thread.tsx`) — never
+  hand-rolled `<img>`/background divs. Biome-ignore comments use `/*`, not `/**`.
+- Shared-ContextMenu suppression for non-target right-clicks goes through
+  `suppressContextMenu` (`src/lib/context-menu.ts`) — `preventDefault` alone
+  still opens Base UI's menu as an empty popup.
+- CI copy comes from `src/features/actions/status.tsx`, never hand-spelled: the
+  provider's noun via `ciRunNoun` (labels and toasts derive from it, so no
+  surface says "run" beside another's "pipeline"), the gitlab-or-bitbucket test
+  via `isPipelineProvider`, and the re-run offers, titles, and cancel wording
+  via `rerunOffers`/`RERUN_TITLES`/`cancelLabel` — shared so the runs list and
+  the run detail view can't drift.
+- Header meta fields (the PR header's label/value grid: labels, assignees,
+  projects, reviewers) render through `MetaValueCell` / `MetaFieldLabel`
+  (`src/components/meta-field-cells.tsx`) — never a hand-rolled `role="group"`
+  value cell or a re-spelled empty-dash placeholder. A forge user inside one of
+  those cells is a `UserChip` from the same module — never a hand-rolled
+  avatar + truncating-label span — and any chip that shares a value cell with
+  another but keeps its own markup wears the `USER_CHIP_CLASS` box. The
+  pickers emit those two cells only under their `cells` prop; unset, each still
+  renders its own inline trigger+chips row. Scope is that grid alone:
+  `MrTimeTracking` (GitLab-only) deliberately keeps its own full-width row below
+  it, and form-dialog field groups (CreatePrDialog / CreateIssueDialog's `Label`
+  + `aria-labelledby` wrappers) are a richer separate pattern this rule doesn't
+  govern.
+
+**Layout gotchas.** `DialogContent` is a grid — truncating flex content needs
+`min-w-0` on the grid item; cap tall dialogs at `max-h-[85vh]`. Link-styled
+clickables add `cursor-pointer` at the call site (vendored Button sets none).
+Main-side panels (children of RepositoryView's `<main>`, a display:block host) root
+with `flex h-full min-h-0 flex-col` — `flex-1` is inert there, and the panel's
+natural height document-scrolls the whole tab, chrome included (#261's
+InsightsBoard was the outlier; every other main-side panel already complies).
+Tailwind animation overrides need the `!` important modifier — tw-merge doesn't
+dedupe the animate group, so `animate-none` vs an existing `animate-in` is a
+build-order lottery (tailwind-merge 3.6.0; in-repo: `data-open:animate-none!`).
+
+**State & rendering gotchas.**
+- **`gd/session/*` branches are filtered from every branch surface** (lists,
+  pickers, bulk actions) — the user dogfoods agent sessions on them; deleting
+  one breaks Resume. Hard invariant.
+- `<Activity>`-hidden subtrees still render and fetch — gate query `enabled`
+  on the active tab; gate agent-surface notifications on the tab being watched.
+- Open-TRANSITION resets ride `useSeedOnOpen` (`src/lib/use-seed-on-open.ts`) —
+  a bare `useEffect(() => { if (open) seed(); }, [open])` re-fires when a hidden
+  `<Activity>` tab re-mounts its effects on show, wiping the user's draft. The
+  carve-out: data-arrival seeds (`[open, thatQuery.data]`) and `onOpenChange`
+  seeds stay bare, and each must be idempotent — never stomping a user's pick.
+  The `seed-effect-on-open` guard allowlists the recorded ones.
+- Zustand + view transitions: navigators (`openRepo`, `openPr`, `closeRepo`,
+  `openSettings`, …) apply their set through `startViewTransition`, which runs
+  it in a later task wherever the View Transitions API is available (at once
+  only under reduced motion or without the API). The repo-view navigators
+  (`openRepo`, `openPr`, `openIssue`, `openRun`, `openAgentTab`, `openRepoView`)
+  crossfade only when the top-level view changes and otherwise skip the
+  animation (`{ animate: false }`), still applying after any pending
+  transition's update; the screen navigators always crossfade. A plain `set()`
+  right after a navigator can be clobbered by that later apply — navigate in
+  ONE atomic action.
+- Opening a repo the user picked goes through `useOpenRecordedRepo`
+  (`src/features/repository/useOpenRepoByPath.ts`): it warms the repo's shell
+  reads (`warmRepoShell`, a 250 ms budget on cold keys), records it in recents,
+  and switches only if no newer open or navigation arrived — never a
+  hand-rolled `addRecent` → `openRepo`. A caller whose own awaits are part of
+  the request claims first (`claimRepoOpen`); one whose pre-open await may end
+  in something other than an open (BranchSwitcher's worktree lookups) takes
+  `repoOpenWatermark()` and yields to a newer open instead. The known bypasses
+  call `openRepo` directly (RepoDialogs' failure reopen, a worktree promote's
+  landing), warm without recording (`useOpenWorktree`), or switch without
+  warming (the store navigators' cross-repo arms: notification and My work
+  jumps). The reads that paint the repo view stay cached `REPO_SHELL_GC_TIME`
+  (`src/lib/query-cache-times.ts`) through curated `<thing>Options` factories:
+  the local ones are spread by their hook and the warm-up, the network-backed
+  ones (`publishTargetsOptions`, `latestRunOptions`) by their hook only. A
+  warmed read nothing on the first paint shows (`remoteBranchesOptions`, the
+  closed branch menu's Remote group) warms unheld (`into: []`), so it never
+  spends the budget; BranchSwitcher prefetches it once per repo for the
+  switches that skip the warm-up, and its hook stays open-gated. Never a
+  `["repo"]` prefix default (it would catch the notification baselines).
+- React Compiler already memoizes call results — don't add `useMemo` for perf
+  reflexively (~40% false-positive rate); render reads of mutable module
+  state go stale under it.
+- Never read the clock in render — live times ride the shared 30s ticker:
+  `<RelativeTime>` / `<ElapsedTime>`, `useRelativeNow()` for composed
+  strings, `formatDurationBetween` for finished spans
+  (`src/components/relative-time.tsx`, `src/components/elapsed-time.tsx`,
+  `src/lib/time.ts`).
+- Feed/timeline children mixing entity types prefix React keys per slot
+  (`comment-${id}`, `event-${id}`) — bare cross-type ids collide and React
+  keeps the earlier duplicate's DOM alive.
+- Queries with identity axes beyond the repo (entity id, lens, state) keep
+  previous data via `keepPreviousDataForKeyAxes`
+  (`src/lib/git/queries/core.ts`), and callers gate derived UI on
+  `!isPlaceholderData` — a disabled query still renders its placeholder.
+- Virtualized lists: a variable-height first row races `measureElement` —
+  mount the virtualizer in a child gated on data (`docs/list-virtualization.md`).
+- Multi-toggle settings batch behind a Save/Discard bar (draft + dirty), not
+  per-toggle auto-save; a single discrete select may apply-on-change.
+- A stored note/verdict that DESCRIBES form-draft values carries the draft
+  signature it was produced under — never clear-at-every-writer: the footer's
+  Discard `form.reset()`s from outside the section, which no in-file clear can
+  reach. An advisory NOTICE is retired — state cleared — on the first mismatch,
+  so a draft returning to that signature can't resurrect a dismissed one (`note`
+  in KeyboardSection, `warn` in AllowedHostsField); a VERDICT stays render-gated
+  (`testConfig` in AiProviderSection), being valid again on return. Imperative
+  clears only for validity axes the signature can't see (typed input).
+- Repo-content config features (FUNDING.yml, CODEOWNERS, …) scaffold the
+  local file for the user to commit — never write repo content via an API.
+- A mutation whose host can unmount mid-flight (a dialog closable by Esc / ✕ /
+  backdrop, a keyed remount) rides `await mutateAsync` continuations, never
+  `.mutate(vars, { onSuccess, onError })` — react-query drops per-call
+  callbacks when the observer unmounts, so the toast, navigation, or cleanup
+  that lived in them silently never runs. The house idiom is `form.ts`'s
+  awaited-submit convention (`SquashDialog` in
+  `src/features/history/RewriteDialogs.tsx` is the reference).
+- An awaited continuation that writes GLOBAL selection/navigation state
+  (`selectIssue` / `selectTag` / `selectDiscussion`, `setRepoTab`,
+  `setCommitDraft`) guards on the live `repoPath` — and the live entity, for
+  deselects — read via `useUiStore.getState()` after the await: mutateAsync
+  continuations outlive Activity hides AND unmounts, so an unguarded write
+  retargets whatever repo/entity the user switched to (reference:
+  `deselectIfStillHere` in `src/features/issues/RemoteIssueView.tsx`). Toasts
+  stay unconditional — the operation happened regardless.
+- `interactionEpoch` bumps belong to the user's request, synchronously (the
+  store contract on `UiState.interactionEpoch`): a late bump retires whatever
+  newer action is pending, a repo open included. Automatic corrections and
+  prunes write through `clearSelectedFile`, `defaultCompareBranch` and
+  `clearRemoteSelections`, which never bump, and a navigator's `beforeSelect`
+  never bumps (`noteUserInteraction` is a no-op there; the navigator already
+  counted the gesture). A continuation that would bump after its await bumps
+  at its request instead, re-checks the epoch and live repo after the await,
+  and lands through a non-bumping write (`useAmendCommit` + `landAmend` is the
+  reference); the guarded post-await writes in the bullet above still bump
+  late, a tracked follow-up. Review-enforced, not guarded: a regex over effect
+  and continuation bodies would fail open.
+- A follow-up that needs the DOM from a state flip (focus a just-revealed
+  input, re-pin a grown scroll region) never rides a bare
+  `requestAnimationFrame` from the event handler: when the state lives in
+  react-query, the notify-batched re-render can land AFTER that rAF, so the
+  callback hits a still-hidden node and silently no-ops. Arm a pending ref and
+  consume it in a `useLayoutEffect` keyed on the flipped state's commit
+  (reference: `CommentComposer`'s collapse/expand pending flags); an rAF
+  belongs inside that effect only to outlast Base UI's close-time focus-return.
+- A mode swap that unmounts the control holding focus (a toolbar cluster
+  swapping its controls) drops focus to `<body>` on the PALETTE route — the
+  palette closes-then-dispatches, so its focus-restore lands on the
+  about-to-unmount control. Rescue via `useFocusOnControlsSwap`
+  (`src/features/diff/use-hidden-trigger-focus.ts`): change-only by design so
+  a mount never steals focus; its sibling `useHiddenTriggerFocus` owns the
+  container-query-hidden-trigger close arm. Never a hand-rolled focus effect.
+
+## Seam idioms (the spec template's "Idioms at this seam" field reads this list)
+
+Wiring a NEW call site onto one of these surfaces means the governing idiom
+applies — cite it in the spec or record "none applies"; the canonical site is
+one grep away on the named symbol. Grows via Conventions-sync.
+
+- **Repo-identity keying** — per-repo state keys on the repo IDENTITY
+  (`useRepoIdentity` / the shared `--git-common-dir` resolver), never a raw
+  checkout path; a raw-path key diverges across worktrees of one repo.
+- **View lens** — a PR/issue number or blob is valid only in the lens that
+  produced it (origin vs upstream vs local match); navigation and dock entry
+  points thread the lens (`beforeSelect`), never pass a bare number across.
+- **Force/retry threading** — a re-run or retry carries its force/trigger
+  marker end-to-end; downstream code distinguishing "original vs re-run" reads
+  the marker, never infers from timing.
+- **asText rendering** — user-and-forge-supplied strings render through the
+  file's asText discipline, never raw interpolation.
+- **networkMode / offline parking** — react-query calls on possibly-offline
+  surfaces set the documented `networkMode`; the default PARKS offline and the
+  query never resolves.
+- **Retry focus rescue** — a Retry control whose press can unmount it (an
+  error arm swapping to a skeleton or notice) rides `useRetryFocusRescue`
+  (ConversationListPanel) with a stable `tabIndex={-1}` host element; focus
+  must never fall to `<body>` on the shown→hidden edge. A detail pane's
+  error-arm Retry carries no disabled state or in-flight label (the arm
+  unmounts the moment the retry fetches), pinned by
+  `scripts/detail-pane-retry.test.mjs`.
+- **Empty-picker copy** — a picker's line while it draws no options rides
+  `emptyPickerCopy` (remote-section-state); a read parked with nothing loaded,
+  or over a failure, says offline; only a successful read may claim none.
+- **Degraded-list copy** — a list that may be partial rides `unknownListNotice`
+  (remote-section-state), keyed on the read's WIRE flags, never row count:
+  truncated says "may be incomplete" with no Retry; a failure offers Retry; a
+  park never does. Several sub-lists of ONE read share one line and one Retry
+  through `unknownListsNotice`, never stacked per-list notices.
+- **Settings list retention** — a repo-settings list read renders through
+  `RemoteListSection` (repo-settings/parts), never `AsyncListBody` fed a raw
+  query error: a failed or parked refresh keeps loaded rows under a notice.
+  Settled by omission (no `fetching`), so Retry survives its own press.
+- **Settings form retention** — a repo-settings FORM over one read renders
+  through `RemoteFormSection` (repo-settings/parts): gated on absent data,
+  never `isError`, so a failed or parked refresh keeps the form and its draft
+  under a notice above it. A draft that reseeds after a save holds only touched
+  fields and retires them through `reconcileTouched` + `stampSent`
+  (repo-settings/touched-draft, pinned by its test; a save that canonicalizes
+  client-side, like Funding's, remaps its draft to the canonical form and
+  stamps that) — never a clear on
+  save (a failed post-save refetch shows the pre-save values) or a
+  `dataUpdatedAt` key (every focus refetch wipes the draft); a whole-object
+  draft would send another client's newer values back stale.
+- **Offline remote writes** — a repo-settings control that fires a remote
+  write (add, save, delete, role, toggle) gates on `useOnline()`
+  (`src/lib/use-online.ts`) with the shared `OFFLINE_WRITE_REASON`
+  (`@/lib/offline-writes` — the hold reason; its parked-write sibling is
+  `OFFLINE_QUEUED_REASON` via `pendingWriteReason`), disabled with reason,
+  never hidden: a mutation pressed offline parks silently and fires on
+  reconnect. Confirms take `InlineConfirm`'s / `DangerDialog`'s `heldReason`,
+  pickers `HeldRoleSelect`'s, switches `HeldSwitch`'s
+  (`@/components/held-switch`; readOnly, never `disabled`:
+  one node that keeps its tab stop and gives keyboard and AT its reason;
+  inside a wrapping `<label>` pass `inLabel` and title the label). Openers
+  that only reveal a form or confirm stay enabled, as do local writes
+  (FUNDING.yml, dependabot.yml, removing the upstream remote).
+- **Held row pickers** — a row's select (role, ruleset enforcement) held while
+  saving or offline rides `HeldRoleSelect` (repo-settings/parts): readOnly +
+  gated open, never Base UI's `disabled`, which drops the trigger and its
+  reason from the tab order.
+- **Flip-capable menu rows** — a menu item whose `disabled` can change while
+  the menu is open (an offline flip, a pending write starting or settling)
+  carries `MENU_HELD_ROW_CLASS` (`@/components/menu-held-row`): the vendored
+  `data-disabled:pointer-events-none` otherwise makes the hovered row stop
+  being a hit target, and the resulting `pointerleave` drops focus to the
+  menu popup (keyboard navigation is unaffected). The override keeps the row
+  hit-testable; Base UI's `useButton` still gates clicks on disabled rows.
+- **Confirm-swap focus** — a control that swaps with an inline confirm hands
+  focus across the swap via `useConfirmSwapFocus` (repo-settings/parts): the
+  same ref on the trigger and on `InlineConfirm`'s `swapFocusRef`, keyed per
+  row in lists; without it the dialog's focus fallback sends focus to the
+  popup when the focused node unmounts. A confirm that removes its own row or
+  container lands on a successor: mark the row `data-confirm-row`, the section
+  root `data-confirm-section`, and its first input or add control
+  `data-confirm-fallback`. The act button holds by reason while pending, so it
+  keeps focus through the write.
+- **Invalidation keys** — cache invalidation goes through the shared key
+  builders in `src/lib/git/queries/`; a hand-built key or raw-path key
+  silently fails to co-invalidate siblings.
+- **Queries package boundary** — import the git query layer through the
+  `@/lib/git/queries` barrel; `queries/internal.ts` is package-private. Modules
+  inside the package may import it but never re-export it, since `export *`
+  chains would republish it through the barrel. Guards: `queries-internal-import`
+  (callers outside), `queries-internal-reexport` (re-exports anywhere inside),
+  `queries-barrel-internal-reference` (the barrel may not name it at all).
+- **Mutation identity pinning** — every mutation is constructed through
+  `useMutation` from `@/lib/started-mutation`, never react-query's own (guard:
+  `raw-react-query-mutation`, with `started-mutation-present` pinning the
+  helper's path). It snapshots each mutation's options into the context
+  react-query builds once per execution, so a mutation's mutationFn and option
+  callbacks are the ones in effect when it started (the observer's options at
+  the `mutate` call; a per-call `mutate(v, { … })` callback is fixed at the call
+  anyway), however its host re-renders before it settles: a write parked
+  offline lands on, refreshes and patches the repo/PR/lens/link it started on.
+  `scope` and `gcTime` are not snapshotted (query-core reads them off the live
+  options), so a `scope.id` derived from render state would follow a switch.
+  The helper's `meta` key (`STARTED_KEY`) is reserved (wrapping throws on
+  any other options carrying it), and client mutation defaults are banned,
+  since its trampolines shadow them: the `mutation-defaults` guard fails
+  any use of the client's defaults API and any `defaultOptions` beyond a
+  `queries`-only literal. Every `getMutationCache()` call leads straight into a
+  member that makes no mutation (`getAll`, `find`, `findAll`, `subscribe`,
+  `hasListeners` or `clear`), never `build(…)`, which makes one the helper never
+  saw (guard: `mutation-cache-access`; its one exemption is the reference
+  `useMutationCacheSnapshot` holds in `queries/internal.ts`, pinned to its exact
+  statement). The snapshot can't reach a mutation not yet started: a
+  handler that calls `mutate` after an await, or from a confirm whose state
+  outlives a switch, builds from the observer's CURRENT options, so it must
+  record the repo when it starts (a dialog: when it opens) and refuse through
+  `refuseIfSwitched` (`@/lib/stores/notifications`, beside `landedIn`) at the
+  point the write would start, passing its outcome and, once the prompt is gone,
+  a `when` lead (the reference is `doResetToUpstream` in SyncControls.tsx). Copy
+  that can't take that shape (a partial-state error, or a "Didn't <verb> …" line
+  kept in step with a twin) reads `landedIn` once and builds its message from
+  that one result's `live` and `away` (`closed` picks "you closed the
+  repository" over "you switched repositories"; the publish twins don't yet).
+  The shared confirm store covers the prompt window once the switch applies (a
+  repo-scoped `ask` resolves `false` on a switch), so a per-site stamp is for
+  writes started after a NON-confirm await, or after further awaits that follow
+  the answer. The store stamps the repo at ASK time, so a caller whose repo
+  predates an earlier await (a render-time closure, as in CommitDetailView's
+  `doCherryPick`) keeps its own `refuseIfSwitched` after the ask. A view whose
+  repo can be a worktree rather than the open one compares its own prop instead
+  (`useRefuseIfMoved` in `src/features/repository/use-refuse-if-moved.ts`, shared
+  by the two conflict views). A `useRepoMutation` whose mutationFn or
+  callbacks close over repo/lens AND whose host survives a repo switch passes
+  `identity: ["<op>", repo, lens]`, which scopes the HOLD: a changed key hash
+  detaches the pending mutation at the switch, so the new repo's controls don't
+  read the old repo's write as busy. Callers must consume the promise
+  (`mutateAsync`), since the observer's `isPending`/`data` go idle at the
+  switch. Exemplar: `useCreateIssue`; a plain `useMutation` spells the same
+  pin `mutationKey:`.
+  Guard: `mutation-identity-pinning` ratchets the cache-seeding sites and the
+  create-family ones it can see by NAME, following delegation one level inside a
+  module. It scans the git-queries package, `lib/jira/queries.ts` and the local
+  PR/issue query modules (both local wrappers key unconditionally,
+  `["local-pr" | "local-issue", op, repo]`; a wrapper keyed through an optional
+  parameter would oblige its delegating call to pass one) — a repo-scoped create
+  written anywhere else is unratcheted, and the wider class stays a review
+  concern. The creates `useAddRemote`, `useAddCollaborator`, `useAddSubmodule`,
+  `useAddUserWorktree`, `useAddMrSpentTime` and `useForkRepo` (repo-access.ts —
+  RepositoryMenu reads its observer as the re-entry guard) stay unpinned BY
+  DECISION: their callers read `isPending` as a re-entry guard, which a pin
+  idles, so the isPending → cache-reader migration comes first.
+  (`useSubmitReview`, `useAddIssueSpentTime`, `useAddDiscussionComment` and
+  `useForkRepoByName` — a different hook from `useForkRepo` — are pinned, their
+  re-entry guards on mutation-cache readers.) A cache WRITE
+  (`setQueryData`/`setQueriesData`) in `onSuccess`/`onError`/`onSettled` keys
+  from the callback's own parameters, never hook scope. The snapshot already
+  runs the settle callbacks in effect at the start, so this is defense in depth:
+  `onMutate` runs once at mutate time and its result rides the mutation's own
+  state, which would still name the right entity if a settle ever ran through
+  other callbacks than the ones `onMutate` ran with (no path does: react-query
+  re-executes a mutation outside its original execution only after hydration,
+  building it from mutation defaults rather than a render's options, and nothing
+  here hydrates). Build the key in `onMutate`, return it in the context, read it
+  back (`useSetRepoStar` is the reference). The carve-out is a pinned
+  `useRepoMutation` seed: it has no `onMutate` to key from, so it relies on the
+  snapshot (`useCreateIssue`, writing through `insertCreatedIssue`, is the live
+  instance). Context-keying needs no pin of its own, so `isPending`
+  stays live — but the pin rule above is separate and still applies: an EXPORTED
+  repo-scoped hook whose `onSuccess` seeds the cache keeps its mutation key
+  however the seed is keyed. Guard: `settle-cache-write-identity`, over the
+  same modules; a write through a helper, a callback passed by name, and
+  `useOptimisticCacheMutation`'s `reconcile` stay review concerns (the check's
+  message lists the rest).
+- **Pending-write holds** read the mutation cache through
+  `useMutationCacheSnapshot` (`queries/internal.ts`) with a caller-memoized
+  `select` (`useCallback` over stable deps: primitives or module-level
+  constants), never `useMutationState` (its ref goes stale across an
+  `<Activity>` hide) and never the observer (it tracks only its latest
+  call). The pure projection goes in an import-free module (`pr-writes.ts`,
+  `board-writes.ts`). A projection that CASTS the variables
+  casts through the same exported type the mutation's generic uses
+  (`ThreadWriteVars`, `DiscussionUpvoteVars`), so a renamed field fails to
+  compile; the runtime-guarded readers (`boardWriteVars`, `pendingPrWriteTarget`,
+  `releaseWriteTag`, `usePendingStatusUpdateWrites`) `typeof`-check each field
+  instead. A per-record write in a `[family, kind, repo]` family is read with
+  `usePendingRepoWrites` + `pendingWriteMatching` (typed twins:
+  `pendingIssueWrite`, `pendingDiscussionWrite`), matched on the record its
+  variables name.
+- **Record-scoped pending** — a detail view or strip that one mounted instance
+  reuses across records (the roster is the guard's `MEMBERS` list, below; a new
+  reused view joins it in the same change) never reads a mutation observer's
+  `isPending`/`isPaused`: that is instance state, so the next record shows the
+  previous one's spinner or held control. It reads the cache per record (the
+  bullet above). A run spanning several mutations takes a submit-time record
+  slot `{repo, …id}` behind a one-run gate (the promote dialogs' `pendingPub`);
+  a non-idempotent local write that must hold from the click, before the
+  batched cache notification lands, adds a slot set as an object token and
+  cleared compare-and-clear, so one press's settle never frees another's
+  (LocalIssueView's `statusSavingFor` is the reference). Guard:
+  `scripts/check-reused-view-pending.mjs` scans the member files, with reviewed
+  allowlist entries pinned to their enclosing function and binding (query
+  reads, repo-wide working-tree writes, mounts keyed per record); a plain
+  `useState` busy flag and a view outside its member list stay review concerns.
+- **Plugin-store open/reload** — an app-data store opens via
+  `memoizedStoreLoader` and re-reads via `reloadToleratingEmptyStore`
+  (`src/lib/plugin-store.ts`), never a hand-rolled `??= load(storeName(…))` or a
+  bare `store.reload()`: the former memoizes a REJECTED load (store dead until
+  restart), the latter swallows an unreadable file and saves the cache over it.
+- **Plugin-store writes take the cross-process lock** — a store a second app
+  instance (or the MCP server) can write wraps its read-modify-write in
+  `withAppStoreLock` (`src/lib/app-store-lock.ts`): identity/git resolution
+  BEFORE the lock, reload → mutate → forced `save()` inside it, all within the
+  module's serialize queue. Advisory and fail-open; cold-start instances skip it.
+- **Per-record repo scope** — a record offered per-repo-or-globally carries a
+  `scope` string: the `"global"` sentinel (also the absent-value default) or
+  an identity key. Reads match BOTH key forms (raw + identity, most-preferred
+  last); writes fold raw→identity; an UNKNOWN scope fails closed (never widens
+  to global); the owning store re-homes old-path keys on relocate, inside its
+  own serialized write. Two instances: `settings/mcp.ts` (`serverScope`;
+  `rehomeServerRepoKeys`, run by `relocateRecentRepo` on the settings chain)
+  and `scripts/scope.ts` (`taskScope`; its re-home is `rehomeTaskScopes` in
+  `scripts/store.ts`, run from repo-data-migration.ts) — deliberate mirrors of
+  each other, not a shared import.
+- **Repo-identity observers** — every observer of `["repo-identity", repoPath]`
+  spreads the ONE factory `repoIdentityQueryOptions`
+  (`src/lib/git/repo-identity-query.ts`), never an inline query: its strict
+  queryFn REJECTS on IPC failure, so a transient error retries instead of pinning
+  the raw-path fallback for the session. Three steady states, not two — resolved,
+  pending, and a MOUNTED observer sitting on `isError` with no data until a
+  remount: a consumer gating on `data !== undefined` must treat the error as
+  settled (fall back to the raw path, the key the swallowing `repoIdentity` and
+  the disk loaders use) or its gate never opens. A store's WRITER takes
+  `repoIdentityStrict` unless its reads heal through a `foldIdentityKey` fold:
+  swallowing in a fold-less writer mints a record no healed read consults (the
+  exemplar is `conversation-filters/store.ts`); loaders may still swallow, since
+  a defaults read costs one session, never a strand. `pnpm run checks` fails the
+  `inline-repo-identity-query` guard on the key spelled anywhere but the factory.
+- **Hydrate gating** — a `hydrate` that swallows its read must NEVER set the
+  ready flag, and a snapshot write gates on a RESOLVED `hydrate()`, not on the
+  flag: `memoizedStoreLoader` retries after a transient failure, so a store
+  marked ready on an empty read will write that empty snapshot over data it
+  never read (re-attempting on the write path is what makes it self-heal).
+  The flag alone suffices only where the state provably cannot change before
+  the read lands — `agentNumber`, whose `ensure` won't mint while it's false.
+- **Ref names vs short refs** — HEAD's branch comes from
+  `git::branches::current_branch_name` (or `current_branch_ref` for a rev
+  position), never `rev-parse --abbrev-ref HEAD`; ref lists read `%(refname)`
+  and strip exactly `refs/heads/` / `refs/remotes/` / `refs/tags/`, never
+  `%(refname:short)`. git's short forms disambiguate (`heads/<x>`,
+  `remotes/<r>/<x>`, or the full ref) whenever a tag or other ref shares the
+  name, so a NAME use (comparison, branch argument, config key, refspec, forge
+  API) misroutes. A REV use keeps git's form or the full ref, never a stripped
+  bare name, which resolves to a same-named tag first. `symbolic-ref` also
+  answers on an unborn branch — a site that must refuse before the first commit
+  checks `head_is_unborn`.
+- **Branch names as revs** — a branch name never reaches a REV position (a
+  range, a `^{commit}` peel, a rev-taking argv, a `fetch` refspec source) bare:
+  gitrevisions resolves a same-named tag first. Resolve it via
+  `git::branches::branch_first_rev` (once per side for a pair; inside
+  compare.rs, `local_branch_revs`) or read the tip sha via
+  `git::branches::branch_tip_sha`; frontend composes pass `refs/heads/…` /
+  `refs/remotes/…` as the rev and keep the short name for display.
+  `<branch>@{upstream}` stays bare — git looks that name up as a branch and
+  refuses the `refs/heads/` spelling (measured, git 2.51.1)
+  (guard: check-rust-invariants check G).
+
+## Rust / Tauri conventions
+
+- **Large ints over IPC:** snowflake/`u64` ids lose precision as JS numbers —
+  serialize as strings end-to-end.
+- **Advisory probes fail SAFE toward inaction:** a probe whose verdict can
+  unlock a destructive offer (`BranchRewriteStatus` is the model) keeps its
+  VERDICT "unknown" on any failed sub-probe, and never ships a defaulted
+  count PRESENTED AS MEASURED — the pre-verdict shape zeroes the counts, and
+  the null verdict is what makes them unreadable (every consumer gates on
+  the verdict first). Callers render exactly what they render without the
+  data. The unlock condition must rest on measured evidence (e.g. rewrite =
+  reflog miss AND patch-twins present — strong evidence, not proof; the
+  failure direction stays inaction), and the destructive action targets the
+  measured sha, never a re-resolved ref.
+- **GraphQL nullability:** fields without `!` deserialize into `Option<T>`;
+  never `unwrap_or_default()` a `from_value`; confirm a field exists before
+  querying it.
+- **Sync Tauri commands run on the main thread** — take the value under the
+  lock, drop the guard, then block; prefer `try_wait`-style non-blocking.
+- **Command futures stay small:** the invoke handler CONSTRUCTS a
+  `#[tauri::command]`'s future on the WebView2 UI-thread stack before the
+  runtime polls it on a worker — a large command future overflows that stack
+  in release builds (dev never reproduced it: the debug-profile future
+  measured 123,000 B against a ~721 KB release handler frame, and debug
+  `Box::pin`s command futures at the IPC boundary; on Windows dev IPC uses
+  the same custom protocol). The trigger is per-future stack footprint, not join
+  arity: sub-futures holding capture buffers or nested async chains get
+  spawned (`tauri::async_runtime::spawn`) or `Box::pin`ned before a `join!`.
+  A 7-way inline join of process-spawning probes shipped a stack-overflow
+  crash (v0.12.1 About page). (guard: `system_health_future_stays_small`,
+  src-tauri/src/health.rs — per-command by choice; a new command joining
+  capture-buffer futures adds its own.)
+- **Untrusted JSON** (CLI output, forge APIs): TS derivers `typeof`/shape-guard
+  each field with `try/catch` per item; Rust uses tolerant serde (`Option<T>`,
+  null-tolerant defaults) over strict shapes. Grammar-validate command/URL
+  values either side. Third-party timestamps validate before formatting —
+  `parseableDate` for ISO strings, `validEpochMs` for epoch numbers
+  (`src/lib/time.ts`); never raw `new Date(x)` on forge/CLI data.
+- **Windows spawning:** never pass multi-line argv to `.cmd` shims
+  (BatBadBut rejection) — feed multi-line input via stdin.
+- **User input → git refspecs/argv** routes through the existing chokepoints:
+  `validate_ref_name` (git/branches.rs), `validate_tag_name` (git/ops.rs),
+  pushes via `build_push_args` (git/remote.rs) — never construct an inline
+  refspec or re-derive the validation. MCP tools push only through
+  `git_push_same_name_core` (it refuses a named push onto a differently named
+  branch of a named remote) and the HEAD-only `git_force_push_head_core`
+  (git/remote.rs); `git_push_core`, the GUI's follow-tracking entry, stays
+  private to `git::remote` so no MCP tool can reach it. Refs reaching a
+  compare-endpoint basehead route through `forge::validate_compare_branch`
+  (guard: check-rust-invariants check E).
+- **Merges into a checkout check for ignored files first:** git's merge
+  default silently replaces an ignored file the incoming side tracks, and
+  merge-ort ignores `--no-overwrite-ignore` on 3-way merges (measured, git
+  2.51.1). Every merge or non-rebase pull into a user checkout calls
+  `git::ignored_guard::ignored_files_in_the_way` under its working-tree hold,
+  before any stash push, and refuses on a hit with fixed copy free of the
+  frontend's dirty-tree and conflict markers. It may step aside where git
+  refuses on its own (unmerged entries, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, an
+  unresolvable target or missing upstream, a non-fast-forward `--ff-only` pull,
+  unrelated histories). Exempt: a `merge` argv whose own literal carries
+  `--ff-only --no-overwrite-ignore` (git refuses natively) and fresh throwaway
+  checkouts. A caller of an argv builder runs the guard itself (guard:
+  check-rust-invariants check H, per function).
+- Test-side update-marker holders under the process-wide root override use
+  branch names no other test uses (guard: check-rust-invariants check I for
+  `UpdateMarker::create_for` calls in test modules, following one level of
+  same-file helper delegation for the override). Production-path mints and
+  the other gaps listed in check I's header comment are review-enforced.
+- **Rust tests never read the real settings store** — use the
+  `TEST_STORE_DIR` seam in `app_store.rs` (arm 0 of `store_path`). The other
+  app-data modules carry their own seams with the opposite arm order
+  (`oplog.rs` `GD_OPLOG_DIR`, `review_notes.rs` `GD_REVIEW_NOTES_DIR`:
+  env override outranks the `cfg!(test)` temp arm; both ship in release) —
+  a new store module mirrors one of these, never resolves app-data bare.
+  Concurrency: the MCP server is a second writing process, so both stores'
+  read→modify→writes take the cross-process file lock in `store_lock.rs` (a
+  `create_new` lock file beside the store, stale-evicted, fail-open) on top of
+  their own in-process guards — `oplog.rs` its `OPLOG_LOCK` mutex,
+  `review_notes.rs` its `notes_lock()` mutex — with the atomic whole-file
+  replace underneath both (torn-file safety, not lost-update safety). The GUI's
+  review-notes writes route through the locked `review_notes_set_branch` /
+  `review_notes_delete_branch` Tauri commands rather than the plugin store
+  (cold-start test mode is the one exception: it aliases the store file and
+  has no second writer). A NEW store module with more than one process
+  writing adopts `store_lock` — don't assume last-writer-wins is acceptable.
+- **Forge gating:** per-action `Implemented` flags. Shared-with-GitHub
+  controls gate on `canWrite || forgeFeatureReady` (GitHub must be zero-diff);
+  provider-only controls gate on `forgeFeatureReady` alone with the flag
+  `false` for GitHub; shared controls with different per-provider ids
+  guard/dispatch on the common key and carry both id pairs. Write-access
+  axes: availability decides what RENDERS; permission decides what's ENABLED
+  (disable-with-reason, never hide); triage is its own lower tier — see
+  `src/features/pulls/usePrCapabilities.ts`.
+- A server-constrained field in a shared PATCH rejects the whole request when
+  ineligible — model as `Option` + eligibility check; hide/omit when ineligible.
+- **A Tauri package's two halves move together:** the crate
+  (`src-tauri/Cargo.toml` → `Cargo.lock`) and its npm half (`package.json` →
+  `pnpm-lock.yaml`) must agree on major.minor or `tauri build` refuses the
+  pair. An npm bump already reddens appimage-check (its paths filter lists
+  `package.json`); the blind spots are a crate-only bump and a lockfile-only
+  drift inside a caret range, both gated by check-tauri-plugin-parity.mjs on
+  every PR. A Dependabot group can't span ecosystems, so the two PRs combine.
+- **CodeMirror/Lezer core packages are lockfile SINGLETONS**, gated by
+  `scripts/check-lockfile-dedupe.mjs` (its `SINGLETONS` list): two installed
+  copies of `@codemirror/state` throw at editor open, and a split
+  `@lezer/highlight` drops theme coloring — neither shows in build or tests.
+  Remedy is `pnpm dedupe`, then an `overrides:` pin in `pnpm-workspace.yaml`
+  for a split that survives it.
+
+## Code comments
+
+Constraint-statements only: the decision + one sentence of why (≤3 lines
+typical, ~6 for genuinely multi-constraint blocks). KEEP-class content:
+invariants, ordering/locking rules, deliberate non-obvious choices, cross-module
+and IPC contracts, empirically-learned external-API/platform behavior, public-API
+doc contracts. NEVER: what the code used to do or replaced, PR/issue/review
+references, how a bug was caught, worked numeric examples where the principle
+sentence suffices, narrating the next line, arguing the change is correct (the
+commit message and PR own the story). Trim any comment you touch to this
+standard.
+Carve-out: measured figures a later reader would otherwise have to re-measure
+(payload sizes, timed runs) may stay and cite their source (a PR or run
+reference is fine there).
+
+⚠ Rust doc-comment rewrites are a clippy surface — a `///` line starting with a
+Markdown bullet char (`+`/`-`/`*`) mid-sentence turns the following lines into
+`doc_lazy_continuation` lints. Run the Verification block's clippy line after any
+doc-comment edit.
+
+## Docs-sync (same change, unprompted)
+
+CLAUDE.md defines the full rule; short form for a user-facing feature: README
+*Highlights/Features* bullet → site `capabilities` (+ `FeatureRow` when it
+warrants; non-AI features in both site views) → in-app guide
+`src/features/help/content.ts` → a `changelog.d/<added|changed|fixed>-<slug>.md`
+fragment (its body is the finished Keep-a-Changelog bullet). **Never hand-edit
+`## [Unreleased]` in `CHANGELOG.md`** — it's *generated* from the fragments at
+release time; one file per change keeps parallel branches conflict-free. The
+`fragment` check is **required** on master and keys on paths — any `src/` or
+`src-tauri/` change needs a fragment, the `no-changelog` label, or
+`skip-changelog` in the PR title.
+
+**Skills ship in TWO trees — edit both.** `.claude/skills/<name>` (the Claude
+store) and `.agents/skills/<name>` (the vendor-neutral store the codex and
+opencode lanes read) are separate committed copies, and nothing propagates an
+edit between them, so a lane resolving the copy you did not edit gets stale
+text. `scripts/check-skill-mirrors.mjs` gates every skill present in both trees
+and is a required `guards` step; the skips it declares (`EXEMPT` for per-harness
+rewrites, `SINGLE_TREE` for one-tree skills) each carry their reason. Line
+endings, the two trees' `.claude/`-vs-`.agents/` path references, the
+`/cmd`-vs-`$cmd` sigil, and harness-only frontmatter keys are normalized away —
+everything else must match. The path rewrite is symmetric, so byte-identical
+copies always compare equal; the script header records what that costs.
+
+**In a delegated package the spec's `Docs-sync:` field is authoritative:**
+apply exactly what it lists (those files are thereby in scope); "orchestrator
+handles" → skip docs; silent spec + user-facing change → flag the gap in your
+report, don't exceed scope.
+
+Help-content specifics: shortcuts are `{{kbd:action-id}}` / `{{key:…}}`
+tokens, never literal keys — but a `defaultBinding: null` (palette-only)
+action gets **no token at all** (it renders the literal word "palette" —
+HelpScreen's `PALETTE_ONLY` set); mention it as plain prose. AI-only content
+gated with `ai: true` + `{{ai}}…{{/ai}}`. Verify every claim against code;
+sweep stale "coming soon" mentions when a feature ships.
+
+## Prevention standing rules (owner-adopted 2026-08-15)
+
+- **Tripwire:** a fix that closes a CLASS of defect ships its mechanical guard
+  in the same change — a biome `noRestrictedImports` entry, a `scripts/check-*`
+  pattern or allowlist rule, or a pinning test. A swept class without a
+  tripwire has re-opened before; the sweep alone is not the fix.
+- **Class-grep at accept time:** when a review or session finding is accepted,
+  grep its class immediately — fix every sibling in the same batch, or record
+  the count with a named home. Never leave the Nth instance for a later PR.
+- **Conventions-sync:** a change that builds a reusable primitive adds its line
+  to THIS file in the same change (the docs-sync rule, applied to idioms). A
+  change to a hard rule also updates every file that states that rule, wherever
+  it is restated — the always-loaded excerpt `.claude/rules/git-safety.md`, the
+  repo `AGENTS.md`, the agent definitions, and any carrier added later;
+  `scripts/check-rule-mirrors.mjs` holds the gated list for the git whitelist
+  and fails when a carrier drops the rule's core (the codex spec preamble
+  restates it condensed, synced by hand).
+- **No inline gate predicates in CI YAML:** a check's logic never ships as an
+  inline `node -e`/shell string in a workflow file — it is invisible to biome,
+  to `node --test`, and to every static review lane (four independent defects
+  once shipped in one such predicate). Extract to `scripts/check-*.mjs` with
+  hit/miss fixtures in `scripts/checks.test.mjs`; the YAML step only invokes
+  the script.
+- **Guard scripts default CLOSED on inputs they cannot read:** every
+  `scripts/check-*.mjs` enumerates its unreadable-input arms — unquoted or
+  folded YAML scalars, binary bytes, deleted/missing files, empty corpora,
+  non-string values, duplicate keys — and FAILS on them instead of skipping.
+  Mining minted the fail-open-checker-arm class on 12+ records across 6 PRs,
+  concentrated in the guard scripts the tripwire rule itself ships: a scanner
+  that exits 0 on input it could not parse approves exactly what it cannot
+  see. Each arm gets a miss fixture in `scripts/checks.test.mjs`, and an
+  empty-corpus / zero-files-matched result is a FAIL or an explicit annotated
+  skip, never a pass. **A PR that ships a scanner/guard is a parser-grade
+  adversarial surface:** budget a dedicated adversarial loop over its input
+  grammar (aliased/namespace imports, destructured params, catch bindings —
+  the shapes reviewers actually threw) or ship the guard as its own PR — one
+  cycle-3 PR (#425) paid 9+ consecutive reviewer rounds draining exactly those
+  arms one at a time.
+
+## Definition of done
+
+Verification green (failures quoted verbatim, passes one line each); edge
+cases exercised (first/last/empty, boundaries); keyboard nav + palette
+registration wired for new UI; docs-sync per the spec's `Docs-sync:` field
+(gaps flagged, never silently skipped); footprint sweep via
+`git --no-pager status` accounting for YOUR files only (the tree may hold the
+user's parallel WIP and sibling packages — don't touch or explain what isn't
+yours); nothing committed, ever.

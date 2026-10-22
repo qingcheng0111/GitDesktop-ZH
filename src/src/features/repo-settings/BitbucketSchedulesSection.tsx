@@ -1,0 +1,437 @@
+import { PlusIcon } from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { toast } from "sonner";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { SelectClipText } from "@/components/select-clip-text";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
+import { clipTitleFromText } from "@/lib/clip-title";
+import {
+  useBbCreateSchedule,
+  useBbDeleteSchedule,
+  useBbPipelinesConfig,
+  useBbSchedules,
+  useBbSetPipelinesEnabled,
+  useBbSetScheduleEnabled,
+  useBranches,
+} from "@/lib/git/queries";
+import type { BitbucketPipelineSchedule } from "@/lib/git/types";
+import { toastError } from "@/lib/toast";
+import { useOnline } from "@/lib/use-online";
+import {
+  PipelinesConfigGate,
+  PipelinesDisabledBanner,
+} from "./BitbucketVariablesSection";
+import {
+  ACT_PENDING_REASON,
+  HeldSwitch,
+  InlineConfirm,
+  NEW_FORM_SWAP_KEY,
+  OFFLINE_WRITE_REASON,
+  RemoteListSection,
+  type SwapFocusRef,
+  useConfirmSwapFocus,
+} from "./parts";
+
+const bbSchedulesKey = (repo: string) => ["repo", repo, "bb-schedules"];
+
+/** Bitbucket pipeline schedules: cron-triggered pipelines on a branch. Same
+ *  pipelines-disabled banner as the variables section; each row toggles enabled
+ *  in place (a single discrete control, so apply-on-change) and deletes with a
+ *  confirm. Cron patterns are QUARTZ format (e.g. "0 0 12 * * ?"). The list can lag
+ *  a create by ~1s (server replication), so the created row is patched into the
+ *  cache by the awaited create's continuation and reconciled by a single
+ *  delayed refetch. */
+export function BitbucketSchedulesSection({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const config = useBbPipelinesConfig(repoPath, open);
+  const setEnabled = useBbSetPipelinesEnabled(repoPath);
+  const enabled = config.data?.enabled ?? false;
+  const schedules = useBbSchedules(repoPath, open && enabled);
+  const branches = useBranches(repoPath);
+  const setScheduleEnabled = useBbSetScheduleEnabled(repoPath);
+  const remove = useBbDeleteSchedule(repoPath);
+  const queryClient = useQueryClient();
+
+  const [creating, setCreating] = useState(false);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const swapFocus = useConfirmSwapFocus();
+
+  function patchRow(row: BitbucketPipelineSchedule) {
+    queryClient.setQueryData<BitbucketPipelineSchedule[]>(
+      bbSchedulesKey(repoPath),
+      (prev) => {
+        const list = prev ?? [];
+        const at = list.findIndex((s) => s.uuid === row.uuid);
+        if (at >= 0) {
+          const next = [...list];
+          next[at] = row;
+          return next;
+        }
+        return [...list, row];
+      },
+    );
+  }
+
+  // Bitbucket's schedules LIST lags a create by ~1s, so reconcile the optimistic
+  // patch with a SINGLE delayed refetch (past the observed lag) — this is what
+  // swaps a synthetic `pending:` uuid for the server's real one. An immediate
+  // invalidate would refetch a list without the new row and keep the empty state.
+  function reconcileAfterCreate() {
+    setTimeout(() => {
+      queryClient.invalidateQueries({ queryKey: bbSchedulesKey(repoPath) });
+    }, 2500);
+  }
+
+  // Awaited, not per-call callbacks: this subtree unmounts when the dialog
+  // closes or the rail crossfades to another section, and react-query drops
+  // per-call callbacks on unmount — the outcome would never reach the user.
+  async function handleEnablePipelines() {
+    try {
+      await setEnabled.mutateAsync(true);
+      toast.success("Pipelines enabled");
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  async function handleToggle(uuid: string, next: boolean) {
+    try {
+      await setScheduleEnabled.mutateAsync({ uuid, enabled: next });
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  async function handleRemove(uuid: string) {
+    try {
+      await remove.mutateAsync(uuid);
+      toast.success("Schedule deleted");
+      setConfirming(null);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  // Every arm rides the gate, the `creating` form as well as the banner: until
+  // the config loads, this section can't tell whether schedules are available
+  // to create at all.
+  if (config.data && !enabled) {
+    return (
+      <PipelinesConfigGate config={config}>
+        <PipelinesDisabledBanner
+          pending={setEnabled.isPending}
+          onEnable={handleEnablePipelines}
+        />
+      </PipelinesConfigGate>
+    );
+  }
+
+  if (creating) {
+    return (
+      <PipelinesConfigGate config={config}>
+        <ScheduleForm
+          repoPath={repoPath}
+          branches={(branches.data ?? [])
+            .map((b) => b.name)
+            .filter((n) => !n.startsWith("gd/session/"))}
+          onPatch={patchRow}
+          onReconcile={reconcileAfterCreate}
+          swapFocusRef={swapFocus(NEW_FORM_SWAP_KEY)}
+          onDone={() => setCreating(false)}
+        />
+      </PipelinesConfigGate>
+    );
+  }
+
+  return (
+    <PipelinesConfigGate config={config}>
+      <div data-confirm-section className="min-w-0 space-y-3">
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-muted-foreground">
+            Run a pipeline on a branch automatically, on a cron schedule.
+          </p>
+          <Button
+            ref={swapFocus(NEW_FORM_SWAP_KEY)}
+            data-confirm-fallback
+            size="sm"
+            onClick={() => setCreating(true)}
+          >
+            <PlusIcon data-icon="inline-start" />
+            Add schedule
+          </Button>
+        </div>
+
+        <RemoteListSection
+          query={schedules}
+          rowCount={schedules.data?.length ?? 0}
+          noun="schedules"
+          loadFailed="Couldn't load schedules."
+          extraPaused={config.isPaused}
+          emptyLabel="No schedules yet — a schedule runs a branch's pipeline on a recurring cron."
+          skeletonClassName="h-12 w-full"
+          errorTitle="Couldn't load schedules."
+          errorHint="If this is a permissions error, managing schedules needs admin on this repository."
+        >
+          {schedules.data?.map((s) => (
+            <ScheduleRow
+              key={s.uuid}
+              schedule={s}
+              toggling={
+                setScheduleEnabled.isPending &&
+                setScheduleEnabled.variables?.uuid === s.uuid
+              }
+              onToggle={(next) => handleToggle(s.uuid, next)}
+              confirming={confirming === s.uuid}
+              pending={remove.isPending}
+              swapFocusRef={swapFocus(s.uuid)}
+              onConfirm={() => setConfirming(s.uuid)}
+              onCancel={() => setConfirming(null)}
+              onRemove={() => handleRemove(s.uuid)}
+            />
+          ))}
+        </RemoteListSection>
+      </div>
+    </PipelinesConfigGate>
+  );
+}
+
+function ScheduleRow({
+  schedule,
+  toggling,
+  onToggle,
+  confirming,
+  pending,
+  swapFocusRef,
+  onConfirm,
+  onCancel,
+  onRemove,
+}: {
+  schedule: BitbucketPipelineSchedule;
+  toggling: boolean;
+  onToggle: (enabled: boolean) => void;
+  confirming: boolean;
+  pending: boolean;
+  /** The section's confirm-swap ref for this row's Delete. */
+  swapFocusRef: SwapFocusRef;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRemove: () => void;
+}) {
+  // A just-created row carries a synthetic `pending:` uuid until the reconcile
+  // refetch swaps in the server's real one; a toggle/delete against a fake uuid
+  // would 404, so both controls stay disabled while it's syncing.
+  const syncing = schedule.uuid.startsWith("pending:");
+  const online = useOnline();
+  const deleteLabel = `Delete schedule for ${schedule.refName} (${schedule.cronPattern})`;
+  const toggleHeld = (() => {
+    switch (true) {
+      case syncing:
+        return "Syncing with Bitbucket…";
+      case !online:
+        return OFFLINE_WRITE_REASON;
+      default:
+        return undefined;
+    }
+  })();
+  return (
+    <div
+      data-confirm-row
+      className="flex items-center gap-2 rounded-md border p-2 text-xs"
+    >
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-mono font-medium" title={schedule.refName}>
+          {schedule.refName}
+        </p>
+        <p className="mt-0.5 font-mono text-muted-foreground">
+          {schedule.cronPattern}
+        </p>
+      </div>
+      <HeldSwitch
+        checked={schedule.enabled}
+        heldReason={toggleHeld}
+        saving={toggling}
+        onCheckedChange={onToggle}
+        aria-label={`Schedule enabled for ${schedule.refName} (${schedule.cronPattern})`}
+      />
+      {confirming ? (
+        <InlineConfirm
+          prompt="Delete?"
+          actLabel="Delete"
+          pending={pending}
+          heldReason={online ? undefined : OFFLINE_WRITE_REASON}
+          swapFocusRef={swapFocusRef}
+          onCancel={onCancel}
+          onAct={onRemove}
+        />
+      ) : syncing ? (
+        <DisabledReasonButton
+          ref={swapFocusRef}
+          size="sm"
+          variant="ghost"
+          className="text-muted-foreground"
+          disabled
+          reason="Syncing with Bitbucket…"
+          aria-label={deleteLabel}
+        >
+          Delete
+        </DisabledReasonButton>
+      ) : (
+        <Button
+          ref={swapFocusRef}
+          size="sm"
+          variant="ghost"
+          className="text-muted-foreground hover:text-destructive"
+          onClick={onConfirm}
+          aria-label={deleteLabel}
+        >
+          Delete
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function ScheduleForm({
+  repoPath,
+  branches,
+  onPatch,
+  onReconcile,
+  swapFocusRef,
+  onDone,
+}: {
+  repoPath: string;
+  branches: string[];
+  onPatch: (row: BitbucketPipelineSchedule) => void;
+  onReconcile: () => void;
+  /** Hands focus back to Add schedule when this form closes. */
+  swapFocusRef: SwapFocusRef;
+  onDone: () => void;
+}) {
+  const create = useBbCreateSchedule(repoPath);
+  const online = useOnline();
+  const [refName, setRefName] = useState(branches[0] ?? "");
+  const [cron, setCron] = useState("");
+
+  const cronValid = cron.trim().length > 0;
+  const canSave =
+    refName.length > 0 && cronValid && !create.isPending && online;
+  const offlineReason = online ? undefined : OFFLINE_WRITE_REASON;
+  const warning = !refName
+    ? "Pick a branch."
+    : !cronValid
+      ? "Enter a Quartz cron pattern."
+      : null;
+
+  async function submit() {
+    const cronPattern = cron.trim();
+    const created: BitbucketPipelineSchedule = {
+      // The create call returns void, so synthesize a uuid; the reconcile refetch
+      // replaces it with the server's real row shortly. A random uuid (not one
+      // derived from branch+cron) keeps two identical back-to-back creates from
+      // colliding on the same synthetic key and overwriting in the cache.
+      uuid: `pending:${crypto.randomUUID()}`,
+      refName,
+      cronPattern,
+      enabled: true,
+    };
+    try {
+      await create.mutateAsync({ refName, cronPattern, enabled: true });
+      onPatch(created);
+      onReconcile();
+      toast.success("Schedule added");
+      onDone();
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="min-w-0 space-y-3">
+      <div className="space-y-3 rounded-md border p-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="bb-schedule-branch">Branch</Label>
+          <Select
+            items={Object.fromEntries(branches.map((b) => [b, b]))}
+            value={refName}
+            onValueChange={(v) => {
+              if (v) setRefName(v);
+            }}
+          >
+            <SelectTrigger id="bb-schedule-branch" className="w-full">
+              <SelectValue
+                placeholder="Select a branch"
+                onMouseEnter={clipTitleFromText}
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {branches.map((b) => (
+                <SelectItem key={b} value={b}>
+                  <SelectClipText>{b}</SelectClipText>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="bb-schedule-cron">Cron pattern</Label>
+          {/* The form's first keyed node, so opening it lands here: the branch
+              comes preselected, and the cron is what needs typing. */}
+          <Input
+            ref={swapFocusRef}
+            id="bb-schedule-cron"
+            value={cron}
+            onChange={(e) => setCron(e.target.value)}
+            placeholder="0 0 12 * * ?"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-mono"
+          />
+          <p className="text-[11px] text-muted-foreground">
+            Quartz cron format.
+          </p>
+        </div>
+        {warning && <p className="text-[11px] text-warning">{warning}</p>}
+        <div className="flex items-center justify-end gap-2 border-t pt-3">
+          <Button
+            ref={swapFocusRef}
+            variant="outline"
+            size="sm"
+            onClick={onDone}
+          >
+            Cancel
+          </Button>
+          <DisabledReasonButton
+            ref={swapFocusRef}
+            size="sm"
+            disabled={!canSave}
+            reason={
+              offlineReason ??
+              (create.isPending ? ACT_PENDING_REASON : undefined) ??
+              warning
+            }
+            onClick={submit}
+          >
+            {create.isPending && <Spinner data-icon="inline-start" />}
+            Add
+          </DisabledReasonButton>
+        </div>
+      </div>
+    </div>
+  );
+}

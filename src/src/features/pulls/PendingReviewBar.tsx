@@ -1,0 +1,234 @@
+import { useState } from "react";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { Markdown } from "@/components/markdown/markdown";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { CommentEditor } from "@/features/conversations/CommentEditor";
+import {
+  pendingWriteMatching,
+  useForgeStatus,
+  usePendingRepoWrites,
+} from "@/lib/git/queries";
+import type { RemoteLens } from "@/lib/git/types";
+import {
+  type ClearReviewDraftsVars,
+  LOCAL_REVIEW_WRITES_FAMILY,
+  type ReviewDraft,
+  useClearReviewDrafts,
+  useRemoveReviewDraft,
+  useReviewDrafts,
+  useUpdateReviewDraft,
+} from "@/lib/pulls/review-drafts";
+import { useLatestRef } from "@/lib/use-latest-ref";
+
+/** The anchor label for a draft: "Lines a–b" for a range, "Line b" otherwise. */
+function draftLabel(draft: ReviewDraft): string {
+  if (draft.startLine && draft.startLine !== draft.line) {
+    return `Lines ${draft.startLine}–${draft.line}`;
+  }
+  return `Line ${draft.line}`;
+}
+
+/**
+ * One pending draft comment, rendered under its anchored diff line (the Files
+ * tab) or in a list: a `Pending` badge (semantic token + text, never color
+ * alone), a markdown body preview, and always-visible Edit (inline editor swap)
+ * and Delete (confirm) controls — no hover-reveal. Wired to the draft store's
+ * update/remove hooks. Exported for PrFilesPane's draft anchors.
+ */
+export function DraftCommentCard({
+  repoPath,
+  lens,
+  number,
+  draft,
+}: {
+  repoPath: string;
+  /** The origin|upstream lens the parent PR view resolved (scopes the drafts). */
+  lens: RemoteLens;
+  number: number;
+  draft: ReviewDraft;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [body, setBody] = useState(draft.body);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const updateDraft = useUpdateReviewDraft(repoPath, lens, number);
+  const removeDraft = useRemoveReviewDraft(repoPath, lens, number);
+  // A draft body carries the same references the posted comment will, so the
+  // preview linkifies them against the PR's repo.
+  const provider = useForgeStatus(repoPath).data?.provider;
+  const refs = provider ? { provider, repoPath, lens } : undefined;
+
+  const next = body.trim();
+  const canSave = next.length > 0 && next !== draft.body.trim();
+
+  // Awaited rather than per-call mutate callbacks: these cards unmount on a tab
+  // switch away from Files, and react-query drops per-call callbacks once an
+  // observer has no listeners. The catches do nothing because both draft hooks
+  // toast failures at mutation level, which fires for `mutateAsync` rejections
+  // too, so a catch of our own would double-report.
+  async function saveEdit() {
+    if (!canSave) return;
+    try {
+      await updateDraft.mutateAsync({ id: draft.id, body: next });
+      setEditing(false);
+    } catch {
+      // Reported at hook level (see above).
+    }
+  }
+
+  async function deleteDraft() {
+    try {
+      await removeDraft.mutateAsync(draft.id);
+      setConfirmDelete(false);
+    } catch {
+      // Reported at hook level (see above).
+    }
+  }
+
+  return (
+    <div className="space-y-1.5 rounded border bg-background px-3 py-2 text-xs">
+      <div className="flex items-center gap-2">
+        <Badge variant="secondary" className="shrink-0 text-warning">
+          Pending
+        </Badge>
+        <span className="truncate font-mono text-muted-foreground">
+          {draftLabel(draft)}
+        </span>
+        {!editing && (
+          <>
+            <span className="flex-1" />
+            <Button
+              variant="ghost"
+              size="xs"
+              className="text-muted-foreground"
+              onClick={() => {
+                setBody(draft.body);
+                setEditing(true);
+              }}
+            >
+              Edit
+            </Button>
+            <Button
+              variant="ghost"
+              size="xs"
+              className="text-destructive"
+              onClick={() => setConfirmDelete(true)}
+            >
+              Delete
+            </Button>
+          </>
+        )}
+      </div>
+      {editing ? (
+        <CommentEditor
+          value={body}
+          onChange={setBody}
+          onSubmit={() => void saveEdit()}
+          onCancel={() => setEditing(false)}
+          canSubmit={canSave}
+          pending={updateDraft.isPending}
+          ariaLabel="Edit pending comment"
+          textareaClassName="max-h-48 min-h-16 resize-y"
+        />
+      ) : (
+        <Markdown refs={refs}>{draft.body}</Markdown>
+      )}
+      <ConfirmDialog
+        open={confirmDelete}
+        onCancel={() => setConfirmDelete(false)}
+        title="Delete pending comment?"
+        body="This removes the draft comment from your pending review. It hasn't been posted yet."
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        pending={removeDraft.isPending}
+        onConfirm={() => void deleteDraft()}
+      />
+    </div>
+  );
+}
+
+/**
+ * The pending-review status bar: hidden until at least one draft comment exists,
+ * then a compact "Review in progress · N pending comment(s)" line with a primary
+ * "Submit review…" (opens the parent's submit dialog via `onSubmit`) and a
+ * destructive-styled "Discard" (confirmed before clearing). Reads its own draft
+ * count; self-contained and non-sticky (P5 places it at a stable slot). No layout
+ * shift on appearance — it simply renders nothing at zero drafts.
+ */
+export function PendingReviewBar({
+  repoPath,
+  lens,
+  number,
+  onSubmit,
+}: {
+  repoPath: string;
+  /** The origin|upstream lens the parent PR view resolved (scopes the drafts). */
+  lens: RemoteLens;
+  number: number;
+  onSubmit: () => void;
+}) {
+  const drafts = useReviewDrafts(repoPath, lens, number);
+  const clearDrafts = useClearReviewDrafts(repoPath, lens);
+  // This PR's own clear, from the cache: the bar outlives a PR switch, and a
+  // post-submit clear or the palette's discard on this PR holds it too.
+  const clearing =
+    pendingWriteMatching(
+      usePendingRepoWrites(LOCAL_REVIEW_WRITES_FAMILY, repoPath),
+      "clear-drafts",
+      (v: ClearReviewDraftsVars) => v.number === number,
+    ) !== undefined;
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const count = drafts.data?.length ?? 0;
+  // The PR view swaps pull requests without remounting this bar, so its confirm
+  // resets on a switch (a render-time adjustment), and a discard settling after
+  // one leaves the next PR's confirm alone.
+  const prKey = `${repoPath}#${lens}#${number}`;
+  const prKeyRef = useLatestRef(prKey);
+  const [lastPrKey, setLastPrKey] = useState(prKey);
+  if (prKey !== lastPrKey) {
+    setLastPrKey(prKey);
+    setConfirmDiscard(false);
+  }
+
+  async function discard() {
+    const startedFor = prKey;
+    try {
+      await clearDrafts.mutateAsync({ number });
+      if (startedFor === prKeyRef.current) setConfirmDiscard(false);
+    } catch {
+      // Awaited with a do-nothing catch: see DraftCommentCard.
+    }
+  }
+
+  if (count === 0) return null;
+
+  return (
+    <div className="flex items-center gap-3 border-y bg-muted/40 px-3 py-1.5 text-xs">
+      <span className="min-w-0 flex-1 text-muted-foreground">
+        <span className="font-medium text-foreground">Review in progress</span>{" "}
+        · {count} pending comment{count === 1 ? "" : "s"}
+      </span>
+      <Button size="xs" onClick={onSubmit}>
+        Submit review…
+      </Button>
+      <Button
+        size="xs"
+        variant="ghost"
+        className="text-destructive"
+        onClick={() => setConfirmDiscard(true)}
+      >
+        Discard
+      </Button>
+      <ConfirmDialog
+        open={confirmDiscard}
+        onCancel={() => setConfirmDiscard(false)}
+        title="Discard pending review?"
+        body={`This deletes all ${count} pending comment${count === 1 ? "" : "s"}. They haven't been posted yet and can't be recovered.`}
+        confirmLabel="Discard review"
+        confirmVariant="destructive"
+        pending={clearing}
+        onConfirm={() => void discard()}
+      />
+    </div>
+  );
+}

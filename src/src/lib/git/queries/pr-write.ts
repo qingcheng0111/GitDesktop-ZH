@@ -1,0 +1,202 @@
+import {
+  type MutationCache,
+  type QueryKey,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useCallback } from "react";
+import { useMutation } from "@/lib/started-mutation";
+import { toastError } from "@/lib/toast";
+import * as api from "../api";
+import type { RemoteLens } from "../types";
+import { repoKeys } from "./core";
+import { useMutationCacheSnapshot, useRepoMutation } from "./internal";
+import {
+  type EditLabelsVars,
+  pendingLabelEditFor,
+  pendingMutationEntries,
+  prWriteKey,
+} from "./pr-writes";
+
+export function useEditPr(repo: string, lens: RemoteLens) {
+  return useRepoMutation(
+    repo,
+    (args: {
+      number: number;
+      title: string;
+      body: string;
+      /** Retarget the PR onto this base branch. Omit to leave the base alone —
+       *  a no-op retarget is still a forge write, and GitHub rejects one on a
+       *  stacked PR. */
+      base?: string;
+    }) =>
+      api.forgePrEdit(
+        repo,
+        args.number,
+        args.title,
+        args.body,
+        lens,
+        args.base,
+      ),
+  );
+}
+
+/** Stack a chain of open PRs (bottom→top) into a new stack. Takes the default
+ *  whole-repo invalidation: stacking rewrites every member's base and position,
+ *  so the PR detail, the list, and each member's own row all go stale at once —
+ *  the same reasoning as the PR-lifecycle mutations beside it. The member list
+ *  names every PR the write holds while it runs. */
+export function useStackCreate(repo: string, lens: RemoteLens) {
+  return useRepoMutation(
+    repo,
+    (pullRequests: number[]) => api.forgeStackCreate(repo, pullRequests, lens),
+    { identity: prWriteKey("stack-create", repo) },
+  );
+}
+
+/** Append a chain of open PRs (bottom→top) to an existing stack. */
+export function useStackAdd(repo: string, lens: RemoteLens) {
+  return useRepoMutation(
+    repo,
+    (args: { stackNumber: number; pullRequests: number[] }) =>
+      api.forgeStackAdd(repo, args.stackNumber, args.pullRequests, lens),
+    { identity: prWriteKey("stack-add", repo) },
+  );
+}
+
+/** Dissolve a stack — its members stay open on their branches, unstacked. */
+export function useStackDissolve(repo: string, lens: RemoteLens) {
+  return useRepoMutation(
+    repo,
+    (stackNumber: number) => api.forgeStackDissolve(repo, stackNumber, lens),
+    { identity: prWriteKey("stack-dissolve", repo) },
+  );
+}
+
+/** Add/remove labels on an issue, MR, or GitHub Discussion. GitHub uses the node-id path
+ *  (`labelableId` + `addIds`/`removeIds`); GitLab uses names (`target` + `number` +
+ *  `addNames`/`removeNames`). `kind` is the reconcile discriminator and picks the wire
+ *  `target` (issue→"issue", mr→"mr", discussion→"issue" with number 0, which the node-id
+ *  path ignores). Reconciles per-kind on settle instead of whole-repo. */
+export function useEditPrLabels(repo: string, lens: RemoteLens) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    // The entity rides the variables, so a picker remounted on it still finds the
+    // write ({@link usePendingLabelEdit}) and a switch never detaches it.
+    mutationKey: prWriteKey("labels", repo),
+    mutationFn: (args: EditLabelsVars) =>
+      api.forgeEditLabels(
+        repo,
+        args.kind === "mr" ? "mr" : "issue",
+        // GitHub Discussions use the node-id path; the wire number is unused and
+        // stays 0 to match the old `args.number ?? 0` default byte-for-byte.
+        args.kind === "discussion" ? 0 : args.number,
+        args.labelableId,
+        args.addIds,
+        args.removeIds,
+        args.addNames ?? [],
+        args.removeNames ?? [],
+      ),
+    // Mutation-level: see useTimeTrackingMutation. The label pickers are keyed per
+    // entity, so a switch mid-flight used to drop the failure silently.
+    onError: (e) => toastError(e),
+    onSettled: (_d, _e, args) => {
+      // Issue/MR narrow keys carry the lens they were read under; discussions are
+      // not lens-scoped (GitHub Discussions have no fork lens) — keyed as before.
+      const keysByKind: Record<typeof args.kind, (n: number) => QueryKey[]> = {
+        issue: (n) => [
+          [...repoKeys.issueList(repo), lens],
+          ["repo", repo, "issue", lens, n],
+        ],
+        mr: (n) => [
+          ["repo", repo, "pr", lens, n],
+          [...repoKeys.prList(repo), lens],
+          // A label edit moves the PR's `updatedAt`, so the grouping map has to
+          // refresh with the rows (see usePrReviewState). Issues and discussions
+          // have no such sibling.
+          [...repoKeys.prReviewState(repo), lens],
+        ],
+        discussion: (n) => [
+          ["repo", repo, "discussion", n],
+          repoKeys.discussionList(repo),
+        ],
+      };
+      // RETURNED, not voided: react-query holds `isPending` until this settles,
+      // so the label picker's trigger stays held until the refetched labels land.
+      return Promise.all(
+        keysByKind[args.kind](args.number).map((queryKey) =>
+          queryClient.invalidateQueries({ queryKey }),
+        ),
+      );
+    },
+  });
+}
+
+const NO_PENDING_LABEL_EDIT = { pending: false, paused: false };
+
+/** Whether a label edit on the `kind` entity `number` is in flight in `repo`, and
+ *  whether it is parked offline. Read from the mutation cache: the pickers are keyed
+ *  per entity, and a remounted one's own observer would read idle. */
+export function usePendingLabelEdit(
+  repo: string,
+  kind: EditLabelsVars["kind"],
+  number: number,
+): { pending: boolean; paused: boolean } {
+  const select = useCallback(
+    (cache: MutationCache) =>
+      pendingLabelEditFor(
+        pendingMutationEntries(
+          cache.findAll({
+            mutationKey: prWriteKey("labels", repo),
+            status: "pending",
+          }),
+        ),
+        repo,
+        kind,
+        number,
+      ),
+    [repo, kind, number],
+  );
+  return useMutationCacheSnapshot(select, NO_PENDING_LABEL_EDIT);
+}
+
+export function useCreatePr(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: {
+      base: string;
+      head: string;
+      title: string;
+      body: string;
+      draft: boolean;
+      /** Create-time reviewer account uuids (Bitbucket-only; omit elsewhere). */
+      reviewers?: string[];
+      /** Create-time label names (GitHub/GitLab; omit for Bitbucket). */
+      labels?: string[];
+      /** Create-time assignee login/username strings (GitHub/GitLab; omit for Bitbucket). */
+      assignees?: string[];
+      /** Which repo the PR opens against: the fork itself ("origin", default) or
+       *  its parent ("upstream" — GitHub fork only; the backend composes
+       *  `owner:head` and rejects reviewers/labels/assignees on that path). */
+      lens?: RemoteLens;
+    }) =>
+      api.forgePrCreate(
+        repo,
+        args.base,
+        args.head,
+        args.title,
+        args.body,
+        args.draft,
+        args.reviewers,
+        args.labels,
+        args.assignees,
+        args.lens ?? "origin",
+      ),
+    {
+      // Pinned: the call and its invalidation close over `repo`, and the dialog
+      // host survives a repo switch — without the key the newly-live repo's
+      // controls would read the pending create as busy. `args.lens` is per-call,
+      // already frozen in the vars.
+      identity: ["create-pr", repo],
+    },
+  );
+}

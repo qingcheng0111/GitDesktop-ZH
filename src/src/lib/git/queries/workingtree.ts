@@ -1,0 +1,542 @@
+import { type QueryClient, useQuery } from "@tanstack/react-query";
+import { usePanelActive } from "@/components/panel-portal";
+import { ignoreLines } from "@/lib/ai/ignore";
+import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import { isAppError } from "@/lib/tauri/invoke";
+import * as api from "../api";
+import {
+  checkoutConflictSide,
+  conflictSides,
+  resolveConflict,
+} from "../conflict";
+import { literalPathspec } from "../glob";
+import type { RepoOp, UnignoreRule } from "../types";
+import { repoKeys } from "./core";
+import { useRepoMutation, workingTreeKeys } from "./internal";
+
+/** Prefix of every {@link useAiExcludedView} key for a repo (the global-pattern
+ *  axis follows), so a rule edit invalidates the view whatever settings held. */
+const aiExcludedKey = (repo: string) => ["repo", repo, "ai-excluded"] as const;
+
+/** The families a commit (or amend) makes stale BEYOND the working tree —
+ *  history, branch tips/counters, HEAD-rev blobs, and operation state, both
+ *  in-flight (a commit can conclude a merge or an interrupted journaled op)
+ *  and prospective (merge/conflict previews, local-PR merge states).
+ *  Invalidated fire-and-forget so the Commit button never waits on them;
+ *  forge-backed keys (pr/issue/CI/…) are deliberately absent — a local
+ *  commit cannot change forge state. */
+const commitAftermathKeys = (repo: string) =>
+  [
+    repoKeys.log(repo),
+    repoKeys.commits(repo),
+    repoKeys.branches(repo),
+    ["repo", repo, "log-search"],
+    ["repo", repo, "recent-commits"],
+    ["repo", repo, "commit-authors"],
+    ["repo", repo, "unpushed-count"],
+    ["repo", repo, "unpushed-messages"],
+    ["repo", repo, "branch-stats"],
+    ["repo", repo, "stats"],
+    ["repo", repo, "divergence"],
+    ["repo", repo, "compare"],
+    ["repo", repo, "file-log"],
+    ["repo", repo, "blame"],
+    ["repo", repo, "file-b64", "HEAD"],
+    repoKeys.opState(repo),
+    ["repo", repo, "conflict-file"],
+    ["repo", repo, "merge-preview"],
+    ["repo", repo, "conflict-preview"],
+    ["repo", repo, "local-pr-merge-states"],
+    ["repo", repo, "oplog-check"],
+    ["repo", repo, "insights", "contributors"],
+    ["repo", repo, "insights", "commit-activity"],
+    ["repo", repo, "insights", "code-frequency"],
+    ["repo", repo, "insights", "punch-card"],
+  ] as const;
+
+export function useFileDiff(
+  repo: string,
+  file: { path: string; staged: boolean; untracked: boolean } | null,
+) {
+  return useQuery({
+    // `untracked` is in the key so the untracked→tracked flip (after staging part
+    // of a new file) subscribes to a fresh query — the `--no-index` "all new"
+    // diff and the normal remainder diff must not share a cache entry, or an
+    // invalidation race could leave the stale all-lines view on screen.
+    queryKey: [
+      ...repoKeys.diff(repo, file?.path ?? "", file?.staged ?? false),
+      file?.untracked ?? false,
+    ] as const,
+    queryFn: () =>
+      api.gitDiffFile(
+        repo,
+        file?.path ?? "",
+        file?.staged ?? false,
+        file?.untracked ?? false,
+      ),
+    enabled: file !== null,
+    // Local reads must not park on react-query's default "online" mode offline;
+    // the same holds for every `networkMode` in this file.
+    networkMode: "always",
+  });
+}
+
+/**
+ * A file's cumulative diff in an agent session worktree vs the session's base commit.
+ * `base` is in the key so a restarted session's new base can't cache-hit; idle until
+ * `enabled` (the step is expanded). While `live` it polls: the agent edits the worktree
+ * through its own CLI, outside any app mutation that could invalidate this, so an open
+ * diff would otherwise freeze.
+ */
+export function useSessionFileDiff(
+  repo: string,
+  filePath: string,
+  base: string,
+  enabled: boolean,
+  live: boolean,
+) {
+  return useQuery({
+    queryKey: [...repoKeys.diff(repo, filePath, false), "session-base", base],
+    queryFn: () => api.gitSessionFileDiff(repo, filePath, base),
+    enabled: enabled && Boolean(repo && filePath && base),
+    refetchInterval: enabled && live ? 1500 : false,
+    refetchIntervalInBackground: false,
+    networkMode: "always",
+  });
+}
+
+export function useStage(repo: string) {
+  return useRepoMutation(repo, (paths: string[]) => api.gitStage(repo, paths), {
+    invalidate: workingTreeKeys(repo),
+    // Local working-tree write — never park it offline.
+    networkMode: "always",
+  });
+}
+
+/** Shared so every observer of a repo's op-state key fetches under the same
+ *  options: the fetch takes them from whichever observer starts it. */
+export function opStateOptions(repo: string) {
+  return {
+    queryKey: repoKeys.opState(repo),
+    queryFn: () => api.gitOpState(repo),
+    networkMode: "always" as const,
+    gcTime: REPO_SHELL_GC_TIME,
+  };
+}
+
+export function useOpState(repo: string) {
+  return useQuery(opStateOptions(repo));
+}
+
+export function useOpAbort(repo: string) {
+  return useRepoMutation(repo, (op: RepoOp) => api.gitOpAbort(repo, op), {
+    // Local git write — never park it offline.
+    networkMode: "always",
+  });
+}
+
+export function useOpContinue(repo: string) {
+  return useRepoMutation(repo, (op: RepoOp) => api.gitOpContinue(repo, op), {
+    // Local git write — never park it offline.
+    networkMode: "always",
+  });
+}
+
+/** How often an open conflict file re-reads from disk while its panel shows. */
+const CONFLICT_FILE_POLL_MS = 2000;
+
+/** The pause before a conflict-file read's one retry after an `io` failure. */
+const CONFLICT_FILE_RETRY_MS = 300;
+
+/**
+ * The conflicted file's sides + marked working text, for the conflict editor.
+ * Polls while its panel shows: the file is edited outside any app mutation (the
+ * terminal, an agent, an external editor), and git status still lists an
+ * on-disk resolve as unmerged. A tick costs one `git ls-files -u`, a `git show`
+ * per present stage, and a whole-file read, hence the panel gate. The
+ * document-visibility pause applies only where the webview reports hidden; a
+ * minimized Windows window does not, so it keeps polling like the status poll
+ * does. An `io` failure (a read colliding with an editor's save) retries once
+ * quickly, since any error swaps the pane to the read-error copy. A failed read
+ * also re-runs on the next tick (retry limits only one fetch), so that pane
+ * heals without a Retry, except `invalidArgument` (binary or oversized): it
+ * can't clear by itself, and each tick would re-read the whole file.
+ */
+export function useConflictFile(repo: string, path: string) {
+  const panelActive = usePanelActive();
+  return useQuery({
+    queryKey: ["repo", repo, "conflict-file", path] as const,
+    queryFn: () => conflictSides(repo, path, []),
+    retry: (failureCount, error) =>
+      failureCount < 1 && isAppError(error) && error.kind === "io",
+    retryDelay: CONFLICT_FILE_RETRY_MS,
+    refetchInterval: (query) =>
+      panelActive &&
+      !(
+        isAppError(query.state.error) &&
+        query.state.error.kind === "invalidArgument"
+      )
+        ? CONFLICT_FILE_POLL_MS
+        : false,
+    refetchIntervalInBackground: false,
+    networkMode: "always",
+  });
+}
+
+const conflictFileKey = (repo: string) =>
+  ["repo", repo, "conflict-file"] as const;
+
+/** Re-reads the conflict editor (awaited) and fires the working-tree keys
+ *  alongside it, where the conflict mutations fire them after; shared with the
+ *  view's error-path refresh so the keys stay in this package. */
+export async function refreshConflictFile(
+  queryClient: QueryClient,
+  repo: string,
+): Promise<void> {
+  const refresh = queryClient.invalidateQueries({
+    queryKey: conflictFileKey(repo),
+  });
+  for (const queryKey of workingTreeKeys(repo))
+    void queryClient.invalidateQueries({ queryKey });
+  await refresh;
+}
+
+/** Writes a conflict resolution, staging it when `stage` (marks resolved).
+ *  A mounted conflict editor's re-read lands before `isPending` drops, and one
+ *  mounted or shown later holds its buttons through its own first read, so they
+ *  never act on pre-write segments; the working tree refreshes behind it. On
+ *  error nothing is invalidated: ConflictFileView re-reads itself, and the AI
+ *  resolve view renders its own proposal, not the disk. */
+export function useResolveConflict(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { path: string; content: string; stage: boolean }) =>
+      resolveConflict(repo, args.path, args.content, args.stage),
+    {
+      invalidate: [conflictFileKey(repo)],
+      invalidateAfter: workingTreeKeys(repo),
+      refetchBeforeSuccess: true,
+      // Local conflict write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Resolves a whole conflicted file by taking one side ("ours"/"theirs"). */
+export function useCheckoutConflictSide(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { path: string; side: "ours" | "theirs" }) =>
+      checkoutConflictSide(repo, args.path, args.side),
+    {
+      invalidate: [conflictFileKey(repo)],
+      invalidateAfter: workingTreeKeys(repo),
+      refetchBeforeSuccess: true,
+      // Local conflict write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Stages a conflicted file exactly as it stands on disk — edited, emptied, or
+ *  removed — which marks the conflict resolved. */
+export function useMarkConflictResolved(repo: string) {
+  return useRepoMutation(
+    repo,
+    (path: string) => api.gitStage(repo, [literalPathspec(path)]),
+    {
+      invalidate: [conflictFileKey(repo)],
+      invalidateAfter: workingTreeKeys(repo),
+      refetchBeforeSuccess: true,
+      // Local conflict write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useFileAtRev(
+  repo: string,
+  rev: string | null,
+  file: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "file-b64", rev ?? "worktree", file] as const,
+    queryFn: () => api.gitFileBase64(repo, rev, file),
+    enabled,
+    networkMode: "always",
+  });
+}
+
+export function useApplyPatch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { patch: string; cached: boolean; reverse: boolean }) =>
+      api.gitApplyPatch(repo, args.patch, args.cached, args.reverse),
+    {
+      invalidate: workingTreeKeys(repo),
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useApplyPartial(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: {
+      diffText: string;
+      selected: api.SelectedLine[];
+      cached: boolean;
+      reverse: boolean;
+    }) =>
+      api.gitApplyPartial(
+        repo,
+        args.diffText,
+        args.selected,
+        args.cached,
+        args.reverse,
+      ),
+    {
+      invalidate: workingTreeKeys(repo),
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Discards selected lines from an untracked (new) file (see
+ *  {@link api.gitDiscardUntrackedLines}) — line/hunk discard for a new file. */
+export function useDiscardUntrackedLines(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { path: string; lines: number[] }) =>
+      api.gitDiscardUntrackedLines(repo, args.path, args.lines),
+    {
+      invalidate: workingTreeKeys(repo),
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useUnstage(repo: string) {
+  return useRepoMutation(
+    repo,
+    (paths: string[]) => api.gitUnstage(repo, paths),
+    {
+      invalidate: workingTreeKeys(repo),
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useCommit(repo: string) {
+  // Awaited: only the working tree, so the emptied changes list, cleared draft,
+  // and toast land together without waiting on forge queries; history and branch
+  // counters refresh behind the toast (commitAftermathKeys).
+  return useRepoMutation(
+    repo,
+    (args: {
+      title: string;
+      body?: string;
+      amend?: boolean;
+      expectedHead?: string | null;
+      expectedBranch?: string | null;
+    }) =>
+      api.gitCommit(
+        repo,
+        args.title,
+        args.body,
+        args.amend ?? false,
+        args.expectedHead,
+        args.expectedBranch,
+      ),
+    {
+      invalidate: workingTreeKeys(repo),
+      invalidateAfter: commitAftermathKeys(repo),
+      refetchBeforeSuccess: true,
+      // Local commit write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useAppendToGitignore(repo: string) {
+  return useRepoMutation(
+    repo,
+    (patterns: string[]) => api.appendToGitignore(repo, patterns),
+    {
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useAppendRepoAiIgnore(repo: string) {
+  return useRepoMutation(
+    repo,
+    (patterns: string[]) => api.appendRepoAiIgnore(repo, patterns),
+    // Staging-class edit — only the working tree changes (the aiignore file
+    // appears/updates), so narrow like useStage/useApplySuggestion. The
+    // AI-excluded view reads those rules, so it goes with them.
+    {
+      invalidate: [...workingTreeKeys(repo), aiExcludedKey(repo)],
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/**
+ * Everything the AI-excluded view renders: the rules in force, which rule
+ * decided each candidate file, and the names no rule could have decided.
+ *
+ * `exclude` is repo rules FIRST, global LAST — the same security invariant
+ * `aiExcludePatterns` keeps, since last-match-wins and the repo file is
+ * committed content: a committed `!` must never outrank a global exclude.
+ * Verdicts index into that array, so the caller reads a rule's source from its
+ * position.
+ *
+ * A name the listing flags `undecodable` leaves the corpus before the IPC call
+ * and comes back as `unreadable`: generation hides such a name whatever the
+ * patterns say, so attributing it to a rule would be a lie. The flag is judged on
+ * the real bytes, so a name holding a real U+FFFD stays in the corpus and gets its
+ * true verdict; two names sharing one lossy spelling fail closed together. Keyed
+ * on the global patterns, so a settings edit produces a fresh view rather than a
+ * stale attribution.
+ */
+export function useAiExcludedView(
+  repo: string,
+  enabled: boolean,
+  globalPatterns: string,
+) {
+  return useQuery({
+    queryKey: [...aiExcludedKey(repo), globalPatterns] as const,
+    queryFn: async () => {
+      const [repoRules, tracked, untracked] = await Promise.all([
+        api.readRepoAiIgnore(repo),
+        api.gitListTracked(repo),
+        api.gitListUntracked(repo),
+      ]);
+      const globalRules = ignoreLines(globalPatterns);
+      const exclude = [...repoRules, ...globalRules];
+      const undecodableByPath = new Map<string, boolean>();
+      for (const row of [...tracked, ...untracked]) {
+        undecodableByPath.set(
+          row.path,
+          row.undecodable || (undecodableByPath.get(row.path) ?? false),
+        );
+      }
+      const corpus: string[] = [];
+      const unreadable: string[] = [];
+      for (const [path, undecodable] of undecodableByPath) {
+        (undecodable ? unreadable : corpus).push(path);
+      }
+      const verdicts =
+        exclude.length > 0 && corpus.length > 0
+          ? await api.gitAiIgnoreVerdicts(repo, corpus, exclude)
+          : [];
+      return {
+        repoRules,
+        globalRules,
+        verdicts,
+        untracked: untracked.map((row) => row.path),
+        unreadable,
+      };
+    },
+    enabled,
+    staleTime: 30_000,
+    networkMode: "always",
+  });
+}
+
+export function useUntrack(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { pathspecs: string[]; ignorePatterns: string[] }) =>
+      api.gitUntrack(repo, args.pathspecs, args.ignorePatterns),
+    {
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Every file git tracks — for the Repository files manager. Fetched lazily. */
+export function useTrackedFiles(repo: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["repo", repo, "tracked-files"] as const,
+    queryFn: async () =>
+      (await api.gitListTracked(repo)).map((row) => row.path),
+    enabled,
+    staleTime: 30_000,
+    networkMode: "always",
+  });
+}
+
+/** Slash-commands + skills available to `agent` (project + global). Fetched
+ *  lazily while a slash command is being typed in the agent composer; keyed on
+ *  the agent too, since each CLI reads different command/skill directories. */
+export function useAgentCommands(
+  repo: string,
+  agent: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "agent-commands", agent] as const,
+    queryFn: () => api.readAgentCommands(repo, agent),
+    enabled,
+    staleTime: 30_000,
+    networkMode: "always",
+  });
+}
+
+/** Files git ignores, with the rule responsible for each. Fetched lazily. */
+export function useIgnoredFiles(repo: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["repo", repo, "ignored-files"] as const,
+    queryFn: () => api.gitIgnoredFiles(repo),
+    enabled,
+    staleTime: 30_000,
+    networkMode: "always",
+  });
+}
+
+export function useForceAdd(repo: string) {
+  return useRepoMutation(
+    repo,
+    (pathspecs: string[]) => api.gitForceAdd(repo, pathspecs),
+    {
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useUnignoreRules(repo: string) {
+  return useRepoMutation(
+    repo,
+    (rules: UnignoreRule[]) => api.gitUnignoreRules(repo, rules),
+    {
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Deletes lines from the repo's `.gitdesktop/aiignore`. Same narrowing as
+ *  {@link useAppendRepoAiIgnore} — the file is working-tree content, and the
+ *  AI-excluded view reads the rules it holds. */
+export function useRemoveRepoAiIgnore(repo: string) {
+  return useRepoMutation(
+    repo,
+    (patterns: string[]) => api.removeRepoAiIgnore(repo, patterns),
+    {
+      invalidate: [...workingTreeKeys(repo), aiExcludedKey(repo)],
+      // Local working-tree write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}

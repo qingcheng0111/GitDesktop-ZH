@@ -1,0 +1,486 @@
+import { SparkleIcon, XIcon } from "@phosphor-icons/react";
+import { useSelector } from "@tanstack/react-store";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  useEffect,
+  useEffectEvent,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { toast } from "sonner";
+import { DIALOG_SCROLL } from "@/components/dialog-scroll";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useRetryFocusRescue } from "@/features/conversations/ConversationListPanel";
+import {
+  DEGRADED_ACTION_CLASS,
+  offlinePendingMessage,
+  refreshFailed,
+} from "@/features/conversations/remote-section-state";
+import {
+  CREATE_PENDING_GENERATE_REASON,
+  useFinishAndSurface,
+} from "@/features/conversations/useAiStream";
+import { presentError } from "@/lib/error-summary";
+import { required, useAppForm } from "@/lib/form";
+import { useGenerateChord } from "@/lib/hotkeys/useGenerateChord";
+import { useJiraCreateIssue, useJiraIssueTypes } from "@/lib/jira/queries";
+import type { JiraLink } from "@/lib/jira/store";
+import {
+  AI_DRAFT_PENDING_REASON,
+  pendingWriteReason,
+} from "@/lib/offline-writes";
+import { useAiEnabled } from "@/lib/settings/queries";
+import { originNoteFor } from "@/lib/stores/notifications";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastErrorWithNote } from "@/lib/toast";
+import {
+  ARIA_DISABLED_CLASS,
+  useDisabledReason,
+} from "@/lib/use-disabled-reason";
+import { useSeedOnOpen } from "@/lib/use-seed-on-open";
+import { cn } from "@/lib/utils";
+import { useGenerateIssueDraft } from "./useGenerateIssueDraft";
+
+/**
+ * Create an issue in the linked Jira project. Mirrors the local/GitHub create
+ * dialogs (summary + markdown description) with a Jira issue-type picker driven
+ * by the project's `createmeta` (subtasks filtered out — they can't be created
+ * standalone). Only rendered when `createIssues` permission is present, so there
+ * is never a dead form. On success it toasts the new key, selects the created
+ * issue in the panel, and the mutation invalidates the list so the row appears.
+ */
+export function CreateJiraIssueDialog({
+  repoPath,
+  link,
+  open,
+  onOpenChange,
+}: {
+  repoPath: string;
+  link: JiraLink;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const create = useJiraCreateIssue(repoPath, link);
+  // Only fetch types while the dialog is open; surfaced errors get a retry
+  // rather than a dead Select.
+  const types = useJiraIssueTypes(repoPath, link, open);
+  const selectIssue = useUiStore((s) => s.selectIssue);
+  const repoName = useUiStore((s) => s.repoName) ?? "";
+  const aiEnabled = useAiEnabled();
+  const { generate, cancel, generating } = useGenerateIssueDraft(repoPath);
+  // Closing mid-generation never cancels the run: it finishes into the retained
+  // form state, and this surfaces the result while the dialog is away.
+  const surface = useFinishAndSurface(repoPath, open, {
+    cancel,
+    generating,
+    close: () => onOpenChange(false),
+    readyTitle: "Issue draft ready",
+    readyDescription: "It's waiting in the dialog.",
+    reopen: () => onOpenChange(true),
+  });
+
+  // Creatable types only (a subtask needs a parent — not offered here). Manual
+  // useMemo is LOAD-BEARING: the submit handler's try/catch bails this component
+  // out of the React Compiler, so nothing auto-memoizes this derived array — and
+  // it feeds the default-type effect's deps below (a fresh reference every render
+  // would re-fire that effect each time).
+  const creatable = useMemo(
+    () => (types.data ?? []).filter((t) => !t.subtask),
+    [types.data],
+  );
+  const [issueTypeId, setIssueTypeId] = useState<string>("");
+  const issueTypeSelectId = useId();
+  // A Jira validation error the create command surfaced (field-level messages
+  // the Rust side joins readably). Stamped with the repo it fired in, because
+  // this dialog is retained across repo switches: the inline message belongs to
+  // that repo's draft and renders only there, while a failure that lands once
+  // the user has moved on rides a toast from the catch instead, naming it.
+  const [createError, setCreateError] = useState<{
+    repo: string;
+    message: string;
+  } | null>(null);
+  // Which repo's draft the form holds — stamped on every open transition, ahead
+  // of the seed's skip arm (which holds a seed off only for a draft already this
+  // repo's). A dialog left open across a repo switch never re-seeds, so this
+  // still reads the submit's repo and the settle's close is the right one.
+  const draftRepoRef = useRef(repoPath);
+  // Which draft the form holds, bumped only where the seed actually reseeds. The
+  // repo stamp can't tell drafts apart within one repo: an A→B→A round trip
+  // restores the same path behind different content.
+  const seedGenRef = useRef(0);
+
+  const form = useAppForm({
+    defaultValues: { summary: "", body: "" },
+    onSubmit: async ({ value }) => {
+      const submitGen = seedGenRef.current;
+      setCreateError(null);
+      try {
+        const { key, url } = await create.mutateAsync({
+          issueTypeId,
+          summary: value.summary.trim(),
+          descriptionMd: value.body.trim() || undefined,
+        });
+        // The create can settle after a repo switch, and this dialog is retained
+        // across one: the selection below answers to the live repo, the close to
+        // the draft's. The toast fires either way, naming where it was filed.
+        const originNote = originNoteFor(repoPath);
+        const stillHere = originNote === undefined;
+        toast.success(`Created ${key}`, {
+          description: originNote ? `${originNote} · ${url}` : url,
+          action: { label: "View", onClick: () => openUrl(url) },
+        });
+        // Closed whenever the form still holds THIS submit's draft — leaving an
+        // already-filed draft open is a duplicate factory. The selection is a
+        // global write, so it takes the live-repo guard instead.
+        const ourDraft =
+          draftRepoRef.current === repoPath && seedGenRef.current === submitGen;
+        if (ourDraft) onOpenChange(false);
+        if (stillHere) selectIssue({ kind: "jira", id: key });
+      } catch (e) {
+        // Keep the dialog open so the draft survives; surface the reason inline.
+        setCreateError({ repo: repoPath, message: presentError(e).summary });
+        // The inline message renders only in the repo this fired in, so a
+        // failure landing after a switch would be silent — the toast is the one
+        // surface that still reaches the user, and it names that repo.
+        const originNote = originNoteFor(repoPath);
+        if (originNote) toastErrorWithNote(e, originNote);
+      }
+    },
+  });
+
+  const titleVal = useSelector(form.store, (s) => s.values.summary);
+  const bodyVal = useSelector(form.store, (s) => s.values.body);
+  const notes = [titleVal, bodyVal].filter(Boolean).join("\n\n");
+
+  // keepDefaultValues: otherwise the per-render options sync clobbers the reset
+  // values back to empty on an untouched form.
+  const seedOnOpen = useEffectEvent(() => {
+    draftRepoRef.current = repoPath;
+    // The previous attempt's error is stale on every open transition, guarded or
+    // not — it must clear even when the draft below is kept.
+    setCreateError(null);
+    // A generation still streaming — or one that settled while the dialog was
+    // closed — leaves the whole draft in form state, which this reset would blank
+    // on reopen.
+    if (surface.shouldSkipSeed(generating)) return;
+    // A create still pending (or parked offline) owns the draft on screen: a
+    // reseed would offer a blank form to file the same issue again.
+    if (create.isPending) return;
+    seedGenRef.current += 1;
+    form.reset({ summary: "", body: "" }, { keepDefaultValues: true });
+  });
+  useSeedOnOpen(open, seedOnOpen);
+
+  // Default to the first creatable type once they load; clear the selection if a
+  // refetch dropped the currently-picked one (e.g. project changed).
+  useEffect(() => {
+    if (creatable.length === 0) {
+      setIssueTypeId("");
+      return;
+    }
+    setIssueTypeId((cur) =>
+      cur && creatable.some((t) => t.id === cur) ? cur : creatable[0].id,
+    );
+  }, [creatable]);
+
+  const typeItems = Object.fromEntries(creatable.map((t) => [t.id, t.name]));
+  const noTypes = !types.isPending && !types.isError && creatable.length === 0;
+  // Only a settled failure counts, and it replaces the picker only with nothing
+  // to pick: cached types (and the pick made from them) stay under a line.
+  const typesRefreshFailed = refreshFailed(types);
+  const typesFailed = typesRefreshFailed && creatable.length === 0;
+  // After a failure a cached list with nothing creatable is unknown, not empty,
+  // so a park over it waits like a first load.
+  const emptyUnknown = types.isError && creatable.length === 0;
+  const typesParked =
+    types.isPaused && (types.data === undefined || emptyUnknown);
+  // Either Retry unmounts on press: the field's box takes the focus.
+  const typesRescue = useRetryFocusRescue(typesRefreshFailed);
+  const isSubmitting = useSelector(form.store, (s) => s.isSubmitting);
+  // An offline create queues rather than refuses: the dialog stays open on the
+  // waiting draft and sends it once the connection returns. `isSubmitting` covers
+  // the submit's lead-in before the mutation reports pending. The fields freeze
+  // meanwhile: the summary read-only, since its Enter starts the submit while it
+  // holds focus; the description and type disable, as neither can submit.
+  const creating = create.isPending || isSubmitting;
+  // Why the submit is held, for both the hover wrapper and the sr-only node.
+  const submitReason = (() => {
+    switch (true) {
+      case generating:
+        return AI_DRAFT_PENDING_REASON;
+      case create.isPending:
+        return pendingWriteReason(create.isPaused, "Creating the issue…");
+      case isSubmitting:
+        return "Creating the issue…";
+      case !issueTypeId:
+        return "Select an issue type to create the issue";
+      default:
+        return null;
+    }
+  })();
+
+  // Shared by the Draft-with-AI button and the generate chord below.
+  async function runGenerate() {
+    // `generate` resolves void and fires onResult only on a usable draft, so the
+    // flag is how the settle learns whether a result actually landed.
+    let ok = false;
+    // finally: a throw past the stream (draft extraction, these field writes)
+    // must still settle, or the switch-abort latch stays armed for the next run.
+    try {
+      await generate({
+        notes,
+        repoName,
+        onResult: (d) => {
+          ok = true;
+          if (d.title) form.setFieldValue("summary", d.title);
+          form.setFieldValue("body", d.body);
+        },
+      });
+    } finally {
+      surface.noteRunSettled(ok);
+    }
+  }
+  // The generate chord drafts this issue while the dialog is open. It's mounted
+  // on DialogContent, not the <form>: the X close button is a form SIBLING
+  // inside the Popup, so a form-level handler would miss a chord pressed with
+  // focus on X. It is swallowed here whenever it may fire (the hook mirrors the
+  // global listener's own guards), so the global generate-commit-message action
+  // can't run behind the dialog; while generating it swallows but DOESN'T
+  // cancel. A running create holds it like the button: the draft it would
+  // revise has already been sent.
+  const generateChord = useGenerateChord({
+    enabled: aiEnabled && !generating && notes.trim() !== "" && !isSubmitting,
+    run: runGenerate,
+  });
+  // The one submit gate, shared by the button and the form's native submit:
+  // Enter must submit exactly when the button would. A pending create rides it
+  // so the held button keeps focus and names the wait.
+  const submitBlocked = generating || creating || !issueTypeId;
+  const { blockedReason, reasonId, wrapperTitle, describedBy } =
+    useDisabledReason({ disabled: submitBlocked, reason: submitReason });
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="flex max-h-[85vh] flex-col sm:max-w-2xl"
+        onKeyDown={generateChord.onKeyDown}
+      >
+        <form
+          className="flex min-h-0 min-w-0 flex-col gap-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (submitBlocked) return;
+            form.handleSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>Create Jira issue</DialogTitle>
+            <DialogDescription>
+              Opens a new issue in{" "}
+              <span className="font-mono">{link.projectKey}</span> on your Jira
+              site.
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* Fields scroll; header and submit footer stay pinned. */}
+          <div className={cn(DIALOG_SCROLL, "min-h-0 flex-1 space-y-4")}>
+            <form.AppField
+              name="summary"
+              validators={{ onChange: ({ value }) => required(value) }}
+            >
+              {(field) => (
+                <field.TextField
+                  label="Summary"
+                  placeholder="Summarize the issue"
+                  readOnly={creating}
+                  warning={(v) =>
+                    v.trim() ? null : "Enter a summary to create the issue"
+                  }
+                />
+              )}
+            </form.AppField>
+
+            <div
+              ref={typesRescue.hostRef}
+              tabIndex={-1}
+              className="space-y-2 outline-none"
+            >
+              <Label htmlFor={issueTypeSelectId}>Issue type</Label>
+              {typesFailed ? (
+                <div className="flex items-center gap-2 border px-3 py-2 text-xs text-muted-foreground">
+                  <span className="flex-1">
+                    Couldn't load issue types for {link.projectKey}.
+                  </span>
+                  <Button
+                    ref={typesRescue.retryRef}
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    onClick={() => types.refetch()}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : noTypes ? (
+                <p className="text-xs text-warning">
+                  {link.projectKey} has no issue types you can create — create
+                  one in Jira, or check your project permissions.
+                </p>
+              ) : (
+                <Select
+                  items={typeItems}
+                  value={issueTypeId || null}
+                  onValueChange={(v) => {
+                    if (v) setIssueTypeId(v);
+                  }}
+                  disabled={types.isPending || creating}
+                >
+                  <SelectTrigger id={issueTypeSelectId} className="w-full">
+                    <SelectValue
+                      placeholder={
+                        typesParked
+                          ? offlinePendingMessage("issue types")
+                          : types.isPending ||
+                              (types.isFetching && creatable.length === 0)
+                            ? "Loading types…"
+                            : "Select a type"
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {creatable.map((t) => (
+                      <SelectItem key={t.id} value={t.id}>
+                        {t.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+              {typesRefreshFailed && !typesFailed && (
+                <p className="text-xs text-muted-foreground">
+                  Couldn't refresh issue types — showing the last loaded ones.{" "}
+                  <button
+                    ref={typesRescue.retryRef}
+                    type="button"
+                    aria-label="Retry loading issue types"
+                    onClick={() => void types.refetch()}
+                    className={DEGRADED_ACTION_CLASS}
+                  >
+                    Retry
+                  </button>
+                </p>
+              )}
+            </div>
+
+            <form.AppField name="body">
+              {(field) => (
+                <field.MarkdownField
+                  label="Description"
+                  placeholder="Jot down rough notes, then draft with AI"
+                  disabled={creating}
+                  rows={8}
+                  textareaClassName="max-h-72 min-h-24 resize-y font-mono"
+                  actions={
+                    !aiEnabled ? undefined : generating ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={cancel}
+                      >
+                        <XIcon data-icon="inline-start" />
+                        Cancel
+                      </Button>
+                    ) : (
+                      // Empty notes stay a plain disable; a running create says why.
+                      <DisabledReasonButton
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        disabled={!notes.trim() || isSubmitting}
+                        reason={
+                          isSubmitting
+                            ? CREATE_PENDING_GENERATE_REASON
+                            : undefined
+                        }
+                        onClick={runGenerate}
+                        // The chord is only offered while it would do something —
+                        // a disabled Generate's shortcut is dead too.
+                        title={
+                          notes.trim() && !isSubmitting
+                            ? `Expand your notes into a structured issue with AI${generateChord.hint}`
+                            : "Expand your notes into a structured issue with AI"
+                        }
+                      >
+                        <SparkleIcon data-icon="inline-start" />
+                        Draft with AI
+                      </DisabledReasonButton>
+                    )
+                  }
+                />
+              )}
+            </form.AppField>
+
+            {/* Only this repo's failure: a create that fails after a switch
+                belongs to the repo it fired in, not the draft on screen. */}
+            {createError && createError.repo === repoPath && (
+              <p className="text-xs text-destructive">{createError.message}</p>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <form.AppForm>
+              <span
+                className={cn(
+                  "inline-flex",
+                  blockedReason && "cursor-not-allowed",
+                )}
+                title={wrapperTitle}
+              >
+                <form.SubmitButton
+                  focusableWhenDisabled={!!blockedReason}
+                  disabled={submitBlocked}
+                  aria-describedby={describedBy}
+                  className={ARIA_DISABLED_CLASS}
+                >
+                  Create issue
+                </form.SubmitButton>
+                {blockedReason ? (
+                  <span id={reasonId} className="sr-only">
+                    {blockedReason}
+                  </span>
+                ) : null}
+              </span>
+            </form.AppForm>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

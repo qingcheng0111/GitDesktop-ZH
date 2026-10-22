@@ -1,0 +1,1066 @@
+import { ArrowSquareOutIcon } from "@phosphor-icons/react";
+import { notifyManager, useQueryClient } from "@tanstack/react-query";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { type ReactNode, useCallback, useSyncExternalStore } from "react";
+import { Markdown } from "@/components/markdown/markdown";
+import { PathText } from "@/components/path-text";
+import { RelativeTime } from "@/components/relative-time";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  DegradedListNotice,
+  useRetryFocusRescue,
+} from "@/features/conversations/ConversationListPanel";
+import {
+  detailNoticeMessage,
+  offlinePendingMessage,
+  refreshFailed,
+  resolveDetailPane,
+} from "@/features/conversations/remote-section-state";
+import type {
+  BbAnnotationOut,
+  BbReportOut,
+} from "@/lib/bitbucket/security-findings";
+import {
+  bbAnnotationTypeLabel,
+  bbReportLabel,
+  bbResultLabel,
+  linkOutLabel,
+  useBitbucketFindings,
+} from "@/lib/bitbucket/security-findings";
+import {
+  forgeReady,
+  forgeSupports,
+  repoKeys,
+  useForgeStatus,
+} from "@/lib/git/queries";
+import type {
+  CodeScanningAlertOut,
+  CvssOut,
+  CweOut,
+  DependabotAlertOut,
+  ReferenceOut,
+  RepoAdvisoryOut,
+  SecretScanningAlertOut,
+} from "@/lib/github/security-findings";
+import {
+  useCodeScanningAlerts,
+  useDependabotAlerts,
+  useRepoAdvisories,
+  useSecretScanningAlerts,
+} from "@/lib/github/security-findings";
+import type {
+  GlCodeQualityFindingOut,
+  GlFindingsOut,
+  GlSecureFindingOut,
+} from "@/lib/gitlab/security-findings";
+import {
+  codeQualityFindingId,
+  secureFindingId,
+  useGitLabFindings,
+} from "@/lib/gitlab/security-findings";
+import {
+  type FindingsLimits,
+  type SelectedFinding,
+  useUiStore,
+} from "@/lib/stores/ui";
+import { parseableDate } from "@/lib/time";
+import { cveUrl, cweUrl, ghsaUrl, repoAdvisoryGhsaUrl } from "./advisory-links";
+import {
+  CodeScanningChip,
+  CqChip,
+  SeverityChip,
+  ValidityChip,
+  validityLabel,
+} from "./severity";
+
+function Row({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 wrap-break-word">{children}</dd>
+    </>
+  );
+}
+
+function DetailShell({
+  title,
+  chip,
+  htmlUrl,
+  linkLabel = "View on GitHub",
+  linkTitle,
+  meta,
+  children,
+}: {
+  title: string;
+  /** The category's own status chip — severity, SARIF level, or validity; each
+   *  category names its state in its own ladder's words. */
+  chip: ReactNode;
+  htmlUrl: string;
+  /** What the link-out opens, when it isn't the finding's page on GitHub. */
+  linkLabel?: string;
+  /** Hover preview of the destination, for a link whose label can't name it
+   *  outright. Left unset elsewhere: a blank `title` would suppress an
+   *  ancestor's tooltip, so the attribute must be absent, never empty. */
+  linkTitle?: string;
+  meta: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="border-b p-4">
+        <h2 className="text-sm font-semibold text-balance">{title}</h2>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {chip}
+          {/* A tolerated malformed item can lack html_url — no link, no button. */}
+          {htmlUrl ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-auto"
+              title={linkTitle}
+              onClick={() => openUrl(htmlUrl)}
+            >
+              <ArrowSquareOutIcon data-icon="inline-start" />
+              {linkLabel}
+            </Button>
+          ) : null}
+        </div>
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+          {meta}
+        </dl>
+      </div>
+      {/* overflow-hidden: the vendored ScrollArea Root is `relative`-only, so a
+          fill-layout body would grow the pane past the viewport without it. */}
+      <ScrollArea className="min-h-0 flex-1 overflow-hidden">
+        <div className="p-4">{children}</div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+/** GitHub reports `direct` / `transitive`; anything else is shown as it arrived,
+ *  so a value we don't know yet is never dropped or mislabeled. */
+function relationshipLabel(relationship: string): string {
+  switch (relationship.toLowerCase()) {
+    case "direct":
+      return "Direct";
+    case "transitive":
+      return "Transitive";
+    default:
+      return relationship;
+  }
+}
+
+/** One CVSS version's score and decoded metrics. An advisory can carry v3 and v4
+ *  at once, so each gets its own section rather than one collapsed "CVSS" row. */
+function CvssSection({ cvss }: { cvss: CvssOut }) {
+  return (
+    <section className="mb-4">
+      <h3 className="mb-1.5 flex items-baseline gap-2 text-xs font-semibold">
+        {/* The version is empty when the vector named none — heading it
+            "CVSS" alone beats a dangling revision number. */}
+        <span>{cvss.version ? `CVSS ${cvss.version}` : "CVSS"}</span>
+        {cvss.score !== null ? (
+          <span className="font-normal text-muted-foreground tabular-nums">
+            {cvss.score}
+          </span>
+        ) : null}
+      </h3>
+      {cvss.metrics.length > 0 ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+          {cvss.metrics.map((m) => (
+            <Row key={m.label} label={m.label}>
+              {m.value}
+            </Row>
+          ))}
+        </dl>
+      ) : (
+        // An unparseable vector still says something — show it raw rather than
+        // silently rendering an empty section.
+        <p className="font-mono text-[11px] wrap-break-word text-muted-foreground">
+          {cvss.vectorString}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function ReferencesSection({ references }: { references: ReferenceOut[] }) {
+  return (
+    <section className="mt-4">
+      <h3 className="mb-1.5 text-xs font-semibold">References</h3>
+      <ul>
+        {references.map((r, i) => (
+          <li key={`${r.url}-${i}`}>
+            <button
+              type="button"
+              onClick={() => openUrl(r.url)}
+              className="flex w-full cursor-pointer items-center gap-2 rounded px-1 py-1 text-left text-xs hover:bg-muted/40"
+            >
+              <span className="shrink-0">{r.label}</span>
+              <span
+                className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground"
+                title={r.url}
+              >
+                {r.url}
+              </span>
+              <ArrowSquareOutIcon className="size-3 shrink-0 text-muted-foreground" />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** A GHSA or CVE id as a link-out chip, in the same idiom as the GitLab
+ *  identifier chips; plain text when no URL could be built from it. */
+function AdvisoryIdValue({ id, url }: { id: string; url: string | null }) {
+  if (!url) return <span className="font-mono">{id}</span>;
+  return (
+    <button
+      type="button"
+      title={url}
+      onClick={() => openUrl(url)}
+      className="inline-flex cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 hover:bg-muted/40"
+    >
+      <span className="font-mono whitespace-nowrap">{id}</span>
+      <ArrowSquareOutIcon className="size-3 text-muted-foreground" />
+    </button>
+  );
+}
+
+/** Id and name share ONE flex item as inline text: a space between two flex
+ *  items is dropped from layout and from the accessible name, while a space in
+ *  text flow survives both. The nowrap id can't split; only the name wraps. */
+function CweChip({ cwe }: { cwe: CweOut }) {
+  const url = cweUrl(cwe.cweId);
+  const content = (
+    <span className="min-w-0 wrap-break-word">
+      <span className="font-mono whitespace-nowrap">{cwe.cweId}</span>
+      {cwe.name ? ` ${cwe.name}` : null}
+    </span>
+  );
+  return url ? (
+    <button
+      type="button"
+      title={url}
+      onClick={() => openUrl(url)}
+      className="inline-flex max-w-full cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 text-left hover:bg-muted/40"
+    >
+      {content}
+      <ArrowSquareOutIcon className="size-3 shrink-0 text-muted-foreground" />
+    </button>
+  ) : (
+    <Badge
+      variant="outline"
+      className="h-auto max-w-full py-0.5 text-left font-normal whitespace-normal"
+    >
+      {content}
+    </Badge>
+  );
+}
+
+function AlertDetail({ alert }: { alert: DependabotAlertOut }) {
+  return (
+    <DetailShell
+      // Falls back to the identity field, never invented prose: a doubly-degraded
+      // item with no GHSA id either keeps a blank heading rather than a lie.
+      title={alert.summary || alert.ghsaId}
+      chip={<SeverityChip severity={alert.severity} />}
+      htmlUrl={alert.htmlUrl}
+      meta={
+        <>
+          <Row label="Package">
+            <span className="font-mono">{alert.packageName}</span>{" "}
+            <span className="text-muted-foreground">
+              {alert.ecosystem}
+              {alert.scope ? ` · ${alert.scope}` : ""}
+            </span>
+          </Row>
+          {/* Next to the package: whether this is your dependency or something
+              underneath it decides who can act on it. Omitted when unstated. */}
+          {alert.relationship ? (
+            <Row label="Dependency">
+              {relationshipLabel(alert.relationship)}
+            </Row>
+          ) : null}
+          <Row label="Manifest">
+            <PathText path={alert.manifestPath} className="font-mono" />
+          </Row>
+          {/* Always the global database: Dependabot alerts reference published
+              advisories. */}
+          <Row label="GHSA">
+            <AdvisoryIdValue id={alert.ghsaId} url={ghsaUrl(alert.ghsaId)} />
+          </Row>
+          {alert.cveId ? (
+            <Row label="CVE">
+              <AdvisoryIdValue id={alert.cveId} url={cveUrl(alert.cveId)} />
+            </Row>
+          ) : null}
+          {/* Only when there's no CVSS section to carry the score — otherwise
+              this row and the first section state the same number twice. */}
+          {alert.cvssScore !== null && alert.cvss.length === 0 ? (
+            <Row label="CVSS">
+              <span className="tabular-nums">{alert.cvssScore}</span>
+            </Row>
+          ) : null}
+          <Row label="Affected">
+            {alert.vulnerableVersionRange ?? "Not stated"}
+          </Row>
+          <Row label="Patched">
+            {alert.firstPatchedVersion ?? "No patched version yet"}
+          </Row>
+          {alert.cwes.length > 0 ? (
+            <Row label="CWE">
+              <span className="flex flex-wrap gap-1">
+                {alert.cwes.map((c) => (
+                  <CweChip key={c.cweId} cwe={c} />
+                ))}
+              </span>
+            </Row>
+          ) : null}
+          {parseableDate(alert.createdAt) ? (
+            <Row label="Opened">
+              <RelativeTime date={alert.createdAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {/* Index-keyed: the version can come through empty, so it isn't unique. */}
+      {alert.cvss.map((c, i) => (
+        <CvssSection key={`${c.version}-${i}`} cvss={c} />
+      ))}
+      <Markdown>{alert.description}</Markdown>
+      {alert.references.length > 0 ? (
+        <ReferencesSection references={alert.references} />
+      ) : null}
+    </DetailShell>
+  );
+}
+
+/** Sentence-case a raw wire value, leaving the rest of it as it arrived so an
+ *  unrecognized level still reads instead of collapsing to "Unspecified". */
+function capitalizeFirst(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+/** `path:line`, or a placeholder when the path came through empty — a line
+ *  number hung off nothing reads as a location. Must stay in step with
+ *  `PathLabel` in FindingsPanel, which renders the same value in the list. */
+function locationText(path: string, line: number | null): string {
+  return path ? (line === null ? path : `${path}:${line}`) : "No file path";
+}
+
+function CodeScanningDetail({ alert }: { alert: CodeScanningAlertOut }) {
+  return (
+    <DetailShell
+      title={alert.ruleName || alert.ruleId || "Unidentified rule"}
+      chip={
+        <CodeScanningChip
+          securitySeverity={alert.securitySeverity}
+          severity={alert.severity}
+        />
+      }
+      htmlUrl={alert.htmlUrl}
+      meta={
+        <>
+          {/* Omitted outright when the id is empty — the title already carries
+              the fallback, matching how a missing date drops its row. */}
+          {alert.ruleId ? (
+            <Row label="Rule">
+              <span className="font-mono">{alert.ruleId}</span>
+            </Row>
+          ) : null}
+          {/* The SARIF level, spelled out — the chip shows it only when the rule
+              carries no security severity to outrank it. */}
+          {alert.severity ? (
+            <Row label="Level">{capitalizeFirst(alert.severity)}</Row>
+          ) : null}
+          <Row label="Tool">
+            {alert.toolName}
+            {alert.toolVersion ? (
+              <span className="text-muted-foreground">
+                {" "}
+                {alert.toolVersion}
+              </span>
+            ) : null}
+          </Row>
+          <Row label="Location">
+            <span className="font-mono">
+              {locationText(alert.path, alert.startLine)}
+            </span>
+          </Row>
+          {alert.ref ? (
+            <Row label="Ref">
+              <span className="font-mono">{alert.ref}</span>
+            </Row>
+          ) : null}
+          {/* No State row: the fetch pins state=open, so it could only ever
+              read "open". */}
+          {parseableDate(alert.createdAt) ? (
+            <Row label="Opened">
+              <RelativeTime date={alert.createdAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      <p className="text-xs wrap-break-word">{alert.message}</p>
+      {alert.ruleDescription ? (
+        <p className="mt-3 text-xs wrap-break-word text-muted-foreground">
+          {alert.ruleDescription}
+        </p>
+      ) : null}
+    </DetailShell>
+  );
+}
+
+function SecretScanningDetail({ alert }: { alert: SecretScanningAlertOut }) {
+  return (
+    <DetailShell
+      title={
+        alert.secretTypeDisplayName || alert.secretType || "Unknown secret type"
+      }
+      chip={<ValidityChip validity={alert.validity} />}
+      htmlUrl={alert.htmlUrl}
+      meta={
+        <>
+          <Row label="Type">
+            {alert.secretTypeDisplayName || alert.secretType || "Unknown"}
+          </Row>
+          <Row label="Validity">{validityLabel(alert.validity)}</Row>
+          {/* No State row: the fetch pins state=open, so it could only ever
+              read "open". */}
+          {/* Only for a confirmed public leak — a null means GitHub didn't say,
+              and "No" would read as a clearance it never gave. */}
+          {alert.publiclyLeaked === true ? (
+            <Row label="Publicly leaked">Yes</Row>
+          ) : null}
+          {parseableDate(alert.createdAt) ? (
+            <Row label="Opened">
+              <RelativeTime date={alert.createdAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {/* The locations of a secret are a separate paginated endpoint we don't
+          fetch, so this says so instead of implying the alert has no detail. */}
+      <p className="text-xs text-muted-foreground">
+        Open this alert on GitHub to see where the secret appears and manage it.
+      </p>
+    </DetailShell>
+  );
+}
+
+function AdvisoryDetail({ advisory }: { advisory: RepoAdvisoryOut }) {
+  return (
+    <DetailShell
+      title={advisory.summary || advisory.ghsaId}
+      chip={<SeverityChip severity={advisory.severity} />}
+      htmlUrl={advisory.htmlUrl}
+      meta={
+        <>
+          <Row label="GHSA">
+            <AdvisoryIdValue
+              id={advisory.ghsaId}
+              url={repoAdvisoryGhsaUrl(
+                advisory.ghsaId,
+                httpUrl(advisory.htmlUrl) ?? "",
+              )}
+            />
+          </Row>
+          {advisory.cveId ? (
+            <Row label="CVE">
+              <AdvisoryIdValue
+                id={advisory.cveId}
+                url={cveUrl(advisory.cveId)}
+              />
+            </Row>
+          ) : null}
+          <Row label="State">{advisory.state}</Row>
+          {advisory.cvssScore !== null ? (
+            <Row label="CVSS">
+              <span className="tabular-nums">{advisory.cvssScore}</span>
+            </Row>
+          ) : null}
+          {/* Dates that don't exist are omitted outright — a withdrawn-at of
+              "never" would read as a claim the advisory stands. */}
+          {advisory.publishedAt && parseableDate(advisory.publishedAt) ? (
+            <Row label="Published">
+              <RelativeTime date={advisory.publishedAt} />
+            </Row>
+          ) : null}
+          {advisory.updatedAt && parseableDate(advisory.updatedAt) ? (
+            <Row label="Updated">
+              <RelativeTime date={advisory.updatedAt} />
+            </Row>
+          ) : null}
+          {advisory.withdrawnAt && parseableDate(advisory.withdrawnAt) ? (
+            <Row label="Withdrawn">
+              <RelativeTime date={advisory.withdrawnAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {advisory.vulnerabilities.length > 0 && (
+        <section className="mb-4">
+          <h3 className="mb-1.5 text-xs font-semibold">Affected packages</h3>
+          <ul className="space-y-1 text-xs">
+            {advisory.vulnerabilities.map((v) => (
+              <li key={`${v.ecosystem}/${v.packageName}`}>
+                <span className="font-mono">{v.packageName}</span>{" "}
+                <span className="text-muted-foreground">{v.ecosystem}</span>
+                <span className="block text-[11px] text-muted-foreground">
+                  {v.vulnerableVersionRange ?? "Range not stated"} →{" "}
+                  {v.patchedVersions ?? "No patched version listed"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {advisory.description ? (
+        <Markdown>{advisory.description}</Markdown>
+      ) : null}
+    </DetailShell>
+  );
+}
+
+/** The URL only when it's one the system browser should open. Identifier links
+ *  come from third-party report files, where a `file://` or `javascript:` value
+ *  has no meaning here. */
+function httpUrl(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? url
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A permalink to the finding's line at the pipeline's commit, or `""` when any
+ *  piece is missing. GitLab's own vulnerability pages are an Ultimate feature and
+ *  404 for exactly the Free-tier projects this reads reports for, so the blob
+ *  view is the only link that resolves. */
+function glBlobUrl(
+  data: GlFindingsOut,
+  path: string,
+  line: number | null,
+): string {
+  if (!data.projectWebUrl || !data.pipeline || !path) return "";
+  // Each segment encoded, `/` separators kept, so an odd path can't rewrite the
+  // URL it lands in.
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  const anchor = line === null ? "" : `#L${line}`;
+  return `${data.projectWebUrl}/-/blob/${data.pipeline.sha}/${encoded}${anchor}`;
+}
+
+/** The pipeline these findings were read from, one click from the detail. */
+function GlPipelineRow({ data }: { data: GlFindingsOut }) {
+  const pipeline = data.pipeline;
+  if (!pipeline?.webUrl) return null;
+  return (
+    <Row label="Pipeline">
+      <button
+        type="button"
+        title={pipeline.webUrl}
+        onClick={() => openUrl(pipeline.webUrl)}
+        className="inline-flex cursor-pointer items-center gap-1 hover:underline"
+      >
+        #{pipeline.iid}
+        <ArrowSquareOutIcon className="size-3" />
+      </button>
+    </Row>
+  );
+}
+
+function GlSecureDetail({
+  finding,
+  data,
+  fallbackTitle,
+}: {
+  finding: GlSecureFindingOut;
+  data: GlFindingsOut;
+  /** The category's own name for a finding whose report gave none. */
+  fallbackTitle: string;
+}) {
+  return (
+    <DetailShell
+      title={finding.name || fallbackTitle}
+      chip={<SeverityChip severity={finding.severity} />}
+      htmlUrl={glBlobUrl(data, finding.file, finding.startLine)}
+      linkLabel="View file on GitLab"
+      meta={
+        <>
+          <Row label="File">
+            <span className="font-mono">
+              {locationText(finding.file, finding.startLine)}
+            </span>
+          </Row>
+          {finding.scannerName ? (
+            <Row label="Scanner">{finding.scannerName}</Row>
+          ) : null}
+          {finding.identifiers.length > 0 ? (
+            <Row label="Identifiers">
+              <span className="flex flex-wrap gap-1">
+                {finding.identifiers.map((identifier, i) => {
+                  const label =
+                    identifier.name || identifier.value || identifier.type;
+                  const url = httpUrl(identifier.url);
+                  const key = `${identifier.type}-${identifier.value}-${i}`;
+                  return url ? (
+                    <button
+                      key={key}
+                      type="button"
+                      title={url}
+                      onClick={() => openUrl(url)}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 hover:bg-muted/40"
+                    >
+                      {label}
+                      <ArrowSquareOutIcon className="size-3 text-muted-foreground" />
+                    </button>
+                  ) : (
+                    <Badge key={key} variant="outline" className="font-normal">
+                      {label}
+                    </Badge>
+                  );
+                })}
+              </span>
+            </Row>
+          ) : null}
+          <GlPipelineRow data={data} />
+        </>
+      }
+    >
+      {/* Scanner descriptions carry fenced code and links, so they render as
+          markdown rather than as preformatted text. */}
+      {finding.description ? <Markdown>{finding.description}</Markdown> : null}
+    </DetailShell>
+  );
+}
+
+function GlQualityDetail({
+  finding,
+  data,
+}: {
+  finding: GlCodeQualityFindingOut;
+  data: GlFindingsOut;
+}) {
+  return (
+    <DetailShell
+      title={finding.checkName || "Unidentified check"}
+      chip={<CqChip severity={finding.severity} />}
+      htmlUrl={glBlobUrl(data, finding.path, finding.line)}
+      linkLabel="View file on GitLab"
+      meta={
+        <>
+          {/* No Severity row — the chip above already names it in the
+              CodeClimate ladder's own words. */}
+          <Row label="Path">
+            <span className="font-mono">
+              {locationText(finding.path, finding.line)}
+            </span>
+          </Row>
+          <GlPipelineRow data={data} />
+        </>
+      }
+    >
+      {finding.description ? <Markdown>{finding.description}</Markdown> : null}
+    </DetailShell>
+  );
+}
+
+/**
+ * One Code Insights annotation. The heading names the report it came from — the
+ * same string the panel's section header shows — so the summary can own the body
+ * at whatever length Bitbucket's 450-character cap allows.
+ */
+function BbAnnotationDetail({
+  report,
+  annotation,
+}: {
+  report: BbReportOut;
+  annotation: BbAnnotationOut;
+}) {
+  return (
+    <DetailShell
+      title={bbReportLabel(report)}
+      // Omitted outright when the report stated no severity: every rung the chip
+      // could name would be a claim the report never made.
+      chip={
+        annotation.severity ? (
+          <SeverityChip severity={annotation.severity} />
+        ) : null
+      }
+      // The annotation's own link only: the report's points at the tool that
+      // published it, so falling back would open a page about the scanner
+      // instead of about this finding. `||`, not `??` — the tolerant parse
+      // degrades a missing link to an empty string, which means no button.
+      htmlUrl={annotation.link || ""}
+      linkLabel={linkOutLabel(annotation.link)}
+      // The label names only the host; the full URL is what says where this
+      // actually lands, so it previews on hover.
+      linkTitle={annotation.link || undefined}
+      meta={
+        <>
+          {annotation.annotationType ? (
+            <Row label="Type">
+              {bbAnnotationTypeLabel(annotation.annotationType)}
+            </Row>
+          ) : null}
+          {annotation.path ? (
+            <Row label="Location">
+              <span className="font-mono">
+                {locationText(annotation.path, annotation.line)}
+              </span>
+            </Row>
+          ) : null}
+          {report.reporter ? (
+            <Row label="Reporter">{report.reporter}</Row>
+          ) : null}
+          {/* The report's own description, which nothing else surfaces. A
+              tolerated empty string is falsy, so it drops the row like a null. */}
+          {report.details ? (
+            <Row label="Report details">{report.details}</Row>
+          ) : null}
+          {/* The annotation's own verdict and the report's are separate states,
+              so neither ever stands in for the other under one label. */}
+          {annotation.result ? (
+            <Row label="Result">{bbResultLabel(annotation.result)}</Row>
+          ) : null}
+          {report.result ? (
+            <Row label="Report result">{bbResultLabel(report.result)}</Row>
+          ) : null}
+          {annotation.createdOn && parseableDate(annotation.createdOn) ? (
+            <Row label="Created">
+              <RelativeTime date={annotation.createdOn} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {annotation.summary ? (
+        <p className="text-xs wrap-break-word">{annotation.summary}</p>
+      ) : null}
+      {annotation.details ? (
+        <p className="mt-3 text-xs wrap-break-word text-muted-foreground">
+          {annotation.details}
+        </p>
+      ) : null}
+    </DetailShell>
+  );
+}
+
+/** Each selection type's section in the findings key family
+ *  (`repoKeys.findingsPage`), which the category hooks key on. */
+const FINDINGS_KEY_SEGMENT: Record<
+  SelectedFinding["type"],
+  keyof FindingsLimits
+> = {
+  alert: "alerts",
+  codeScanning: "codeScanning",
+  secretScanning: "secretScanning",
+  advisory: "advisories",
+  glFinding: "gitlab",
+  bbFinding: "bitbucket",
+};
+
+/**
+ * The largest-limit page of one findings category already in the cache that
+ * `holds` the selected finding, read only while `segment` is set. A failed Load
+ * more leaves the shared limit on the failed size until the panel's rollback
+ * syncs it, and never syncs while the panel sits in a hidden `<Activity>`. Pages
+ * are tried largest first, since a bigger page can still lack a finding a
+ * smaller one holds. Read in render and on every cache change, so no effect
+ * gates it.
+ */
+function useCachedFindingsPage(
+  repoPath: string,
+  segment: keyof FindingsLimits | null,
+  holds: (page: unknown) => boolean,
+): unknown {
+  const cache = useQueryClient().getQueryCache();
+  // Subscribes only while a fallback is wanted: every cache event re-runs the
+  // snapshot's scan, which the healthy case has no reason to pay for.
+  const subscribe = useCallback(
+    (onStoreChange: () => void) =>
+      segment === null
+        ? () => undefined
+        : cache.subscribe(notifyManager.batchCalls(onStoreChange)),
+    [cache, segment],
+  );
+  // Returns the cache's own data reference, which stays one identity while the
+  // entry is unchanged, as useSyncExternalStore requires of a snapshot.
+  const getSnapshot = useCallback((): unknown => {
+    if (segment === null) return undefined;
+    const pages = cache
+      .findAll({ queryKey: repoKeys.findingsSection(repoPath, segment) })
+      .flatMap((q) => {
+        const limit = q.queryKey[4];
+        return q.state.data === undefined || typeof limit !== "number"
+          ? []
+          : [{ limit, data: q.state.data }];
+      })
+      .sort((a, b) => b.limit - a.limit);
+    return pages.find((p) => holds(p.data))?.data;
+  }, [cache, repoPath, segment, holds]);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+export function FindingDetailView({
+  repoPath,
+  active,
+}: {
+  repoPath: string;
+  active: boolean;
+}) {
+  const selectedFinding = useUiStore((s) => s.selectedFinding);
+  const limits = useUiStore((s) => s.findingsLimits);
+  const forge = useForgeStatus(repoPath);
+  const enabled =
+    forgeReady(forge.data) && forgeSupports(forge.data, "securityFindings");
+  // Same hooks, same provider gate and same store limits as the panel, so these
+  // are cache hits rather than a second fetch — and the other provider's
+  // commands are never invoked.
+  const provider = forge.data?.provider;
+  const onGitHub = enabled && provider === "github";
+  const alerts = useDependabotAlerts(repoPath, onGitHub, active, limits.alerts);
+  const codeScanning = useCodeScanningAlerts(
+    repoPath,
+    onGitHub,
+    active,
+    limits.codeScanning,
+  );
+  const secrets = useSecretScanningAlerts(
+    repoPath,
+    onGitHub,
+    active,
+    limits.secretScanning,
+  );
+  const advisories = useRepoAdvisories(
+    repoPath,
+    onGitHub,
+    active,
+    limits.advisories,
+  );
+  const gl = useGitLabFindings(
+    repoPath,
+    enabled && provider === "gitlab",
+    active,
+    limits.gitlab,
+  );
+  const bb = useBitbucketFindings(
+    repoPath,
+    enabled && provider === "bitbucket",
+    active,
+    limits.bitbucket,
+  );
+
+  // Only the selected finding's own category decides the pending/error state —
+  // a sibling category failing must not blank a finding that loaded fine. Typed
+  // to what's read here, since the six categories carry different data shapes.
+  const queryByType: Record<
+    SelectedFinding["type"],
+    {
+      isPending: boolean;
+      isError: boolean;
+      isPaused: boolean;
+      isFetching: boolean;
+      data: unknown;
+      refetch: () => unknown;
+    }
+  > = {
+    alert: alerts,
+    codeScanning,
+    secretScanning: secrets,
+    advisory: advisories,
+    glFinding: gl,
+    bbFinding: bb,
+  };
+  const query = selectedFinding ? queryByType[selectedFinding.type] : alerts;
+
+  /** The selected finding's detail from `page`, one page of its category's
+   *  data (the exact read's, or a cached page of the same key family and so the
+   *  same shape), or null when that page doesn't hold it. */
+  function detailIn(page: unknown): ReactNode {
+    if (selectedFinding?.type === "alert") {
+      const alert = (page as typeof alerts.data)?.alerts.find(
+        (a) => a.number === selectedFinding.number,
+      );
+      if (alert) return <AlertDetail alert={alert} />;
+    } else if (selectedFinding?.type === "codeScanning") {
+      const alert = (page as typeof codeScanning.data)?.alerts.find(
+        (a) => a.number === selectedFinding.number,
+      );
+      if (alert) return <CodeScanningDetail alert={alert} />;
+    } else if (selectedFinding?.type === "secretScanning") {
+      const alert = (page as typeof secrets.data)?.alerts.find(
+        (a) => a.number === selectedFinding.number,
+      );
+      if (alert) return <SecretScanningDetail alert={alert} />;
+    } else if (selectedFinding?.type === "advisory") {
+      const advisory = (page as typeof advisories.data)?.advisories.find(
+        (a) => a.ghsaId === selectedFinding.ghsaId,
+      );
+      if (advisory) return <AdvisoryDetail advisory={advisory} />;
+    } else if (selectedFinding?.type === "glFinding") {
+      const data = page as typeof gl.data;
+      if (!data) return null;
+      if (selectedFinding.category === "codeQuality") {
+        const finding = data.codeQuality.findings.find(
+          (f) => codeQualityFindingId(f) === selectedFinding.id,
+        );
+        if (finding) return <GlQualityDetail finding={finding} data={data} />;
+      } else {
+        const category =
+          selectedFinding.category === "sast"
+            ? data.sast
+            : data.secretDetection;
+        const finding = category.findings.find(
+          (f) => secureFindingId(f) === selectedFinding.id,
+        );
+        if (finding)
+          return (
+            <GlSecureDetail
+              finding={finding}
+              data={data}
+              fallbackTitle={
+                selectedFinding.category === "sast"
+                  ? "Unidentified rule"
+                  : "Unknown secret type"
+              }
+            />
+          );
+      }
+    } else if (selectedFinding?.type === "bbFinding") {
+      const report = (page as typeof bb.data)?.reports.find(
+        (r) => r.uuid === selectedFinding.reportUuid,
+      );
+      const annotation = report?.annotations.find(
+        (a) => a.uuid === selectedFinding.annotationUuid,
+      );
+      if (report && annotation)
+        return <BbAnnotationDetail report={report} annotation={annotation} />;
+    }
+    return null;
+  }
+
+  // The exact-limit read has nothing to show (a failed Load more still keys it
+  // on the failed limit), so a cached page holding this finding stands in.
+  const cachedPage = useCachedFindingsPage(
+    repoPath,
+    selectedFinding &&
+      enabled &&
+      query.data === undefined &&
+      (query.isError || query.isPending)
+      ? FINDINGS_KEY_SEGMENT[selectedFinding.type]
+      : null,
+    (page) => detailIn(page) !== null,
+  );
+
+  const detail = detailIn(query.data ?? cachedPage);
+  // Loaded data always renders: a refresh that fails or waits offline keeps
+  // the finding under a notice. Pending is gated on `enabled`: a disabled query
+  // stays `isPending` forever, so an ungated skeleton would spin here if the
+  // repo lost the capability mid-session. A cached page is only ever one that
+  // holds this finding, so with none a miss still reads as the error.
+  const pane = resolveDetailPane({
+    pending: enabled && query.isPending,
+    error: query.isError,
+    hasData: query.data !== undefined || cachedPage !== undefined,
+    paused: query.isPaused,
+    fetching: query.isFetching,
+  });
+  // A pressed Retry resets the never-loaded read to pending, swapping the error
+  // for the skeleton. Every arm's root is the same host div, so React keeps that
+  // node through the swap and on into the loaded finding, and focus lands there.
+  const { hostRef, retryRef } = useRetryFocusRescue(
+    pane === "error" && query.isError,
+  );
+  if (pane === "skeleton") {
+    return (
+      <div ref={hostRef} tabIndex={-1} className="space-y-3 p-4 outline-none">
+        <Skeleton className="h-7 w-2/3" />
+        <Skeleton className="h-4 w-1/2" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
+  if (pane === "offline") {
+    return (
+      <div
+        ref={hostRef}
+        tabIndex={-1}
+        className="p-6 text-center text-sm text-muted-foreground outline-none"
+      >
+        {offlinePendingMessage("this finding")}
+      </div>
+    );
+  }
+  if (pane === "error" && query.isError) {
+    return (
+      <div
+        ref={hostRef}
+        tabIndex={-1}
+        className="flex flex-col items-center gap-3 p-6 text-center text-sm text-muted-foreground outline-none"
+      >
+        <p>Couldn't load this finding.</p>
+        <Button
+          ref={retryRef}
+          variant="outline"
+          size="sm"
+          className="cursor-pointer"
+          onClick={() => query.refetch()}
+        >
+          Retry
+        </Button>
+      </div>
+    );
+  }
+
+  if (detail) {
+    return (
+      <div
+        ref={hostRef}
+        tabIndex={-1}
+        className="flex h-full min-h-0 flex-col outline-none"
+      >
+        <DegradedListNotice
+          noun="this finding"
+          degraded={pane === "content-degraded"}
+          // The finding is read from its category's list, whose key doesn't
+          // change with the selection, so no previous finding is ever shown
+          // as placeholder.
+          message={detailNoticeMessage({
+            noun: "finding",
+            isError: refreshFailed(query),
+            stale: false,
+          })}
+          onRetry={refreshFailed(query) ? () => query.refetch() : undefined}
+          className="shrink-0 border-b px-4 py-1.5"
+        />
+        <div className="min-h-0 flex-1">{detail}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={hostRef}
+      tabIndex={-1}
+      className="p-6 text-center text-sm text-muted-foreground outline-none"
+    >
+      This finding is no longer in the list.
+    </div>
+  );
+}

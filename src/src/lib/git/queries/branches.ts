@@ -1,0 +1,354 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { reloadLocalPrs } from "@/lib/pulls/local";
+import { REPO_SHELL_GC_TIME } from "@/lib/query-cache-times";
+import { reloadReviewNotes } from "@/lib/review-notes/store";
+import { useUiStore } from "@/lib/stores/ui";
+import * as api from "../api";
+import { repoKeys } from "./core";
+import { useRepoMutation } from "./internal";
+import { localPrWriteKey } from "./pr-writes";
+
+export function useBranches(repo: string) {
+  return useQuery({
+    queryKey: repoKeys.branches(repo),
+    queryFn: () => api.gitBranches(repo),
+    // Local reads must not park on react-query's default "online" mode offline;
+    // the same holds for every `networkMode` in this file.
+    networkMode: "always",
+  });
+}
+
+/** Shared by the hook and the shell warm-up, so the switcher's Remote group is
+ *  cached before the menu first opens. Kept on the shell gcTime because the read
+ *  shapes the open menu's layout. */
+export function remoteBranchesOptions(repo: string) {
+  return {
+    queryKey: ["repo", repo, "remote-branches"] as const,
+    queryFn: () => api.gitRemoteBranches(repo),
+    networkMode: "always" as const,
+    gcTime: REPO_SHELL_GC_TIME,
+  };
+}
+
+/** How old a remote-branch list the hook (and the shell warm-up) may serve. Kept
+ *  out of {@link remoteBranchesOptions} so an imperative fetch spreading the
+ *  options keeps fetch-always semantics. */
+export const REMOTE_BRANCHES_STALE_TIME = 30_000;
+
+/** Branches that exist on a remote (reflecting the last fetch), for the switcher's
+ *  "Remote" group. `enabled` gates the fetch so it only runs while the menu is
+ *  open: an enabled observer would re-run an O(remote refs) `for-each-ref` on
+ *  every window focus and repo mutation. */
+export function useRemoteBranches(repo: string, enabled = true) {
+  return useQuery({
+    ...remoteBranchesOptions(repo),
+    enabled: enabled && Boolean(repo),
+    staleTime: REMOTE_BRANCHES_STALE_TIME,
+  });
+}
+
+export function useCheckoutBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (name: string) => api.gitCheckoutBranch(repo, name),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useCheckoutRemoteBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { remote: string; name: string }) =>
+      api.gitCheckoutRemoteBranch(repo, args.remote, args.name),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useCreateBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: {
+      name: string;
+      checkout: boolean;
+      startPoint?: string;
+      noTrack?: boolean;
+    }) =>
+      api.gitCreateBranch(
+        repo,
+        args.name,
+        args.checkout,
+        args.startPoint,
+        args.noTrack,
+      ),
+    {
+      // Pinned: the call and its invalidation close over `repo`, and the dialog
+      // and panel hosts survive a repo switch — without the key the newly-live
+      // repo's controls would read the pending create as busy.
+      identity: ["create-branch", repo],
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function defaultBranchOptions(repo: string) {
+  return {
+    queryKey: ["repo", repo, "default-branch"] as const,
+    queryFn: () => api.gitDefaultBranch(repo),
+    networkMode: "always" as const,
+    gcTime: REPO_SHELL_GC_TIME,
+  };
+}
+
+export function useDefaultBranch(repo: string) {
+  return useQuery(defaultBranchOptions(repo));
+}
+
+export function useRenameBranch(repo: string) {
+  const queryClient = useQueryClient();
+  return useRepoMutation(
+    repo,
+    (args: { oldName: string; newName: string }) =>
+      api.gitRenameBranch(repo, args.oldName, args.newName),
+    {
+      onSuccess: (_data, args) => {
+        // Re-key the branch's commit draft before the status refetch reports the new
+        // name, so the draft (and any generation streaming into it) survives.
+        // Renames from outside the app (MCP, a terminal `git branch -m`) have no such
+        // hook and still lose the draft when the ambient poll flips the key.
+        useUiStore
+          .getState()
+          .migrateCommitDraft(repo, args.oldName, args.newName);
+        // The backend moved the branch's reviewer note on disk as part of the rename;
+        // reload the in-memory store BEFORE invalidating (the focus bridge's pattern in
+        // App.tsx) so the Create-PR dialog reads the note under the new name without
+        // waiting for a focus cycle. Fire-and-forget — this callback must stay sync.
+        void reloadReviewNotes()
+          .then(() =>
+            queryClient.invalidateQueries({ queryKey: ["review-notes"] }),
+          )
+          .catch(() => {
+            // Best-effort: a failed reload just leaves the last known state.
+          });
+        // The same for the local pull requests the backend moved to the new name,
+        // so an open local-PR view acts on the new head.
+        void reloadLocalPrs()
+          .then(() =>
+            queryClient.invalidateQueries({ queryKey: ["local-prs"] }),
+          )
+          .catch(() => {
+            // Best-effort, as above.
+          });
+      },
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useSetBranchArchived(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { name: string; archived: boolean }) =>
+      api.gitSetBranchArchived(repo, args.name, args.archived),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+export function useDeleteBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (name: string) => api.gitDeleteBranch(repo, name),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Deletes a branch on its remote (`git push <remote> --delete`). Invalidates
+ *  the remote-branches list (the row disappears) and the local branches (their
+ *  upstream may now be gone). */
+export function useDeleteRemoteBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { remote: string; name: string }) =>
+      api.gitDeleteRemoteBranch(repo, args.remote, args.name),
+    {
+      invalidate: [["repo", repo, "remote-branches"], repoKeys.branches(repo)],
+    },
+  );
+}
+
+export function useMergeBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: {
+      branch: string;
+      squash: boolean;
+      noFf: boolean;
+      strategy: api.MergeConflictStrategy;
+    }) =>
+      api.gitMerge(repo, args.branch, args.squash, args.noFf, args.strategy),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Predicts a merge's outcome (fast-forward / clean / conflict / …) in memory,
+ *  for the merge picker. Strategy-aware — re-runs when the conflict strategy
+ *  changes so the prediction matches what the merge will actually do. Enabled
+ *  only while the picker is open with a branch. */
+export function useMergePreview(
+  repo: string,
+  branch: string,
+  strategy: api.MergeConflictStrategy,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "merge-preview", branch, strategy] as const,
+    queryFn: () => api.gitMergePreview(repo, branch, strategy),
+    enabled: enabled && branch !== "",
+    staleTime: 15_000,
+    networkMode: "always",
+  });
+}
+
+export function useRebaseBranch(repo: string) {
+  return useRepoMutation(
+    repo,
+    (branch: string) => api.gitRebase(repo, branch),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Rebases the current branch onto `newBase`, replaying only `oldBase..HEAD`
+ *  (the "branched off the wrong branch" fix). Conflicts leave the rebase in
+ *  progress for the conflict banner, exactly like {@link useRebaseBranch}. */
+export function useRebaseOnto(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { newBase: string; oldBase: string }) =>
+      api.gitRebaseOnto(repo, args.newBase, args.oldBase),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}
+
+/** Ahead/behind of every local branch vs `base`. Gated on `enabled` (it's N rev-list
+ *  calls) and keyed under the repo so branch mutations invalidate it. */
+export function useBranchDivergence(
+  repo: string,
+  base: string | null,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "divergence", base] as const,
+    queryFn: () => api.gitBranchDivergence(repo, base ?? ""),
+    enabled: enabled && Boolean(base),
+    // Local rev-list reads only. react-query's default "online" mode parks the
+    // fetch whenever the OS reports no connection, and a parked query is neither
+    // loading nor errored — consumers would silently render without divergence.
+    networkMode: "always",
+  });
+}
+
+/** Merge `base` into `branch`. Filed with the local-PR writes because the local PR
+ *  view holds its Update branch on any running one, from whichever surface fired it. */
+export function useUpdateBranchFrom(repo: string) {
+  const queryClient = useQueryClient();
+  return useRepoMutation(
+    repo,
+    (args: { branch: string; base: string }) =>
+      api.gitUpdateBranchFrom(repo, args.branch, args.base),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+      identity: localPrWriteKey("update-from", repo),
+      // The default invalidation covers only this repo; an update run inside the
+      // holder moved that checkout too. Git reports it forward-slashed, a window
+      // opened on it keys validate_repo's backslashed form (state.rs), so both
+      // are invalidated; on POSIX the backslashed one matches nothing.
+      onSuccess: (data) => {
+        if (!data.holder) return;
+        for (const key of new Set([
+          data.holder,
+          data.holder.replace(/\//g, "\\"),
+        ]))
+          void queryClient.invalidateQueries({ queryKey: repoKeys.all(key) });
+      },
+    },
+  );
+}
+
+/**
+ * Whether a diverged branch's upstream was rewritten under it (a remote rebase
+ * or force-push), and what a reset to that upstream would cost.
+ *
+ * LAZY on purpose: `enabled` must stay false unless a surface is actually facing
+ * a diverged branch, so the ordinary in-sync path spawns no git. Keyed under the
+ * repo, so the whole-subtree invalidation every fetch/pull/push mutation already
+ * runs refreshes it. Local rev-list reads only — `networkMode: "always"` keeps
+ * an offline OS from parking the query into a permanent pending state, matching
+ * {@link useBranchDivergence}.
+ */
+export function useBranchRewriteStatus(
+  repo: string,
+  branch: string | null,
+  opts: { enabled: boolean },
+) {
+  return useQuery({
+    ...branchRewriteStatusOptions(repo, branch ?? ""),
+    enabled: opts.enabled && Boolean(branch),
+  });
+}
+
+/** The one options object behind {@link useBranchRewriteStatus}. Exported so an
+ *  IMPERATIVE probe — a palette action that has to decide before it acts, with no
+ *  render to hang a hook on — reads and caches exactly what the hook would, rather
+ *  than a second spelling that can drift from it. */
+export function branchRewriteStatusOptions(repo: string, branch: string) {
+  return {
+    queryKey: ["repo", repo, "rewrite-status", branch] as const,
+    queryFn: () => api.gitBranchRewriteStatus(repo, branch),
+    staleTime: 30_000,
+    networkMode: "always" as const,
+  };
+}
+
+/** Points a NON-current branch at its upstream's tip, refusing if that upstream
+ *  moved away from `expectedTip`, or the branch away from `expectedLocalTip`,
+ *  since the caller measured them. The current branch takes commit-ops.ts's
+ *  `useHardResetToCommit` instead — only that moves the working tree with it. */
+export function useBranchResetToUpstream(repo: string) {
+  return useRepoMutation(
+    repo,
+    (args: { branch: string; expectedTip: string; expectedLocalTip: string }) =>
+      api.gitBranchResetToUpstream(
+        repo,
+        args.branch,
+        args.expectedTip,
+        args.expectedLocalTip,
+      ),
+    {
+      // Local branch write — never park it offline.
+      networkMode: "always",
+    },
+  );
+}

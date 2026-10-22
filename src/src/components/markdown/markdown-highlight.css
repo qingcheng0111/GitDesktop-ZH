@@ -1,0 +1,54 @@
+/* highlight.js token colors for rendered-markdown code blocks (PR/issue/
+   discussion bodies & comments, AI review output, release notes). Scoped to
+   .markdown-body so the global hljs token classes can't leak into other hljs
+   users (.gd-code owns those, in code-highlight.css). The --gd-syn-* tokens
+   (App.css) are the single syntax palette; dark rides the token cascade. */
+.markdown-body .hljs-comment,
+.markdown-body .hljs-quote {
+  color: var(--gd-syn-comment);
+  font-style: italic;
+}
+.markdown-body .hljs-keyword,
+.markdown-body .hljs-doctag,
+.markdown-body .hljs-meta .hljs-keyword {
+  color: var(--gd-syn-keyword);
+}
+.markdown-body .hljs-string,
+.markdown-body .hljs-regexp,
+.markdown-body .hljs-meta .hljs-string {
+  color: var(--gd-syn-string);
+}
+.markdown-body .hljs-number,
+.markdown-body .hljs-literal {
+  color: var(--gd-syn-number);
+}
+.markdown-body .hljs-title,
+.markdown-body .hljs-title.function_,
+.markdown-body .hljs-section,
+.markdown-body .hljs-built_in {
+  color: var(--gd-syn-func);
+}
+.markdown-body .hljs-type,
+.markdown-body .hljs-class .hljs-title,
+.markdown-body .hljs-title.class_ {
+  color: var(--gd-syn-type);
+}
+.markdown-body .hljs-property,
+.markdown-body .hljs-variable,
+.markdown-body .hljs-template-variable {
+  color: var(--gd-syn-variable);
+}
+.markdown-body .hljs-attr,
+.markdown-body .hljs-attribute {
+  color: var(--gd-syn-attr);
+}
+.markdown-body .hljs-tag,
+.markdown-body .hljs-name,
+.markdown-body .hljs-selector-tag,
+.markdown-body .hljs-symbol,
+.markdown-body .hljs-bullet {
+  color: var(--gd-syn-tag);
+}
+.markdown-body .hljs-meta {
+  color: var(--gd-syn-comment);
+}
