@@ -242,12 +242,12 @@ pnpm tauri build --bundles app     # 产物 target/release/bundle/macos/GitDeskt
 | 项目 | 实测值 |
 |---|---|
 | .app 产物 | `src/src-tauri/target/release/bundle/macos/GitDesktop.app`，65 MB，`lipo -archs` 实测 **arm64 单架构** |
-| DMG 产物 | `src/src-tauri/target/release/bundle/dmg/GitDesktop_0.13.6_aarch64.dmg`，20 MB（20,825,558 字节），sha256 `ea28f7d797d9157d…` |
+| DMG 产物 | `src/src-tauri/target/release/bundle/dmg/GitDesktop_0.13.6_aarch64.dmg`，**20,825,769 字节**，sha256 `cde342d0f578afb0d426c7437eefca5fc0e407276d31483e243ba64579b087fe`（zh.2 重打，含 4d 双击） |
 | DMG 内容 | 挂载后是 `GitDesktop.app` + 指向 `/Applications` 的软链接（拖进去即安装），版本 0.13.6 |
-| DMG 与已装版本一致性 | dmg 内二进制 sha256 前 16 位 `e688ddd519257bdb`，与 `/Applications/GitDesktop.app` 完全相同；`strings` 能查到 `applicationShouldHandleReopen`，说明含 4c 的修复 |
+| DMG 与已装版本一致性 | dmg 内二进制 sha256 前 16 位 `aa5659a9b3999045`，与 `/Applications/GitDesktop.app` 完全相同；`strings` 能查到 `applicationShouldHandleReopen`（4c 修复仍在） |
 | 打包命令 | `pnpm tauri build --bundles app` / `--bundles dmg`；`--bundles dmg` 会先清理旧 `.app`，要两份都留就再跑一次 `--bundles app` |
 | 依赖链 | Node 26.8.1 / pnpm 11.22 / Rust 1.99.1（本次装 rustup）/ Xcode CLT |
-| 增量重编耗时 | 仅前端改动约 7–9 分钟；只重打 dmg（Rust 无改动）约 3–5 分钟 |
+| 增量重编耗时 | 仅前端改动约 8–9 分钟（Rust 侧每次仍要重编 `gitdesktop` crate，因前端资源内嵌进二进制）；`--bundles dmg` 与随后的 `--bundles app` 各自跑一遍，合计约 16 分钟 |
 | 签名 | 本地构建 ad-hoc，本机可直接运行；未公证，拷给别人会被 Gatekeeper 拦 |
 | 自动更新 | 已关闭（`plugins.updater.endpoints` 置空） |
 
@@ -280,3 +280,4 @@ pnpm tauri build --bundles app     # 产物 target/release/bundle/macos/GitDeskt
 | 2026-10-22 | 0.13.6-cn.5 | 出首个 DMG：`bundle/dmg/GitDesktop_0.13.6_aarch64.dmg`（20 MB，sha256 `ea28f7d7…`），挂载核对内含 `GitDesktop.app` + `/Applications` 软链接、版本 0.13.6、二进制与已装版本同源（`e688ddd5…`）、含 Reopen 修复。同时更正文档里的架构说明：实际是 arm64 单架构，不是 universal |
 | 2026-10-22 | 0.13.6-zh.1 | 开源发布到 https://github.com/qingcheng0111/GitDesktop-ZH：源码（1,753 个文件，48 MB）+ docs 文档 + 8 张截图，README 中英文双份（`README.md` / `README.en.md` 顶部互链）；建 Release `v0.13.6-zh.1` 附 DMG，线上回下载校验 sha256 与本地一致 |
 | 2026-10-30 | 0.13.6-zh.2 | 探索仓库支持双击行在默认浏览器打开仓库页，键盘等价为 ⌘↵ / Ctrl+↵；地址从 `webUrl` 或（无 `webUrl` 时）由 `cloneUrl` 派生，剥凭据/query/hash/`.git`，SSH 形式不猜；双击用「原生 dblclick + 400 ms 时间戳配对」双路径判定，600 ms 重开守卫防重复开标签；补「4d」实测表（含派生地址边界用例与浏览器历史取证） |
+| 2026-10-30 | 0.13.6-zh.2 | 重打 DMG 并出 Release `v0.13.6-zh.2`：`GitDesktop_0.13.6_aarch64.dmg` 20,825,769 字节，sha256 `cde342d0f578afb0…`；挂载核对内含 `GitDesktop.app` + `/Applications` 软链接、版本 0.13.6、二进制 `aa5659a9b3999045` 与已装版本同源且保留 4c 的 Reopen 修复；线上回下载校验 sha256 与本地一致。因 `--bundles dmg` 会清 `bundle/macos/`，随后补跑 `--bundles app` 恢复两份产物 |
