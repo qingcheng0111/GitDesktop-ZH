@@ -5,10 +5,7 @@
 源码位置：`./src`（浅克隆，单 commit）
 可运行产物：`src/src-tauri/target/release/bundle/macos/GitDesktop.app`
 许可证：Apache-2.0（上游 LICENSE 原样保留，本目录改动同样受其约束）
-
-
-> **发布说明**：本文是实现记录，文中提到的截图文件名沿用了开发时的中文命名；仓库内实际发布的截图在 `docs/screenshots/` 下，用的是 ASCII 文件名（`welcome.png`、`settings-appearance.png`、`settings-translation.png`、`readme-translated.png`、`fonts-all.png`、`images-before.png`、`images-after.png`、`dock-reopen.png`）。功能与数据描述不受影响。
-
+汉化版仓库：https://github.com/qingcheng0111/GitDesktop-ZH （首个发行版 `v0.13.6-zh.1`，附 DMG）
 
 ## 一、三项功能
 
@@ -206,7 +203,7 @@ pnpm tauri build --bundles app     # 产物 target/release/bundle/macos/GitDeskt
 | 构建产物 CSS 实测（`getComputedStyle`） | 把构建出的 `index-*.css` 装进浏览器、注入 `--font-ui-size:17px / --font-ui-weight:600 / --font-ui-tracking:0.02em / --font-code-size:16px / --font-code-weight:500` 后实测：根 `17px / 600 / letter-spacing 0.34px`；`pre`、`code`、`.cm-editor`、`.diff-tailwindcss-wrapper` 均 `16px / 500`；`.xterm` 保持根字号（终端字号由 xterm 选项接管，故不参与该规则） |
 | 越界值修复 | 手改 `uiFontSize: 3`、`codeFontSize: "18px"`、`uiFontWeight: 700`、`codeFontWeight: 250`、`uiLetterSpacing: 0.5` 后重启：面板读回 `400 / 13 px / 0 / 400 / 12 px`（数值越界夹到区间边界，非数字回默认，枚举外回 400） |
 
-截图：`docs/screenshots/设置-外观与字体-排版.png`（五项控件，默认值）、`docs/screenshots/字体-排版-放大加粗生效.png`（18 px / 600 / +0.02em / 代码 15 px）、`docs/screenshots/字体-排版-重启后保持.png`（退出重开后读回同一组值）。
+截图：`截图/设置-外观与字体-排版.png`（五项控件，默认值）、`截图/字体-排版-放大加粗生效.png`（18 px / 600 / +0.02em / 代码 15 px）、`截图/字体-排版-重启后保持.png`（退出重开后读回同一组值）。
 
 ### 4c. 关闭窗口后点图标唤回（macOS）
 
@@ -223,7 +220,22 @@ pnpm tauri build --bundles app     # 产物 target/release/bundle/macos/GitDeskt
 | Cmd+H 隐藏整个 app 后点图标 | 窗口恢复并置于最前 |
 | 唤回后渲染完整性 | 截图确认欢迎页完整（标题、五个入口、仓库空状态），不是空白或只有框架 |
 
-截图：`docs/screenshots/关闭窗口后点图标唤回.png`。
+截图：`截图/关闭窗口后点图标唤回.png`。
+
+### 4d. 双击仓库名在浏览器打开
+
+探索仓库的结果列表里，**双击任意一行**用系统默认浏览器打开该仓库的 GitHub 页面；键盘路径是选中行后按 **⌘↵**（Windows/Linux 为 `Ctrl+↵`）。单击仍然只是选中该行、右侧加载 README，两个手势互不吃掉。
+
+仓库地址的取法（`repoWebUrl`）：搜索结果自带 `webUrl` 时直接用；「我的仓库」这类没有 `webUrl` 的行从 `cloneUrl` 派生——剥掉地址里的用户名口令、query、hash 和结尾 `.git`，自建 GitLab / Bitbucket 实例的主机名原样保留。SSH 形式的克隆地址（`git@host:o/r.git`）不猜，直接返回空，该行也就没有双击手势。
+
+双击判定同时接了两条路径：浏览器原生的 `dblclick`（真实鼠标）、以及两次点击的时间戳配对（400 ms 内，覆盖自动化与辅助工具的合成点击）。两条同时命中时用 600 ms 的重开守卫去重，保证一次手势只开一个标签页。
+
+| 操作 | 实测结果 |
+|---|---|
+| 鼠标双击 `qingcheng0111/GitDesktop-ZH` 行 | ego lite 历史新增一条 `14:28:22 https://github.com/qingcheng0111/GitDesktop-ZH`，当次只多 1 条访问记录（未开重复标签） |
+| 选中行后按 ⌘↵ | 历史新增 `14:12:05 https://github.com/qingcheng0111/DeepSeekUsage` |
+| 单击同一行 | 只选中并加载 README，浏览器无新访问记录 |
+| 派生地址的边界用例 | `https://user:tok@github.com/o/r.git` → `https://github.com/o/r`；`https://gitlab.example.com/team/app.git` → `https://gitlab.example.com/team/app`；`git@github.com:o/r.git` → 空（不给手） |
 
 ### 5. 构建与签名
 
@@ -260,9 +272,11 @@ pnpm tauri build --bundles app     # 产物 target/release/bundle/macos/GitDeskt
 |---|---|---|
 | 2026-10-21 | 0.13.6-cn.1 | 初始：界面词典汉化 + 内容翻译（自动/手动/关闭）+ 界面/代码字体切换；翻译引擎由 MyMemory 单引擎改为 AI→Chrome→Bing→Libre→MyMemory 五级链；占位符改 ASCII `[[n]]`；正文硬换行行合并成段落 |
 | 2026-10-21 | 0.13.6-cn.2 | 修复 README 图片不显示：相对路径与中文文件名按仓库 raw 内容根重写；翻译管线改成单 token 原子跨度（链接/加粗整体占位、标签单独送译），避免译文重排把链接拆坏；setext 横线不再被并入正文 |
-| 2026-10-21 | 0.13.6-cn.2 | 补「六、验收对照表」：界面汉化 / 三档翻译 / 图片 / 字体 / 构建签名共 29 条实机实测记录，逐条附实际返回值；截图 5 张补入 `docs/screenshots/` |
+| 2026-10-21 | 0.13.6-cn.2 | 补「六、验收对照表」：界面汉化 / 三档翻译 / 图片 / 字体 / 构建签名共 29 条实机实测记录，逐条附实际返回值；截图 5 张补入 `截图/` |
 | 2026-10-22 | 0.13.6-cn.3 | 新增排版设置：界面字重 300–600 / 界面字号 13–18 px / 界面字距 −0.01–+0.02em / 代码字重 300–600 / 代码字号 10–16 px，外加「恢复默认排版」；界面字号落在根字号上整窗缩放，代码字号独立（px 绝对值，嵌套不叠缩）；差异视图与编辑器改吃代码字体与代码字号（此前跟随界面字体），终端读同一变量传给 xterm `fontSize`；`settings.json` 新增 5 项并做枚举校验与区间夹取；补「4b. 排版」实测表与截图 |
 | 2026-10-22 | 0.13.6-cn.3 | 字体可用性判定改成多基线（monospace / serif / sans-serif 任一宽度有变化即认为已安装），修掉单基线在 Menlo、苹方上的误判；把本构建装到 `/Applications` 并卸载上游原版（原版按 sha256 备份到 `回滚备份/`），装完后在装机版本上复验五项排版控件与字族标注 |
 | 2026-10-22 | 0.13.6-cn.4 | 字体探测改用 DOM 布局测宽替代 canvas `measureText`：WKWebView 的 canvas 对系统按需字族一律给回退宽度，导致 楷体/仿宋/圆体/兰亭黑/隶变/行楷/魏碑 7 个可用字体被误标「未安装」；改完后 12 项全部可用、标注清零。查证这 7 项字体文件本就由系统托管在 `System/Library/AssetsV2/`，无需下载（测试期临时拷进 `~/Library/Fonts` 的 375 MB 副本已删除，目录恢复为空）。逐项量字形宽度验证真实生效（宋体 271 / 楷体 272 / 隶变 254 / 魏碑 293 px），并补截图 |
 | 2026-10-22 | 0.13.6-cn.5 | 修复「关闭窗口后点 Dock 图标打不开窗口」：事件循环由 `.run(context)` 改为 `.build(...).run(|app, event|)`，接住 macOS `RunEvent::Reopen` 调唤回函数，并在唤回路径先 `app.show()`（`NSApp.unhide`）以覆盖 Cmd+H 隐藏整个应用的情形。菜单栏图标、单实例回调、Dock 图标三处现共用同一条唤回路径；补「4c」实测表与截图 |
 | 2026-10-22 | 0.13.6-cn.5 | 出首个 DMG：`bundle/dmg/GitDesktop_0.13.6_aarch64.dmg`（20 MB，sha256 `ea28f7d7…`），挂载核对内含 `GitDesktop.app` + `/Applications` 软链接、版本 0.13.6、二进制与已装版本同源（`e688ddd5…`）、含 Reopen 修复。同时更正文档里的架构说明：实际是 arm64 单架构，不是 universal |
+| 2026-10-22 | 0.13.6-zh.1 | 开源发布到 https://github.com/qingcheng0111/GitDesktop-ZH：源码（1,753 个文件，48 MB）+ docs 文档 + 8 张截图，README 中英文双份（`README.md` / `README.en.md` 顶部互链）；建 Release `v0.13.6-zh.1` 附 DMG，线上回下载校验 sha256 与本地一致 |
+| 2026-10-30 | 0.13.6-zh.2 | 探索仓库支持双击行在默认浏览器打开仓库页，键盘等价为 ⌘↵ / Ctrl+↵；地址从 `webUrl` 或（无 `webUrl` 时）由 `cloneUrl` 派生，剥凭据/query/hash/`.git`，SSH 形式不猜；双击用「原生 dblclick + 400 ms 时间戳配对」双路径判定，600 ms 重开守卫防重复开标签；补「4d」实测表（含派生地址边界用例与浏览器历史取证） |

@@ -1,5 +1,6 @@
 import { ArrowLeftIcon } from "@phosphor-icons/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
@@ -47,6 +48,7 @@ import {
   exploreOptionId,
   forgeRepoToSearchRepo,
   groupReposByOwner,
+  repoWebUrl,
 } from "./explore-utils";
 
 type SortOption = "best" | "stars" | "updated";
@@ -139,6 +141,13 @@ export function ExploreScreen() {
     if (e.key === "Enter") {
       if (!selected) return;
       e.preventDefault();
+      // ⌘↵ / Ctrl+↵ opens the row's page in the default browser — the keyboard
+      // equivalent of double-clicking the row (a mouse-only gesture otherwise).
+      if (e.metaKey || e.ctrlKey) {
+        const url = repoWebUrl(selected);
+        if (url) void openUrl(url).catch(() => undefined);
+        return;
+      }
       // Focus the first enabled action button in the detail pane (Clone).
       detailRef.current
         ?.querySelector<HTMLButtonElement>("button:not([disabled])")

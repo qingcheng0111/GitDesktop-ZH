@@ -28,6 +28,7 @@ export const UI_ZH: Record<string, string> = {
   "Back to repositories": "返回仓库列表",
   "No repositories yet": "还没有仓库",
   "Search repositories": "搜索仓库",
+  "Double-click to open in browser": "双击在浏览器中打开",
   "Explore repositories": "探索仓库",
   "Repositories list": "仓库列表",
   Explore: "探索",

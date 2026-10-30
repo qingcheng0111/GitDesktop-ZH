@@ -98,3 +98,32 @@ export const exploreOptionId = (fullName: string) =>
   `explore-repo-${fullName.replace(/[^\w-]/g, "_")}`;
 
 export const EXPLORE_LISTBOX_ID = "explore-repo-listbox";
+
+/**
+ * The repository's page on its forge, for "open in the default browser".
+ *
+ * Search results carry `webUrl`; the "your repositories" shape does not
+ * ({@link forgeRepoToSearchRepo} leaves it null), so those rows derive the page
+ * from the HTTPS clone URL — same host, minus credentials and the `.git`
+ * suffix. Deriving from `cloneUrl` rather than assuming github.com keeps
+ * GitHub Enterprise / self-hosted GitLab on their own host; with neither field
+ * we return null and the caller simply offers nothing, instead of guessing a
+ * URL that 404s.
+ */
+export function repoWebUrl(repo: ForgeSearchRepo): string | null {
+  if (repo.webUrl) return repo.webUrl;
+  const clone = repo.cloneUrl?.trim();
+  if (!clone) return null;
+  try {
+    const url = new URL(clone);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    url.pathname = url.pathname.replace(/\.git$/, "").replace(/\/$/, "");
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
